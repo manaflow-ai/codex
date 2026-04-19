@@ -218,6 +218,11 @@ impl Environment {
         Arc::clone(&self.exec_backend)
     }
 
+    /// Returns the remote exec-server client when this environment is remote.
+    pub fn get_remote_exec_server_client(&self) -> Option<ExecServerClient> {
+        self.remote_exec_server_client.clone()
+    }
+
     pub fn get_filesystem(&self) -> Arc<dyn ExecutorFileSystem> {
         match self.remote_exec_server_client.clone() {
             Some(client) => Arc::new(RemoteFileSystem::new(client)),

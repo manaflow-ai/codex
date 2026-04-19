@@ -1589,28 +1589,41 @@ async fn make_rmcp_client(
             env_http_headers,
             bearer_token_env_var,
         } => {
-            if remote_environment {
-                if !runtime_environment.environment().is_remote() {
-                    return Err(StartupOutcomeError::from(anyhow!(
-                        "remote MCP server `{server_name}` requires a remote executor environment"
-                    )));
-                }
-                return Err(StartupOutcomeError::from(anyhow!(
-                    // Remote HTTP needs the future low-level executor
-                    // `network/request` API so reqwest runs on the executor side.
-                    // Do not fall back to local HTTP here; the config explicitly
-                    // asked for remote placement.
-                    "remote streamable HTTP MCP server `{server_name}` is not implemented yet"
-                )));
-            }
-
-            // Local streamable HTTP remains the existing reqwest path from
-            // the orchestrator process.
             let resolved_bearer_token =
                 match resolve_bearer_token(server_name, bearer_token_env_var.as_deref()) {
                     Ok(token) => token,
                     Err(error) => return Err(error.into()),
                 };
+
+            if remote_environment {
+                let exec_environment = runtime_environment.environment();
+                if !exec_environment.is_remote() {
+                    return Err(StartupOutcomeError::from(anyhow!(
+                        "remote MCP server `{server_name}` requires a remote executor environment"
+                    )));
+                }
+                let exec_client = exec_environment
+                    .get_remote_exec_server_client()
+                    .ok_or_else(|| {
+                        StartupOutcomeError::from(anyhow!(
+                            "remote MCP server `{server_name}` requires an executor client"
+                        ))
+                    })?;
+                return RmcpClient::new_environment_streamable_http_client(
+                    server_name,
+                    &url,
+                    resolved_bearer_token,
+                    http_headers,
+                    env_http_headers,
+                    store_mode,
+                    exec_client,
+                )
+                .await
+                .map_err(StartupOutcomeError::from);
+            }
+
+            // Local streamable HTTP remains the existing reqwest path from
+            // the orchestrator process.
             RmcpClient::new_streamable_http_client(
                 server_name,
                 &url,
