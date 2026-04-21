@@ -20,6 +20,24 @@ use crate::protocol::ReadOnlyAccess;
 use crate::protocol::SandboxPolicy;
 use crate::protocol::WritableRoot;
 
+const PRESERVED_GIT_PATH_NAME: &str = ".git";
+const PRESERVED_AGENTS_PATH_NAME: &str = ".agents";
+const PRESERVED_CODEX_PATH_NAME: &str = ".codex";
+
+/// Top-level workspace metadata paths that stay protected under writable roots.
+pub const PRESERVED_PATH_NAMES: &[&str] = &[
+    PRESERVED_GIT_PATH_NAME,
+    PRESERVED_AGENTS_PATH_NAME,
+    PRESERVED_CODEX_PATH_NAME,
+];
+
+/// Returns true when a path basename is one of the preserved workspace metadata names.
+pub fn is_preserved_path_name(name: &OsStr) -> bool {
+    PRESERVED_PATH_NAMES
+        .iter()
+        .any(|preserved| name == OsStr::new(preserved))
+}
+
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Display, Default, JsonSchema, TS,
 )]
@@ -1308,18 +1326,20 @@ fn normalize_effective_absolute_path(path: AbsolutePathBuf) -> AbsolutePathBuf {
     path
 }
 
-fn default_read_only_subpaths_for_writable_root(
+pub(crate) fn default_read_only_subpaths_for_writable_root(
     writable_root: &AbsolutePathBuf,
     protect_missing_preserved_paths: bool,
 ) -> Vec<AbsolutePathBuf> {
     let mut subpaths: Vec<AbsolutePathBuf> = Vec::new();
-    let top_level_git = writable_root.join(".git");
+    let top_level_git = writable_root.join(PRESERVED_GIT_PATH_NAME);
     // This applies to typical repos (directory .git), worktrees/submodules
     // (file .git with gitdir pointer), and bare repos when the gitdir is the
     // writable root itself.
     let top_level_git_is_file = top_level_git.as_path().is_file();
     let top_level_git_is_dir = top_level_git.as_path().is_dir();
-    if top_level_git_is_dir || top_level_git_is_file || protect_missing_preserved_paths {
+    let protect_missing_top_level_git =
+        protect_missing_preserved_paths && !has_ancestor_git_metadata(writable_root);
+    if top_level_git_is_dir || top_level_git_is_file || protect_missing_top_level_git {
         if top_level_git_is_file
             && is_git_pointer_file(&top_level_git)
             && let Some(gitdir) = resolve_gitdir_from_file(&top_level_git)
@@ -1329,7 +1349,7 @@ fn default_read_only_subpaths_for_writable_root(
         subpaths.push(top_level_git);
     }
 
-    let top_level_agents = writable_root.join(".agents");
+    let top_level_agents = writable_root.join(PRESERVED_AGENTS_PATH_NAME);
     if protect_missing_preserved_paths || top_level_agents.as_path().is_dir() {
         subpaths.push(top_level_agents);
     }
@@ -1338,7 +1358,7 @@ fn default_read_only_subpaths_for_writable_root(
     // default. For the workspace root itself, protect it even before the
     // directory exists so first-time creation still goes through the
     // preserved path approval flow.
-    let top_level_codex = writable_root.join(".codex");
+    let top_level_codex = writable_root.join(PRESERVED_CODEX_PATH_NAME);
     if protect_missing_preserved_paths || top_level_codex.as_path().is_dir() {
         subpaths.push(top_level_codex);
     }
@@ -1390,8 +1410,33 @@ fn has_explicit_resolved_path_entry(
     entries.iter().any(|entry| &entry.path == path)
 }
 
+fn has_ancestor_git_metadata(writable_root: &AbsolutePathBuf) -> bool {
+    writable_root.as_path().parent().is_some_and(|parent| {
+        parent
+            .ancestors()
+            .any(|ancestor| is_valid_git_metadata_path(&ancestor.join(PRESERVED_GIT_PATH_NAME)))
+    })
+}
+
+fn is_valid_git_metadata_path(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if metadata.is_dir() {
+        return true;
+    }
+    if !metadata.is_file() {
+        return false;
+    }
+    let Ok(dot_git) = AbsolutePathBuf::from_absolute_path(path) else {
+        return false;
+    };
+    is_git_pointer_file(&dot_git) && resolve_gitdir_from_file(&dot_git).is_some()
+}
+
 fn is_git_pointer_file(path: &AbsolutePathBuf) -> bool {
-    path.as_path().is_file() && path.as_path().file_name() == Some(OsStr::new(".git"))
+    path.as_path().is_file()
+        && path.as_path().file_name() == Some(OsStr::new(PRESERVED_GIT_PATH_NAME))
 }
 
 fn resolve_gitdir_from_file(dot_git: &AbsolutePathBuf) -> Option<AbsolutePathBuf> {
@@ -1408,7 +1453,14 @@ fn resolve_gitdir_from_file(dot_git: &AbsolutePathBuf) -> Option<AbsolutePathBuf
 
     let trimmed = contents.trim();
     let (_, gitdir_raw) = match trimmed.split_once(':') {
-        Some(parts) => parts,
+        Some((prefix, gitdir_raw)) if prefix.trim() == "gitdir" => (prefix, gitdir_raw),
+        Some(_) => {
+            error!(
+                "Expected {path} to contain a gitdir pointer, but it did not match `gitdir: <path>`.",
+                path = dot_git.as_path().display()
+            );
+            return None;
+        }
         None => {
             error!(
                 "Expected {path} to contain a gitdir pointer, but it did not match `gitdir: <path>`.",
@@ -1534,6 +1586,69 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn writable_roots_do_not_shadow_parent_git_repo_with_missing_git_mask() {
+        let repo = TempDir::new().expect("tempdir");
+        fs::create_dir(repo.path().join(".git")).expect("create parent .git");
+        let cwd = repo.path().join("sub");
+        fs::create_dir(&cwd).expect("create subdir");
+        let expected_root =
+            AbsolutePathBuf::from_absolute_path(cwd.canonicalize().expect("canonicalize cwd"))
+                .expect("absolute canonical root");
+        let expected_dot_git = expected_root.join(".git");
+        let expected_dot_agents = expected_root.join(".agents");
+        let expected_dot_codex = expected_root.join(".codex");
+
+        let policy = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
+            path: FileSystemPath::Special {
+                value: FileSystemSpecialPath::CurrentWorkingDirectory,
+            },
+            access: FileSystemAccessMode::Write,
+        }]);
+
+        let writable_roots = policy.get_writable_roots_with_cwd(&cwd);
+        assert_eq!(writable_roots.len(), 1);
+        assert_eq!(writable_roots[0].root, expected_root);
+        assert!(
+            !writable_roots[0]
+                .read_only_subpaths
+                .contains(&expected_dot_git)
+        );
+        assert!(
+            writable_roots[0]
+                .read_only_subpaths
+                .contains(&expected_dot_agents)
+        );
+        assert!(
+            writable_roots[0]
+                .read_only_subpaths
+                .contains(&expected_dot_codex)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_roots_protect_missing_git_when_parent_git_metadata_is_invalid() {
+        let repo = TempDir::new().expect("tempdir");
+        fs::create_dir(repo.path().join("real_git_dir")).expect("create real git dir");
+        fs::write(repo.path().join(".git"), "notgitdir: real_git_dir").expect("write parent .git");
+        let cwd = repo.path().join("sub");
+        fs::create_dir(&cwd).expect("create subdir");
+        let expected_root =
+            AbsolutePathBuf::from_absolute_path(cwd.canonicalize().expect("canonicalize cwd"))
+                .expect("absolute canonical root");
+        let expected_dot_git = expected_root.join(".git");
+
+        assert!(
+            default_read_only_subpaths_for_writable_root(
+                &expected_root,
+                /*protect_missing_preserved_paths*/ true,
+            )
+            .contains(&expected_dot_git)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn writable_roots_skip_default_preserved_paths_when_explicit_user_rule_exists() {
         let cwd = TempDir::new().expect("tempdir");
         let expected_root = AbsolutePathBuf::from_absolute_path(
@@ -1628,27 +1743,15 @@ mod tests {
     #[test]
     fn legacy_workspace_write_projection_accepts_relative_cwd() {
         let relative_cwd = Path::new("workspace");
-        let expected_dot_git = AbsolutePathBuf::from_absolute_path(
+        let expected_root = AbsolutePathBuf::from_absolute_path(
             std::env::current_dir()
                 .expect("current dir")
-                .join(relative_cwd)
-                .join(".git"),
+                .join(relative_cwd),
         )
-        .expect("absolute dot git");
-        let expected_dot_agents = AbsolutePathBuf::from_absolute_path(
-            std::env::current_dir()
-                .expect("current dir")
-                .join(relative_cwd)
-                .join(".agents"),
-        )
-        .expect("absolute dot agents");
-        let expected_dot_codex = AbsolutePathBuf::from_absolute_path(
-            std::env::current_dir()
-                .expect("current dir")
-                .join(relative_cwd)
-                .join(".codex"),
-        )
-        .expect("absolute dot codex");
+        .expect("absolute root");
+        let expected_dot_git = expected_root.join(".git");
+        let expected_dot_agents = expected_root.join(".agents");
+        let expected_dot_codex = expected_root.join(".codex");
         let policy = SandboxPolicy::WorkspaceWrite {
             writable_roots: vec![],
             read_only_access: ReadOnlyAccess::Restricted {
@@ -1663,34 +1766,37 @@ mod tests {
         let file_system_policy =
             FileSystemSandboxPolicy::from_legacy_sandbox_policy(&policy, relative_cwd);
 
+        let mut expected_entries = vec![FileSystemSandboxEntry {
+            path: FileSystemPath::Special {
+                value: FileSystemSpecialPath::CurrentWorkingDirectory,
+            },
+            access: FileSystemAccessMode::Write,
+        }];
+        let protects_missing_dot_git = !has_ancestor_git_metadata(&expected_root);
+        if protects_missing_dot_git {
+            expected_entries.push(FileSystemSandboxEntry {
+                path: FileSystemPath::Path {
+                    path: expected_dot_git,
+                },
+                access: FileSystemAccessMode::Read,
+            });
+        }
+        expected_entries.push(FileSystemSandboxEntry {
+            path: FileSystemPath::Path {
+                path: expected_dot_agents,
+            },
+            access: FileSystemAccessMode::Read,
+        });
+        expected_entries.push(FileSystemSandboxEntry {
+            path: FileSystemPath::Path {
+                path: expected_dot_codex,
+            },
+            access: FileSystemAccessMode::Read,
+        });
+
         assert_eq!(
             file_system_policy,
-            FileSystemSandboxPolicy::restricted(vec![
-                FileSystemSandboxEntry {
-                    path: FileSystemPath::Special {
-                        value: FileSystemSpecialPath::CurrentWorkingDirectory,
-                    },
-                    access: FileSystemAccessMode::Write,
-                },
-                FileSystemSandboxEntry {
-                    path: FileSystemPath::Path {
-                        path: expected_dot_git,
-                    },
-                    access: FileSystemAccessMode::Read,
-                },
-                FileSystemSandboxEntry {
-                    path: FileSystemPath::Path {
-                        path: expected_dot_agents,
-                    },
-                    access: FileSystemAccessMode::Read,
-                },
-                FileSystemSandboxEntry {
-                    path: FileSystemPath::Path {
-                        path: expected_dot_codex,
-                    },
-                    access: FileSystemAccessMode::Read,
-                },
-            ])
+            FileSystemSandboxPolicy::restricted(expected_entries)
         );
         assert!(
             !file_system_policy.can_write_path_with_cwd(Path::new(".git/config"), relative_cwd,)

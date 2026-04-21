@@ -7,6 +7,8 @@ use std::io::Read;
 use std::os::fd::FromRawFd;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicI32;
+use std::sync::atomic::Ordering;
 
 use crate::bwrap::BwrapNetworkMode;
 use crate::bwrap::BwrapOptions;
@@ -20,6 +22,11 @@ use codex_protocol::protocol::FileSystemSandboxPolicy;
 use codex_protocol::protocol::NetworkSandboxPolicy;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_sandboxing::landlock::CODEX_LINUX_SANDBOX_ARG0;
+
+static BWRAP_CHILD_PID: AtomicI32 = AtomicI32::new(0);
+
+const FORWARDED_SIGNALS: &[libc::c_int] =
+    &[libc::SIGHUP, libc::SIGINT, libc::SIGQUIT, libc::SIGTERM];
 
 #[derive(Debug, Parser)]
 /// CLI surface for the Linux sandbox helper.
@@ -572,7 +579,12 @@ fn run_or_exec_bwrap(bwrap_args: crate::bwrap::BwrapArgs) -> ! {
 }
 
 fn run_bwrap_in_child_with_synthetic_mount_cleanup(bwrap_args: crate::bwrap::BwrapArgs) -> ! {
-    let synthetic_mount_targets = bwrap_args.synthetic_mount_targets.clone();
+    let crate::bwrap::BwrapArgs {
+        args,
+        preserved_files,
+        synthetic_mount_targets,
+    } = bwrap_args;
+    let parent_pid = unsafe { libc::getpid() };
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         let err = std::io::Error::last_os_error();
@@ -580,18 +592,67 @@ fn run_bwrap_in_child_with_synthetic_mount_cleanup(bwrap_args: crate::bwrap::Bwr
     }
 
     if pid == 0 {
-        exec_bwrap(bwrap_args.args, bwrap_args.preserved_files);
+        terminate_with_parent(parent_pid);
+        exec_bwrap(args, preserved_files);
     }
 
-    let mut status: libc::c_int = 0;
-    let wait_res = unsafe { libc::waitpid(pid, &mut status as *mut libc::c_int, 0) };
-    if wait_res < 0 {
-        let err = std::io::Error::last_os_error();
-        panic!("waitpid failed for bubblewrap child: {err}");
-    }
-
+    install_bwrap_signal_forwarders(pid);
+    let status = wait_for_bwrap_child(pid);
+    BWRAP_CHILD_PID.store(0, Ordering::SeqCst);
     cleanup_synthetic_mount_targets(&synthetic_mount_targets);
     exit_with_wait_status(status);
+}
+
+fn terminate_with_parent(parent_pid: libc::pid_t) {
+    let res = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) };
+    if res < 0 {
+        let err = std::io::Error::last_os_error();
+        panic!("failed to set bubblewrap child parent-death signal: {err}");
+    }
+    if unsafe { libc::getppid() } != parent_pid {
+        unsafe {
+            libc::raise(libc::SIGTERM);
+        }
+    }
+}
+
+fn install_bwrap_signal_forwarders(pid: libc::pid_t) {
+    BWRAP_CHILD_PID.store(pid, Ordering::SeqCst);
+    for signal in FORWARDED_SIGNALS {
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = forward_signal_to_bwrap_child as *const () as libc::sighandler_t;
+        unsafe {
+            libc::sigemptyset(&mut action.sa_mask);
+            if libc::sigaction(*signal, &action, std::ptr::null_mut()) < 0 {
+                let err = std::io::Error::last_os_error();
+                panic!("failed to install bubblewrap signal forwarder for {signal}: {err}");
+            }
+        }
+    }
+}
+
+extern "C" fn forward_signal_to_bwrap_child(signal: libc::c_int) {
+    let pid = BWRAP_CHILD_PID.load(Ordering::SeqCst);
+    if pid > 0 {
+        unsafe {
+            libc::kill(pid, signal);
+        }
+    }
+}
+
+fn wait_for_bwrap_child(pid: libc::pid_t) -> libc::c_int {
+    loop {
+        let mut status: libc::c_int = 0;
+        let wait_res = unsafe { libc::waitpid(pid, &mut status as *mut libc::c_int, 0) };
+        if wait_res >= 0 {
+            return status;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        panic!("waitpid failed for bubblewrap child: {err}");
+    }
 }
 
 fn cleanup_synthetic_mount_targets(targets: &[crate::bwrap::SyntheticMountTarget]) {
@@ -649,7 +710,11 @@ fn exit_with_wait_status(status: libc::c_int) -> ! {
 ///   command, and reads are bounded to a fixed max size.
 fn run_bwrap_in_child_capture_stderr(bwrap_args: crate::bwrap::BwrapArgs) -> String {
     const MAX_PREFLIGHT_STDERR_BYTES: u64 = 64 * 1024;
-    let synthetic_mount_targets = bwrap_args.synthetic_mount_targets.clone();
+    let crate::bwrap::BwrapArgs {
+        args,
+        preserved_files,
+        synthetic_mount_targets,
+    } = bwrap_args;
 
     let mut pipe_fds = [0; 2];
     let pipe_res = unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) };
@@ -677,7 +742,7 @@ fn run_bwrap_in_child_capture_stderr(bwrap_args: crate::bwrap::BwrapArgs) -> Str
             close_fd_or_panic(write_fd, "close write end in bubblewrap child");
         }
 
-        exec_bwrap(bwrap_args.args, bwrap_args.preserved_files);
+        exec_bwrap(args, preserved_files);
     }
 
     // Parent: close the write end and read stderr while the child runs.
@@ -691,12 +756,7 @@ fn run_bwrap_in_child_capture_stderr(bwrap_args: crate::bwrap::BwrapArgs) -> Str
         panic!("failed to read bubblewrap stderr: {err}");
     }
 
-    let mut status: libc::c_int = 0;
-    let wait_res = unsafe { libc::waitpid(pid, &mut status as *mut libc::c_int, 0) };
-    if wait_res < 0 {
-        let err = std::io::Error::last_os_error();
-        panic!("waitpid failed for bubblewrap child: {err}");
-    }
+    wait_for_bwrap_child(pid);
     cleanup_synthetic_mount_targets(&synthetic_mount_targets);
 
     String::from_utf8_lossy(&stderr_bytes).into_owned()
