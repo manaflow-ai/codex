@@ -19,8 +19,11 @@ use tokio::sync::watch;
 
 use codex_app_server_protocol::AuthMode;
 use codex_app_server_protocol::AuthMode as ApiAuthMode;
+use codex_auth_provider::AuthProvider;
 use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::ModelProviderAuthInfo;
+use http::HeaderMap;
+use http::HeaderValue;
 
 use super::external_bearer::BearerTokenRefresher;
 use super::revoke::revoke_auth_tokens;
@@ -51,6 +54,19 @@ pub enum CodexAuth {
     Chatgpt(ChatgptAuth),
     ChatgptAuthTokens(ChatgptAuthTokens),
     AgentIdentity(AgentIdentityAuth),
+}
+
+#[derive(Clone, Debug)]
+pub struct CodexAuthProvider {
+    auth: CodexAuth,
+}
+
+impl CodexAuthProvider {
+    pub fn to_auth_headers(&self) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        self.add_auth_headers(&mut headers);
+        headers
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -335,6 +351,10 @@ impl CodexAuth {
         }
     }
 
+    pub fn provider(&self) -> CodexAuthProvider {
+        CodexAuthProvider { auth: self.clone() }
+    }
+
     pub async fn initialize_runtime(
         &self,
         chatgpt_base_url: Option<String>,
@@ -416,6 +436,20 @@ impl CodexAuth {
         })
     }
 
+    pub fn is_workspace_account(&self) -> bool {
+        matches!(
+            self.account_plan_type(),
+            Some(
+                AccountPlanType::Team
+                    | AccountPlanType::SelfServeBusinessUsageBased
+                    | AccountPlanType::Business
+                    | AccountPlanType::EnterpriseCbpUsageBased
+                    | AccountPlanType::Enterprise
+                    | AccountPlanType::Edu
+            )
+        )
+    }
+
     /// Returns `None` if token-backed ChatGPT auth is unavailable.
     fn get_current_auth_json(&self) -> Option<AuthDotJson> {
         let state = match self {
@@ -464,6 +498,26 @@ impl CodexAuth {
         Self::ApiKey(ApiKeyAuth {
             api_key: api_key.to_owned(),
         })
+    }
+}
+
+impl AuthProvider for CodexAuthProvider {
+    fn add_auth_headers(&self, headers: &mut HeaderMap) {
+        if let Ok(header_value) = self.auth.authorization_header_value()
+            && let Ok(header) = HeaderValue::from_str(&header_value)
+        {
+            let _ = headers.insert(http::header::AUTHORIZATION, header);
+        }
+
+        if let Some(account_id) = self.auth.get_account_id()
+            && let Ok(header) = HeaderValue::from_str(&account_id)
+        {
+            let _ = headers.insert("ChatGPT-Account-ID", header);
+        }
+
+        if self.auth.is_fedramp_account() {
+            let _ = headers.insert("X-OpenAI-Fedramp", HeaderValue::from_static("true"));
+        }
     }
 }
 
@@ -1545,31 +1599,6 @@ impl AuthManager {
             .read()
             .ok()
             .and_then(|guard| guard.clone())
-    }
-
-    /// Returns the default authorization header for ChatGPT backend requests.
-    pub async fn chatgpt_authorization_header(self: &Arc<Self>) -> Option<String> {
-        let auth = self.auth().await?;
-        self.chatgpt_authorization_header_for_auth(&auth).await
-    }
-
-    pub async fn chatgpt_authorization_header_for_auth(
-        self: &Arc<Self>,
-        auth: &CodexAuth,
-    ) -> Option<String> {
-        if !auth.is_chatgpt_auth() {
-            return None;
-        }
-
-        Self::chatgpt_bearer_authorization_header_for_auth(auth)
-    }
-
-    pub fn chatgpt_bearer_token_for_auth(auth: &CodexAuth) -> Option<String> {
-        auth.get_token().ok().filter(|token| !token.is_empty())
-    }
-
-    pub fn chatgpt_bearer_authorization_header_for_auth(auth: &CodexAuth) -> Option<String> {
-        Self::chatgpt_bearer_token_for_auth(auth).map(|token| format!("Bearer {token}"))
     }
 
     pub fn subscribe_auth_state(&self) -> watch::Receiver<()> {

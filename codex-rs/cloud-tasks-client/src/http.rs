@@ -18,6 +18,7 @@ use codex_backend_client as backend;
 use codex_backend_client::CodeTaskDetailsResponseExt;
 use codex_git_utils::ApplyGitRequest;
 use codex_git_utils::apply_git_patch;
+use http::HeaderMap;
 
 #[derive(Clone)]
 pub struct HttpClient {
@@ -39,6 +40,11 @@ impl HttpClient {
 
     pub fn with_user_agent(mut self, ua: impl Into<String>) -> Self {
         self.backend = self.backend.clone().with_user_agent(ua);
+        self
+    }
+
+    pub fn with_auth_headers(mut self, headers: HeaderMap) -> Self {
+        self.backend = self.backend.clone().with_auth_headers(headers);
         self
     }
 

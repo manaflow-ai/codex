@@ -2,6 +2,7 @@
 members = [
     "analytics",
     "agent-identity",
+    "auth-provider",
     "backend-client",
     "ansi-escape",
     "async-utils",
@@ -112,6 +113,7 @@ license = "Apache-2.0"
 app_test_support = { path = "app-server/tests/common" }
 codex-analytics = { path = "analytics" }
 codex-agent-identity = { path = "agent-identity" }
+codex-auth-provider = { path = "auth-provider" }
 codex-ansi-escape = { path = "ansi-escape" }
 codex-api = { path = "codex-api" }
 codex-app-server = { path = "app-server" }

@@ -1447,6 +1447,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "codex-auth-provider",
  "codex-client",
  "codex-protocol",
  "codex-utils-rustls-provider",
@@ -1667,6 +1668,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-auth-provider"
+version = "0.0.0"
+dependencies = [
+ "http 1.4.0",
+]
+
+[[package]]
 name = "codex-backend-client"
 version = "0.0.0"
 dependencies = [
@@ -1697,7 +1705,6 @@ dependencies = [
  "anyhow",
  "clap",
  "codex-app-server-protocol",
- "codex-config",
  "codex-connectors",
  "codex-core",
  "codex-git-utils",
@@ -1828,7 +1835,6 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
  "chrono",
  "clap",
  "codex-client",
@@ -1863,6 +1869,7 @@ dependencies = [
  "chrono",
  "codex-backend-client",
  "codex-git-utils",
+ "http 1.4.0",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -2423,6 +2430,7 @@ dependencies = [
  "chrono",
  "codex-agent-identity",
  "codex-app-server-protocol",
+ "codex-auth-provider",
  "codex-client",
  "codex-config",
  "codex-keyring-store",
@@ -2432,6 +2440,7 @@ dependencies = [
  "codex-terminal-detection",
  "codex-utils-template",
  "core_test_support",
+ "http 1.4.0",
  "keyring",
  "once_cell",
  "os_info",

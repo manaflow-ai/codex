@@ -11,6 +11,7 @@ base64 = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 codex-client = { workspace = true }
+codex-auth-provider = { workspace = true }
 codex-protocol = { workspace = true }
 codex-utils-rustls-provider = { workspace = true }
 futures = { workspace = true }

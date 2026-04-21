@@ -17,8 +17,6 @@ pub use codex_client::TransportError;
 
 pub use crate::api_bridge::map_api_error;
 pub use crate::auth::AuthHeaderTelemetry;
-pub use crate::auth::AuthProvider;
-pub use crate::auth::SharedAuthProvider;
 pub use crate::auth::auth_header_telemetry;
 pub use crate::common::CompactionInput;
 pub use crate::common::MemorySummarizeInput;
@@ -64,5 +62,7 @@ pub use crate::requests::Compression;
 pub use crate::sse::stream_from_fixture;
 pub use crate::telemetry::SseTelemetry;
 pub use crate::telemetry::WebsocketTelemetry;
+pub use codex_auth_provider::AuthProvider;
+pub use codex_auth_provider::SharedAuthProvider;
 pub use codex_protocol::protocol::RealtimeAudioFrame;
 pub use codex_protocol::protocol::RealtimeEvent;
