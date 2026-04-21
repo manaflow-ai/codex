@@ -59,7 +59,10 @@ pub fn create_model_provider(
         let aws = provider_info
             .aws
             .clone()
-            .unwrap_or(ModelProviderAwsAuthInfo { profile: None });
+            .unwrap_or(ModelProviderAwsAuthInfo {
+                profile: None,
+                region: None,
+            });
         return Arc::new(AmazonBedrockModelProvider {
             info: provider_info,
             aws,
@@ -143,6 +146,7 @@ mod tests {
         let provider = create_model_provider(
             ModelProviderInfo::create_amazon_bedrock_provider(Some(ModelProviderAwsAuthInfo {
                 profile: Some("codex-bedrock".to_string()),
+                region: None,
             })),
             Some(AuthManager::from_auth_for_testing(CodexAuth::from_api_key(
                 "openai-api-key",
@@ -159,6 +163,7 @@ mod tests {
                 name: "Custom".to_string(),
                 aws: Some(ModelProviderAwsAuthInfo {
                     profile: Some("codex-bedrock".to_string()),
+                    region: None,
                 }),
                 requires_openai_auth: false,
                 ..ModelProviderInfo::create_openai_provider(/*base_url*/ None)
