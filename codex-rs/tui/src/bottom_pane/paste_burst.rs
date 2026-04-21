@@ -159,7 +159,7 @@ const PASTE_ENTER_SUPPRESS_WINDOW: Duration = Duration::from_millis(120);
 #[cfg(not(windows))]
 const PASTE_BURST_CHAR_INTERVAL: Duration = Duration::from_millis(8);
 #[cfg(windows)]
-const PASTE_BURST_CHAR_INTERVAL: Duration = Duration::from_millis(30);
+const PASTE_BURST_CHAR_INTERVAL: Duration = Duration::from_millis(20);
 
 // Idle timeout before flushing buffered paste content.
 // Slower paste bursts have been observed in Windows environments.
