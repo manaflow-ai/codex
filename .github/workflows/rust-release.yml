@@ -510,6 +510,33 @@ jobs:
           cp scripts/install/install.sh dist/install.sh
           cp scripts/install/install.ps1 dist/install.ps1
 
+      - name: Stage installer checksums
+        env:
+          RELEASE_VERSION: ${{ steps.release_name.outputs.name }}
+        run: |
+          set -euo pipefail
+
+          checksums="dist/codex-installer_SHA256SUMS"
+          found=false
+          : > "$checksums"
+
+          for tarball in dist/npm/codex-npm-*-"${RELEASE_VERSION}".tgz; do
+            if [[ ! -e "$tarball" ]]; then
+              continue
+            fi
+
+            found=true
+            digest="$(sha256sum "$tarball" | awk '{print $1}')"
+            printf '%s  %s\n' "$digest" "$(basename "$tarball")" >> "$checksums"
+          done
+
+          if [[ "$found" != true ]]; then
+            echo "No Codex installer tarballs found for ${RELEASE_VERSION}."
+            exit 1
+          fi
+
+          sort -k2,2 "$checksums" -o "$checksums"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
         with:

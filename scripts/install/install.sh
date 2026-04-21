@@ -114,55 +114,29 @@ release_url_for_asset() {
   printf 'https://github.com/openai/codex/releases/download/rust-v%s/%s\n' "$resolved_version" "$asset"
 }
 
-release_metadata_url() {
-  resolved_version="$1"
+checksum_for_asset() {
+  checksums_path="$1"
+  asset="$2"
 
-  printf 'https://api.github.com/repos/openai/codex/releases/tags/rust-v%s\n' "$resolved_version"
-}
-
-release_asset_digest() {
-  asset="$1"
-  resolved_version="$2"
-  release_json="$(download_text "$(release_metadata_url "$resolved_version")")"
-
-  digest="$(printf '%s\n' "$release_json" | awk -v asset="$asset" '
-    {
-      if ($0 ~ "\"name\":[[:space:]]*\"" asset "\"") {
-        in_asset = 1
-        asset_depth = depth
-      }
-
-      if (in_asset && /"digest":[[:space:]]*"[^"]+"/) {
-        sub(/^.*"digest":[[:space:]]*"/, "")
-        sub(/".*$/, "")
-        digest = $0
-      }
-
-      line = $0
-      opens = gsub(/\{/, "{", line)
-      closes = gsub(/\}/, "}", line)
-      depth += opens - closes
-
-      if (in_asset && depth < asset_depth) {
-        in_asset = 0
-      }
+  digest="$(awk -v asset="$asset" '
+    $2 == asset {
+      print $1
+      found = 1
+      exit
     }
     END {
-      if (digest != "") {
-        print digest
+      if (!found) {
+        exit 1
       }
     }
-  ')"
+  ' "$checksums_path" || true)"
 
-  case "$digest" in
-    sha256:????????????????????????????????????????????????????????????????)
-      printf '%s\n' "${digest#sha256:}"
-      ;;
-    *)
-      echo "Could not find SHA-256 digest for release asset $asset." >&2
-      exit 1
-      ;;
-  esac
+  if ! printf '%s\n' "$digest" | grep -Eq '^[0-9a-fA-F]{64}$'; then
+    echo "Could not find SHA-256 checksum for release asset $asset." >&2
+    exit 1
+  fi
+
+  printf '%s\n' "$digest" | tr 'A-F' 'a-f'
 }
 
 file_sha256() {
@@ -193,7 +167,7 @@ verify_archive_digest() {
   actual_digest="$(file_sha256 "$archive_path")"
 
   if [ "$actual_digest" != "$expected_digest" ]; then
-    echo "Downloaded Codex archive checksum did not match release metadata." >&2
+    echo "Downloaded Codex archive checksum did not match release checksums." >&2
     echo "expected: $expected_digest" >&2
     echo "actual:   $actual_digest" >&2
     exit 1
@@ -728,10 +702,12 @@ if ! release_dir_is_complete "$release_dir" "$resolved_version" "$vendor_target"
   fi
 
   archive_path="$tmp_dir/$asset"
+  checksums_path="$tmp_dir/codex-installer_SHA256SUMS"
   extract_dir="$tmp_dir/extract"
 
   step "Downloading Codex CLI"
-  expected_digest="$(release_asset_digest "$asset" "$resolved_version")"
+  download_file "$(release_url_for_asset "codex-installer_SHA256SUMS" "$resolved_version")" "$checksums_path"
+  expected_digest="$(checksum_for_asset "$checksums_path" "$asset")"
   download_file "$download_url" "$archive_path"
   verify_archive_digest "$archive_path" "$expected_digest"
 
