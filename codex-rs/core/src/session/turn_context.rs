@@ -2,12 +2,21 @@ use super::*;
 use crate::EnvironmentSelection;
 use codex_model_provider::SharedModelProvider;
 use codex_model_provider::create_model_provider;
+use codex_protocol::protocol::TurnEnvironmentSelection;
 
 pub(super) fn image_generation_tool_auth_allowed(auth_manager: Option<&AuthManager>) -> bool {
     matches!(
         auth_manager.and_then(AuthManager::auth_mode),
         Some(AuthMode::Chatgpt)
     )
+}
+
+fn multi_environment_tools_enabled(
+    features: &codex_features::Features,
+    environments: Option<&[TurnEnvironment]>,
+) -> bool {
+    features.enabled(codex_features::Feature::MultiEnvironmentTools)
+        && environments.is_some_and(|environments| !environments.is_empty())
 }
 
 #[derive(Clone, Debug)]
@@ -31,6 +40,24 @@ pub(crate) struct TurnEnvironment {
     pub(crate) environment_id: String,
     pub(crate) environment: Arc<Environment>,
     pub(crate) cwd: AbsolutePathBuf,
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub(crate) struct SelectedTurnEnvironment {
+    pub(crate) environment_id: Option<String>,
+    pub(crate) environment: Arc<Environment>,
+    pub(crate) cwd: AbsolutePathBuf,
+}
+
+impl TurnEnvironment {
+    fn selected(&self) -> SelectedTurnEnvironment {
+        SelectedTurnEnvironment {
+            environment_id: Some(self.environment_id.clone()),
+            environment: Arc::clone(&self.environment),
+            cwd: self.cwd.clone(),
+        }
+    }
 }
 
 /// The context needed for a single turn of the thread.
@@ -137,6 +164,8 @@ impl TurnContext {
             /*developer_instructions*/ None,
         );
         let features = self.features.clone();
+        let multi_environment_tools =
+            multi_environment_tools_enabled(&features, self.environments.as_deref());
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
             available_models: &models_manager
@@ -155,6 +184,7 @@ impl TurnContext {
         .with_web_search_config(self.tools_config.web_search_config.clone())
         .with_allow_login_shell(self.tools_config.allow_login_shell)
         .with_has_environment(self.tools_config.has_environment)
+        .with_multi_environment_tools(multi_environment_tools)
         .with_spawn_agent_usage_hint(config.multi_agent_v2.usage_hint_enabled)
         .with_spawn_agent_usage_hint_text(config.multi_agent_v2.usage_hint_text.clone())
         .with_hide_spawn_agent_metadata(config.multi_agent_v2.hide_spawn_agent_metadata)
@@ -216,14 +246,60 @@ impl TurnContext {
             .map_or_else(|| self.cwd.clone(), |path| self.cwd.join(path))
     }
 
-    pub(crate) fn file_system_sandbox_context(
+    #[allow(dead_code)]
+    pub(crate) fn primary_environment(&self) -> Option<SelectedTurnEnvironment> {
+        self.environments
+            .as_ref()
+            .and_then(|environments| environments.first())
+            .map(TurnEnvironment::selected)
+            .or_else(|| {
+                self.environment
+                    .as_ref()
+                    .map(|environment| SelectedTurnEnvironment {
+                        environment_id: None,
+                        environment: Arc::clone(environment),
+                        cwd: self.cwd.clone(),
+                    })
+            })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn environment_for_tool(
         &self,
+        environment_id: Option<&str>,
+    ) -> Option<SelectedTurnEnvironment> {
+        match environment_id {
+            Some(environment_id) => self
+                .environments
+                .as_ref()?
+                .iter()
+                .find(|environment| environment.environment_id == environment_id)
+                .map(TurnEnvironment::selected),
+            None => self.primary_environment(),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn resolve_path_for_environment(
+        &self,
+        environment: &SelectedTurnEnvironment,
+        path: Option<String>,
+    ) -> AbsolutePathBuf {
+        path.as_ref().map_or_else(
+            || environment.cwd.clone(),
+            |path| environment.cwd.join(path),
+        )
+    }
+
+    pub(crate) fn file_system_sandbox_context_for_cwd(
+        &self,
+        cwd: &AbsolutePathBuf,
         additional_permissions: Option<PermissionProfile>,
     ) -> FileSystemSandboxContext {
         FileSystemSandboxContext {
             sandbox_policy: self.sandbox_policy.get().clone(),
-            sandbox_policy_cwd: Some(self.cwd.clone()),
-            file_system_sandbox_policy: self.non_legacy_file_system_sandbox_policy(),
+            sandbox_policy_cwd: Some(cwd.clone()),
+            file_system_sandbox_policy: self.non_legacy_file_system_sandbox_policy(cwd),
             windows_sandbox_level: self.windows_sandbox_level,
             windows_sandbox_private_desktop: self
                 .config
@@ -234,15 +310,16 @@ impl TurnContext {
         }
     }
 
-    fn non_legacy_file_system_sandbox_policy(&self) -> Option<FileSystemSandboxPolicy> {
+    fn non_legacy_file_system_sandbox_policy(
+        &self,
+        cwd: &AbsolutePathBuf,
+    ) -> Option<FileSystemSandboxPolicy> {
         // Omit the derived split filesystem policy when it is equivalent to
         // the legacy sandbox policy. This keeps turn-context payloads stable
         // while both fields exist; once callers consume only the split policy,
         // this comparison and the legacy projection should go away.
-        let legacy_file_system_sandbox_policy = FileSystemSandboxPolicy::from_legacy_sandbox_policy(
-            self.sandbox_policy.get(),
-            &self.cwd,
-        );
+        let legacy_file_system_sandbox_policy =
+            FileSystemSandboxPolicy::from_legacy_sandbox_policy(self.sandbox_policy.get(), cwd);
         (self.file_system_sandbox_policy != legacy_file_system_sandbox_policy)
             .then(|| self.file_system_sandbox_policy.clone())
     }
@@ -258,12 +335,21 @@ impl TurnContext {
             turn_id: Some(self.sub_id.clone()),
             trace_id: self.trace_id.clone(),
             cwd: self.cwd.to_path_buf(),
+            environments: self.environments.as_ref().map(|environments| {
+                environments
+                    .iter()
+                    .map(|environment| TurnEnvironmentSelection {
+                        environment_id: environment.environment_id.clone(),
+                        cwd: environment.cwd.clone(),
+                    })
+                    .collect()
+            }),
             current_date: self.current_date.clone(),
             timezone: self.timezone.clone(),
             approval_policy: self.approval_policy.value(),
             sandbox_policy: self.sandbox_policy.get().clone(),
             network: self.turn_context_network_item(),
-            file_system_sandbox_policy: self.non_legacy_file_system_sandbox_policy(),
+            file_system_sandbox_policy: self.non_legacy_file_system_sandbox_policy(&self.cwd),
             model: self.model_info.slug.clone(),
             personality: self.personality,
             collaboration_mode: Some(self.collaboration_mode.clone()),
@@ -377,6 +463,8 @@ impl Session {
         let session_source = session_configuration.session_source.clone();
         let image_generation_tool_auth_allowed =
             image_generation_tool_auth_allowed(auth_manager.as_deref());
+        let multi_environment_tools =
+            multi_environment_tools_enabled(&per_turn_config.features, environments.as_deref());
         let auth_manager_for_context = auth_manager.clone();
         let provider_for_context = create_model_provider(provider, auth_manager);
         let session_telemetry_for_context = session_telemetry;
@@ -398,6 +486,7 @@ impl Session {
         .with_web_search_config(per_turn_config.web_search_config.clone())
         .with_allow_login_shell(per_turn_config.permissions.allow_login_shell)
         .with_has_environment(environment.is_some())
+        .with_multi_environment_tools(multi_environment_tools)
         .with_spawn_agent_usage_hint(per_turn_config.multi_agent_v2.usage_hint_enabled)
         .with_spawn_agent_usage_hint_text(per_turn_config.multi_agent_v2.usage_hint_text.clone())
         .with_hide_spawn_agent_metadata(per_turn_config.multi_agent_v2.hide_spawn_agent_metadata)
