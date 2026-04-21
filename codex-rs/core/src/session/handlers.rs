@@ -166,10 +166,15 @@ pub(super) async fn user_input_or_turn_inner(
                     personality,
                     app_server_client_name: None,
                     app_server_client_version: None,
-                    environment_selections: None,
+                    environments: None,
                 },
                 None,
-                environments,
+                environments.map(|environments| {
+                    environments
+                        .into_iter()
+                        .map(EnvironmentSelection::from)
+                        .collect()
+                }),
             )
         }
         Op::UserInput {
@@ -184,7 +189,12 @@ pub(super) async fn user_input_or_turn_inner(
                 ..Default::default()
             },
             responsesapi_client_metadata,
-            environments,
+            environments.map(|environments| {
+                environments
+                    .into_iter()
+                    .map(EnvironmentSelection::from)
+                    .collect()
+            }),
         ),
         _ => unreachable!(),
     };
@@ -1103,7 +1113,12 @@ pub(super) async fn submission_loop(
                             reasoning_summary: summary,
                             service_tier,
                             personality,
-                            environment_selections: environments,
+                            environments: environments.map(|environments| {
+                                environments
+                                    .into_iter()
+                                    .map(EnvironmentSelection::from)
+                                    .collect()
+                            }),
                             ..Default::default()
                         },
                     )

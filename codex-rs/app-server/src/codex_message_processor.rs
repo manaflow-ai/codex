@@ -214,6 +214,7 @@ use codex_backend_client::Client as BackendClient;
 use codex_chatgpt::connectors;
 use codex_config::types::McpServerTransportConfig;
 use codex_core::CodexThread;
+use codex_core::EnvironmentSelection;
 use codex_core::ForkSnapshot;
 use codex_core::NewThread;
 use codex_core::RolloutRecorder;
@@ -319,7 +320,6 @@ use codex_protocol::protocol::ReviewTarget as CoreReviewTarget;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::protocol::SessionMetaLine;
-use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::USER_MESSAGE_BEGIN;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_protocol::user_input::MAX_USER_INPUT_TEXT_CHARS;
@@ -2360,7 +2360,7 @@ impl CodexMessageProcessor {
         let environments = environments.map(|environments| {
             environments
                 .into_iter()
-                .map(|environment| TurnEnvironmentSelection {
+                .map(|environment| EnvironmentSelection {
                     environment_id: environment.environment_id,
                     cwd: environment.cwd,
                 })
@@ -2478,7 +2478,7 @@ impl CodexMessageProcessor {
         typesafe_overrides: ConfigOverrides,
         dynamic_tools: Option<Vec<ApiDynamicToolSpec>>,
         session_start_source: Option<codex_app_server_protocol::ThreadStartSource>,
-        environment_selections: Option<Vec<TurnEnvironmentSelection>>,
+        environments: Option<Vec<EnvironmentSelection>>,
         persist_extended_history: bool,
         service_name: Option<String>,
         experimental_raw_events: bool,
@@ -2626,7 +2626,7 @@ impl CodexMessageProcessor {
                 persist_extended_history,
                 metrics_service_name: service_name,
                 parent_trace: request_trace,
-                environment_selections,
+                environments,
             })
             .instrument(tracing::info_span!(
                 "app_server.thread_start.create_thread",
@@ -7188,7 +7188,7 @@ impl CodexMessageProcessor {
         let environments = params.environments.map(|environments| {
             environments
                 .into_iter()
-                .map(|environment| TurnEnvironmentSelection {
+                .map(|environment| EnvironmentSelection {
                     environment_id: environment.environment_id,
                     cwd: environment.cwd,
                 })
