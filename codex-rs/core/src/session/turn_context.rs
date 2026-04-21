@@ -3,10 +3,7 @@ use codex_model_provider::SharedModelProvider;
 use codex_model_provider::create_model_provider;
 
 pub(super) fn image_generation_tool_auth_allowed(auth_manager: Option<&AuthManager>) -> bool {
-    auth_manager
-        .and_then(AuthManager::auth_cached)
-        .as_ref()
-        .is_some_and(CodexAuth::uses_codex_backend)
+    auth_manager.is_some_and(AuthManager::current_auth_uses_codex_backend)
 }
 
 #[derive(Clone, Debug)]
@@ -86,9 +83,7 @@ impl TurnContext {
         let uses_codex_backend = self
             .auth_manager
             .as_deref()
-            .and_then(AuthManager::auth_cached)
-            .as_ref()
-            .is_some_and(CodexAuth::uses_codex_backend);
+            .is_some_and(AuthManager::current_auth_uses_codex_backend);
         self.features.apps_enabled_for_auth(uses_codex_backend)
     }
 

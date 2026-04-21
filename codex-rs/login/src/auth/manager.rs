@@ -17,6 +17,9 @@ use std::sync::atomic::Ordering;
 use tokio::sync::Semaphore;
 use tokio::sync::watch;
 
+use codex_agent_identity::AgentIdentityKey;
+use codex_agent_identity::AgentTaskAuthorizationTarget;
+use codex_agent_identity::authorization_header_for_agent_task;
 use codex_app_server_protocol::AuthMode;
 use codex_app_server_protocol::AuthMode as ApiAuthMode;
 use codex_auth_provider::AuthProvider;
@@ -341,16 +344,6 @@ impl CodexAuth {
         }
     }
 
-    /// Returns the complete Authorization header value for the current auth.
-    pub fn authorization_header_value(&self) -> Result<String, std::io::Error> {
-        match self {
-            Self::AgentIdentity(auth) => auth.authorization_header_value(),
-            Self::ApiKey(_) | Self::Chatgpt(_) | Self::ChatgptAuthTokens(_) => {
-                self.get_token().map(|token| format!("Bearer {token}"))
-            }
-        }
-    }
-
     pub fn provider(&self) -> CodexAuthProvider {
         CodexAuthProvider { auth: self.clone() }
     }
@@ -503,7 +496,33 @@ impl CodexAuth {
 
 impl AuthProvider for CodexAuthProvider {
     fn add_auth_headers(&self, headers: &mut HeaderMap) {
-        if let Ok(header_value) = self.auth.authorization_header_value()
+        let header_value = match &self.auth {
+            CodexAuth::AgentIdentity(auth) => {
+                let record = auth.record();
+                let process_task_id = auth.process_task_id.get().ok_or_else(|| {
+                    std::io::Error::other("agent identity process task is not initialized")
+                });
+                process_task_id.and_then(|task_id| {
+                    authorization_header_for_agent_task(
+                        AgentIdentityKey {
+                            agent_runtime_id: &record.agent_runtime_id,
+                            private_key_pkcs8_base64: &record.agent_private_key,
+                        },
+                        AgentTaskAuthorizationTarget {
+                            agent_runtime_id: &record.agent_runtime_id,
+                            task_id,
+                        },
+                    )
+                    .map_err(std::io::Error::other)
+                })
+            }
+            CodexAuth::ApiKey(auth) => Ok(format!("Bearer {}", auth.api_key)),
+            CodexAuth::Chatgpt(_) | CodexAuth::ChatgptAuthTokens(_) => {
+                self.auth.get_token().map(|token| format!("Bearer {token}"))
+            }
+        };
+
+        if let Ok(header_value) = header_value
             && let Ok(header) = HeaderValue::from_str(&header_value)
         {
             let _ = headers.insert(http::header::AUTHORIZATION, header);
@@ -1807,6 +1826,13 @@ impl AuthManager {
             return Some(AuthMode::ApiKey);
         }
         self.auth_cached().as_ref().map(CodexAuth::auth_mode)
+    }
+
+    pub fn current_auth_uses_codex_backend(&self) -> bool {
+        matches!(
+            self.auth_mode(),
+            Some(AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens | AuthMode::AgentIdentity)
+        )
     }
 
     fn is_stale_for_proactive_refresh(auth: &CodexAuth) -> bool {
