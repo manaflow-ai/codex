@@ -1,0 +1,79 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "definitions": {
+    "NullableString": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "properties": {
+    "account_id": {
+      "$ref": "#/definitions/NullableString"
+    },
+    "codex_home": {
+      "type": "string"
+    },
+    "cwd": {
+      "type": "string"
+    },
+    "error_kind": {
+      "enum": [
+        "usage_limit_reached",
+        "quota_exceeded"
+      ],
+      "type": "string"
+    },
+    "hook_event_name": {
+      "const": "SubscriptionExhausted",
+      "type": "string"
+    },
+    "model": {
+      "type": "string"
+    },
+    "permission_mode": {
+      "enum": [
+        "default",
+        "acceptEdits",
+        "plan",
+        "dontAsk",
+        "bypassPermissions"
+      ],
+      "type": "string"
+    },
+    "plan_type": {
+      "$ref": "#/definitions/NullableString"
+    },
+    "resets_at": {
+      "format": "int64",
+      "type": "integer"
+    },
+    "session_id": {
+      "type": "string"
+    },
+    "transcript_path": {
+      "$ref": "#/definitions/NullableString"
+    },
+    "turn_id": {
+      "description": "Codex extension: expose the active turn id to internal turn-scoped hooks.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "account_id",
+    "codex_home",
+    "cwd",
+    "error_kind",
+    "hook_event_name",
+    "model",
+    "permission_mode",
+    "plan_type",
+    "session_id",
+    "transcript_path",
+    "turn_id"
+  ],
+  "title": "subscription-exhausted.command.input",
+  "type": "object"
+}

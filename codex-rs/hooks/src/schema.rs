@@ -25,6 +25,10 @@ const USER_PROMPT_SUBMIT_INPUT_FIXTURE: &str = "user-prompt-submit.command.input
 const USER_PROMPT_SUBMIT_OUTPUT_FIXTURE: &str = "user-prompt-submit.command.output.schema.json";
 const STOP_INPUT_FIXTURE: &str = "stop.command.input.schema.json";
 const STOP_OUTPUT_FIXTURE: &str = "stop.command.output.schema.json";
+const SUBSCRIPTION_EXHAUSTED_INPUT_FIXTURE: &str =
+    "subscription-exhausted.command.input.schema.json";
+const SUBSCRIPTION_EXHAUSTED_OUTPUT_FIXTURE: &str =
+    "subscription-exhausted.command.output.schema.json";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(transparent)]
@@ -81,6 +85,8 @@ pub(crate) enum HookEventNameWire {
     UserPromptSubmit,
     #[serde(rename = "Stop")]
     Stop,
+    #[serde(rename = "SubscriptionExhausted")]
+    SubscriptionExhausted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -326,6 +332,15 @@ pub(crate) struct StopCommandOutputWire {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+#[schemars(rename = "subscription-exhausted.command.output")]
+pub(crate) struct SubscriptionExhaustedCommandOutputWire {
+    #[serde(flatten)]
+    pub universal: HookUniversalOutputWire,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub(crate) enum BlockDecisionWire {
     #[serde(rename = "block")]
@@ -404,6 +419,28 @@ pub(crate) struct StopCommandInput {
     pub last_assistant_message: NullableString,
 }
 
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(rename = "subscription-exhausted.command.input")]
+pub(crate) struct SubscriptionExhaustedCommandInput {
+    pub session_id: String,
+    /// Codex extension: expose the active turn id to internal turn-scoped hooks.
+    pub turn_id: String,
+    pub transcript_path: NullableString,
+    pub cwd: String,
+    pub codex_home: String,
+    #[schemars(schema_with = "subscription_exhausted_hook_event_name_schema")]
+    pub hook_event_name: String,
+    pub model: String,
+    #[schemars(schema_with = "permission_mode_schema")]
+    pub permission_mode: String,
+    #[schemars(schema_with = "subscription_exhausted_error_kind_schema")]
+    pub error_kind: String,
+    pub plan_type: NullableString,
+    pub resets_at: Option<i64>,
+    pub account_id: NullableString,
+}
+
 pub fn write_schema_fixtures(schema_root: &Path) -> anyhow::Result<()> {
     let generated_dir = schema_root.join(GENERATED_DIR);
     ensure_empty_dir(&generated_dir)?;
@@ -455,6 +492,14 @@ pub fn write_schema_fixtures(schema_root: &Path) -> anyhow::Result<()> {
     write_schema(
         &generated_dir.join(STOP_OUTPUT_FIXTURE),
         schema_json::<StopCommandOutputWire>()?,
+    )?;
+    write_schema(
+        &generated_dir.join(SUBSCRIPTION_EXHAUSTED_INPUT_FIXTURE),
+        schema_json::<SubscriptionExhaustedCommandInput>()?,
+    )?;
+    write_schema(
+        &generated_dir.join(SUBSCRIPTION_EXHAUSTED_OUTPUT_FIXTURE),
+        schema_json::<SubscriptionExhaustedCommandOutputWire>()?,
     )?;
 
     Ok(())
@@ -535,6 +580,10 @@ fn stop_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema {
     string_const_schema("Stop")
 }
 
+fn subscription_exhausted_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema {
+    string_const_schema("SubscriptionExhausted")
+}
+
 fn permission_mode_schema(_gen: &mut SchemaGenerator) -> Schema {
     string_enum_schema(&[
         "default",
@@ -547,6 +596,10 @@ fn permission_mode_schema(_gen: &mut SchemaGenerator) -> Schema {
 
 fn session_start_source_schema(_gen: &mut SchemaGenerator) -> Schema {
     string_enum_schema(&["startup", "resume", "clear"])
+}
+
+fn subscription_exhausted_error_kind_schema(_gen: &mut SchemaGenerator) -> Schema {
+    string_enum_schema(&["usage_limit_reached", "quota_exceeded"])
 }
 
 fn string_const_schema(value: &str) -> Schema {
@@ -591,7 +644,10 @@ mod tests {
     use super::SESSION_START_OUTPUT_FIXTURE;
     use super::STOP_INPUT_FIXTURE;
     use super::STOP_OUTPUT_FIXTURE;
+    use super::SUBSCRIPTION_EXHAUSTED_INPUT_FIXTURE;
+    use super::SUBSCRIPTION_EXHAUSTED_OUTPUT_FIXTURE;
     use super::StopCommandInput;
+    use super::SubscriptionExhaustedCommandInput;
     use super::USER_PROMPT_SUBMIT_INPUT_FIXTURE;
     use super::USER_PROMPT_SUBMIT_OUTPUT_FIXTURE;
     use super::UserPromptSubmitCommandInput;
@@ -639,6 +695,14 @@ mod tests {
             STOP_OUTPUT_FIXTURE => {
                 include_str!("../schema/generated/stop.command.output.schema.json")
             }
+            SUBSCRIPTION_EXHAUSTED_INPUT_FIXTURE => {
+                include_str!("../schema/generated/subscription-exhausted.command.input.schema.json")
+            }
+            SUBSCRIPTION_EXHAUSTED_OUTPUT_FIXTURE => {
+                include_str!(
+                    "../schema/generated/subscription-exhausted.command.output.schema.json"
+                )
+            }
             _ => panic!("unexpected fixture name: {name}"),
         }
     }
@@ -666,6 +730,8 @@ mod tests {
             USER_PROMPT_SUBMIT_OUTPUT_FIXTURE,
             STOP_INPUT_FIXTURE,
             STOP_OUTPUT_FIXTURE,
+            SUBSCRIPTION_EXHAUSTED_INPUT_FIXTURE,
+            SUBSCRIPTION_EXHAUSTED_OUTPUT_FIXTURE,
         ] {
             let expected = normalize_newlines(expected_fixture(fixture));
             let actual = std::fs::read_to_string(schema_root.join("generated").join(fixture))
@@ -702,6 +768,11 @@ mod tests {
             &schema_json::<StopCommandInput>().expect("serialize stop input schema"),
         )
         .expect("parse stop input schema");
+        let subscription_exhausted: Value = serde_json::from_slice(
+            &schema_json::<SubscriptionExhaustedCommandInput>()
+                .expect("serialize subscription exhausted input schema"),
+        )
+        .expect("parse subscription exhausted input schema");
 
         for schema in [
             &pre_tool_use,
@@ -709,6 +780,7 @@ mod tests {
             &post_tool_use,
             &user_prompt_submit,
             &stop,
+            &subscription_exhausted,
         ] {
             assert_eq!(schema["properties"]["turn_id"]["type"], "string");
             assert!(

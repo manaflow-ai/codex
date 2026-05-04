@@ -714,6 +714,7 @@ fn hook_event_label(event_name: HookEventName) -> &'static str {
         HookEventName::SessionStart => "SessionStart",
         HookEventName::UserPromptSubmit => "UserPromptSubmit",
         HookEventName::Stop => "Stop",
+        HookEventName::SubscriptionExhausted => "SubscriptionExhausted",
     }
 }
 

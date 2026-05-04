@@ -41,6 +41,8 @@ pub struct HookEventsToml {
     pub user_prompt_submit: Vec<MatcherGroup>,
     #[serde(rename = "Stop", default)]
     pub stop: Vec<MatcherGroup>,
+    #[serde(rename = "SubscriptionExhausted", default)]
+    pub subscription_exhausted: Vec<MatcherGroup>,
 }
 
 impl HookEventsToml {
@@ -52,6 +54,7 @@ impl HookEventsToml {
             session_start,
             user_prompt_submit,
             stop,
+            subscription_exhausted,
         } = self;
         pre_tool_use.is_empty()
             && permission_request.is_empty()
@@ -59,6 +62,7 @@ impl HookEventsToml {
             && session_start.is_empty()
             && user_prompt_submit.is_empty()
             && stop.is_empty()
+            && subscription_exhausted.is_empty()
     }
 
     pub fn handler_count(&self) -> usize {
@@ -69,6 +73,7 @@ impl HookEventsToml {
             session_start,
             user_prompt_submit,
             stop,
+            subscription_exhausted,
         } = self;
         [
             pre_tool_use,
@@ -77,6 +82,7 @@ impl HookEventsToml {
             session_start,
             user_prompt_submit,
             stop,
+            subscription_exhausted,
         ]
         .into_iter()
         .flatten()
@@ -84,7 +90,7 @@ impl HookEventsToml {
         .sum()
     }
 
-    pub fn into_matcher_groups(self) -> [(HookEventName, Vec<MatcherGroup>); 6] {
+    pub fn into_matcher_groups(self) -> [(HookEventName, Vec<MatcherGroup>); 7] {
         [
             (HookEventName::PreToolUse, self.pre_tool_use),
             (HookEventName::PermissionRequest, self.permission_request),
@@ -92,6 +98,10 @@ impl HookEventsToml {
             (HookEventName::SessionStart, self.session_start),
             (HookEventName::UserPromptSubmit, self.user_prompt_submit),
             (HookEventName::Stop, self.stop),
+            (
+                HookEventName::SubscriptionExhausted,
+                self.subscription_exhausted,
+            ),
         ]
     }
 }

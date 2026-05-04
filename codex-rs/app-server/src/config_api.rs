@@ -308,6 +308,7 @@ fn map_hooks_requirements_to_api(hooks: ManagedHooksRequirementsToml) -> Managed
         session_start,
         user_prompt_submit,
         stop,
+        subscription_exhausted,
     } = hooks;
 
     ManagedHooksRequirements {
@@ -319,6 +320,7 @@ fn map_hooks_requirements_to_api(hooks: ManagedHooksRequirementsToml) -> Managed
         session_start: map_hook_matcher_groups_to_api(session_start),
         user_prompt_submit: map_hook_matcher_groups_to_api(user_prompt_submit),
         stop: map_hook_matcher_groups_to_api(stop),
+        subscription_exhausted: map_hook_matcher_groups_to_api(subscription_exhausted),
     }
 }
 
@@ -627,6 +629,7 @@ mod tests {
                 session_start: Vec::new(),
                 user_prompt_submit: Vec::new(),
                 stop: Vec::new(),
+                subscription_exhausted: Vec::new(),
             }),
         );
         assert_eq!(

@@ -461,6 +461,7 @@ fn hook_event_key_label(event_name: codex_protocol::protocol::HookEventName) -> 
         codex_protocol::protocol::HookEventName::SessionStart => "session_start",
         codex_protocol::protocol::HookEventName::UserPromptSubmit => "user_prompt_submit",
         codex_protocol::protocol::HookEventName::Stop => "stop",
+        codex_protocol::protocol::HookEventName::SubscriptionExhausted => "subscription_exhausted",
     }
 }
 

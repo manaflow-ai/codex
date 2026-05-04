@@ -679,6 +679,7 @@ fn analytics_hook_event_name(event_name: HookEventName) -> &'static str {
         HookEventName::SessionStart => "SessionStart",
         HookEventName::UserPromptSubmit => "UserPromptSubmit",
         HookEventName::Stop => "Stop",
+        HookEventName::SubscriptionExhausted => "SubscriptionExhausted",
     }
 }
 

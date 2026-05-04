@@ -105,6 +105,7 @@ pub(crate) use skills::resolve_skill_dependencies_for_turn;
 pub(crate) use skills::skills_load_input_from_config;
 mod skills_watcher;
 mod stream_events_utils;
+mod subscription_exhaustion;
 pub mod test_support;
 mod unified_exec;
 pub mod windows_sandbox;

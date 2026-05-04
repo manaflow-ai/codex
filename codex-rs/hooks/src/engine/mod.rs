@@ -24,6 +24,8 @@ use crate::events::session_start::SessionStartOutcome;
 use crate::events::session_start::SessionStartRequest;
 use crate::events::stop::StopOutcome;
 use crate::events::stop::StopRequest;
+use crate::events::subscription_exhausted::SubscriptionExhaustedOutcome;
+use crate::events::subscription_exhausted::SubscriptionExhaustedRequest;
 use crate::events::user_prompt_submit::UserPromptSubmitOutcome;
 use crate::events::user_prompt_submit::UserPromptSubmitRequest;
 
@@ -64,6 +66,9 @@ impl ConfiguredHandler {
             codex_protocol::protocol::HookEventName::SessionStart => "session-start",
             codex_protocol::protocol::HookEventName::UserPromptSubmit => "user-prompt-submit",
             codex_protocol::protocol::HookEventName::Stop => "stop",
+            codex_protocol::protocol::HookEventName::SubscriptionExhausted => {
+                "subscription-exhausted"
+            }
         }
     }
 }
@@ -196,6 +201,20 @@ impl ClaudeHooksEngine {
 
     pub(crate) async fn run_stop(&self, request: StopRequest) -> StopOutcome {
         crate::events::stop::run(&self.handlers, &self.shell, request).await
+    }
+
+    pub(crate) fn preview_subscription_exhausted(
+        &self,
+        request: &SubscriptionExhaustedRequest,
+    ) -> Vec<HookRunSummary> {
+        crate::events::subscription_exhausted::preview(&self.handlers, request)
+    }
+
+    pub(crate) async fn run_subscription_exhausted(
+        &self,
+        request: SubscriptionExhaustedRequest,
+    ) -> SubscriptionExhaustedOutcome {
+        crate::events::subscription_exhausted::run(&self.handlers, &self.shell, request).await
     }
 }
 

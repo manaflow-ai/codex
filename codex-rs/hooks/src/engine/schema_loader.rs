@@ -16,6 +16,8 @@ pub(crate) struct GeneratedHookSchemas {
     pub user_prompt_submit_command_output: Value,
     pub stop_command_input: Value,
     pub stop_command_output: Value,
+    pub subscription_exhausted_command_input: Value,
+    pub subscription_exhausted_command_output: Value,
 }
 
 pub(crate) fn generated_hook_schemas() -> &'static GeneratedHookSchemas {
@@ -69,6 +71,16 @@ pub(crate) fn generated_hook_schemas() -> &'static GeneratedHookSchemas {
             "stop.command.output",
             include_str!("../../schema/generated/stop.command.output.schema.json"),
         ),
+        subscription_exhausted_command_input: parse_json_schema(
+            "subscription-exhausted.command.input",
+            include_str!("../../schema/generated/subscription-exhausted.command.input.schema.json"),
+        ),
+        subscription_exhausted_command_output: parse_json_schema(
+            "subscription-exhausted.command.output",
+            include_str!(
+                "../../schema/generated/subscription-exhausted.command.output.schema.json"
+            ),
+        ),
     })
 }
 
@@ -98,5 +110,13 @@ mod tests {
         assert_eq!(schemas.user_prompt_submit_command_output["type"], "object");
         assert_eq!(schemas.stop_command_input["type"], "object");
         assert_eq!(schemas.stop_command_output["type"], "object");
+        assert_eq!(
+            schemas.subscription_exhausted_command_input["type"],
+            "object"
+        );
+        assert_eq!(
+            schemas.subscription_exhausted_command_output["type"],
+            "object"
+        );
     }
 }

@@ -8,13 +8,14 @@ mod types;
 
 pub use engine::HookListEntry;
 /// Hook event names as they appear in hooks JSON and config files.
-pub const HOOK_EVENT_NAMES: [&str; 6] = [
+pub const HOOK_EVENT_NAMES: [&str; 7] = [
     "PreToolUse",
     "PermissionRequest",
     "PostToolUse",
     "SessionStart",
     "UserPromptSubmit",
     "Stop",
+    "SubscriptionExhausted",
 ];
 
 /// Hook event names whose matcher fields are meaningful during dispatch.
@@ -40,6 +41,8 @@ pub use events::session_start::SessionStartRequest;
 pub use events::session_start::SessionStartSource;
 pub use events::stop::StopOutcome;
 pub use events::stop::StopRequest;
+pub use events::subscription_exhausted::SubscriptionExhaustedOutcome;
+pub use events::subscription_exhausted::SubscriptionExhaustedRequest;
 pub use events::user_prompt_submit::UserPromptSubmitOutcome;
 pub use events::user_prompt_submit::UserPromptSubmitRequest;
 pub use legacy_notify::legacy_notify_json;

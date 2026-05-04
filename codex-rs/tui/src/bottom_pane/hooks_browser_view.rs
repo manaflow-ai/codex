@@ -539,6 +539,7 @@ fn event_label(event_name: HookEventName) -> &'static str {
         HookEventName::SessionStart => "SessionStart",
         HookEventName::UserPromptSubmit => "UserPromptSubmit",
         HookEventName::Stop => "Stop",
+        HookEventName::SubscriptionExhausted => "SubscriptionExhausted",
     }
 }
 
@@ -550,6 +551,7 @@ fn event_description(event_name: HookEventName) -> &'static str {
         HookEventName::SessionStart => "When a new session starts",
         HookEventName::UserPromptSubmit => "When the user submits a prompt",
         HookEventName::Stop => "Right before Codex ends its turn",
+        HookEventName::SubscriptionExhausted => "When a subscription or quota is exhausted",
     }
 }
 

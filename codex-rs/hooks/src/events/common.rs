@@ -104,7 +104,9 @@ pub(crate) fn matcher_pattern_for_event(
         | HookEventName::PermissionRequest
         | HookEventName::PostToolUse
         | HookEventName::SessionStart => matcher,
-        HookEventName::UserPromptSubmit | HookEventName::Stop => None,
+        HookEventName::UserPromptSubmit
+        | HookEventName::Stop
+        | HookEventName::SubscriptionExhausted => None,
     }
 }
 
@@ -249,6 +251,10 @@ mod tests {
         );
         assert_eq!(
             matcher_pattern_for_event(HookEventName::Stop, Some("^done$")),
+            None
+        );
+        assert_eq!(
+            matcher_pattern_for_event(HookEventName::SubscriptionExhausted, Some("^pro$")),
             None
         );
     }

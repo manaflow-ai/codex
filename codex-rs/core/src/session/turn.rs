@@ -49,6 +49,7 @@ use crate::stream_events_utils::last_assistant_message_from_item;
 use crate::stream_events_utils::mark_thread_memory_mode_polluted_if_external_context;
 use crate::stream_events_utils::raw_assistant_output_text_from_item;
 use crate::stream_events_utils::record_completed_response_item;
+use crate::subscription_exhaustion;
 use crate::tools::ToolRouter;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::parallel::ToolCallRuntime;
@@ -372,6 +373,7 @@ pub(crate) async fn run_turn(
     // 1. At the start of a turn, so the fresh user prompt in `input` gets sampled first.
     // 2. After auto-compact, when model/tool continuation needs to resume before any steer.
     let mut can_drain_pending_input = input.is_empty();
+    let mut subscription_exhaustion_hook_attempted = false;
 
     loop {
         if run_pending_session_start_hooks(&sess, &turn_context).await {
@@ -652,6 +654,33 @@ pub(crate) async fn run_turn(
                 break;
             }
             Err(e) => {
+                if subscription_exhaustion::should_run_hook_for_error(&e)
+                    && !subscription_exhaustion_hook_attempted
+                {
+                    subscription_exhaustion_hook_attempted = true;
+                    if let Some(recovery) = subscription_exhaustion::recover_with_hook_if_available(
+                        &sess,
+                        &turn_context,
+                        &e,
+                    )
+                    .await
+                    {
+                        client_session.reset_after_subscription_exhaustion_recovery();
+                        let message = if recovery.auth_changed {
+                            "A SubscriptionExhausted hook refreshed Codex auth. Reconnecting and retrying request."
+                        } else {
+                            "A SubscriptionExhausted hook completed. Reconnecting and retrying request."
+                        };
+                        sess.send_event(
+                            &turn_context,
+                            EventMsg::Warning(WarningEvent {
+                                message: message.to_string(),
+                            }),
+                        )
+                        .await;
+                        continue;
+                    }
+                }
                 info!("Turn error: {e:#}");
                 let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
                 sess.send_event(&turn_context, event).await;

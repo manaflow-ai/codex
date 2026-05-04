@@ -445,7 +445,7 @@ v2_enum_from_core!(
 
 v2_enum_from_core!(
     pub enum HookEventName from CoreHookEventName {
-        PreToolUse, PermissionRequest, PostToolUse, SessionStart, UserPromptSubmit, Stop
+        PreToolUse, PermissionRequest, PostToolUse, SessionStart, UserPromptSubmit, Stop, SubscriptionExhausted
     }
 );
 
@@ -988,6 +988,9 @@ pub struct ManagedHooksRequirements {
     #[serde(rename = "Stop")]
     #[ts(rename = "Stop")]
     pub stop: Vec<ConfiguredHookMatcherGroup>,
+    #[serde(rename = "SubscriptionExhausted")]
+    #[ts(rename = "SubscriptionExhausted")]
+    pub subscription_exhausted: Vec<ConfiguredHookMatcherGroup>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
