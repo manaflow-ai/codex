@@ -1387,6 +1387,10 @@ impl AuthManager {
         self.inner.read().ok().and_then(|c| c.auth.clone())
     }
 
+    pub fn codex_home(&self) -> &Path {
+        &self.codex_home
+    }
+
     pub fn refresh_failure_for_auth(&self, auth: &CodexAuth) -> Option<RefreshTokenFailedError> {
         self.inner.read().ok().and_then(|cached| {
             cached

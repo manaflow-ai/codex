@@ -9741,7 +9741,8 @@
           "postToolUse",
           "sessionStart",
           "userPromptSubmit",
-          "stop"
+          "stop",
+          "subscriptionExhausted"
         ],
         "type": "string"
       },
@@ -10574,6 +10575,12 @@
             },
             "type": "array"
           },
+          "SubscriptionExhausted": {
+            "items": {
+              "$ref": "#/definitions/v2/ConfiguredHookMatcherGroup"
+            },
+            "type": "array"
+          },
           "UserPromptSubmit": {
             "items": {
               "$ref": "#/definitions/v2/ConfiguredHookMatcherGroup"
@@ -10599,6 +10606,7 @@
           "PreToolUse",
           "SessionStart",
           "Stop",
+          "SubscriptionExhausted",
           "UserPromptSubmit"
         ],
         "type": "object"

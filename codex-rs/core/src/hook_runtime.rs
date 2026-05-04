@@ -12,6 +12,8 @@ use codex_hooks::PostToolUseRequest;
 use codex_hooks::PreToolUseOutcome;
 use codex_hooks::PreToolUseRequest;
 use codex_hooks::SessionStartOutcome;
+use codex_hooks::SubscriptionExhaustedOutcome;
+use codex_hooks::SubscriptionExhaustedRequest;
 use codex_hooks::UserPromptSubmitOutcome;
 use codex_hooks::UserPromptSubmitRequest;
 use codex_otel::HOOK_RUN_DURATION_METRIC;
@@ -278,6 +280,24 @@ pub(crate) async fn run_user_prompt_submit_hooks(
     .await
 }
 
+pub(crate) async fn run_subscription_exhausted_hooks(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    request: SubscriptionExhaustedRequest,
+) -> bool {
+    let hooks = sess.hooks();
+    let preview_runs = hooks.preview_subscription_exhausted(&request);
+    emit_hook_started_events(sess, turn_context, preview_runs).await;
+
+    let SubscriptionExhaustedOutcome { hook_events } =
+        hooks.run_subscription_exhausted(request).await;
+    let succeeded = hook_events
+        .iter()
+        .any(|event| event.run.status == HookRunStatus::Completed);
+    emit_hook_completed_events(sess, turn_context, hook_events).await;
+    succeeded
+}
+
 pub(crate) async fn inspect_pending_input(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
@@ -470,6 +490,7 @@ fn hook_run_metric_tags(run: &HookRunSummary) -> [(&'static str, &'static str); 
         HookEventName::SessionStart => "SessionStart",
         HookEventName::UserPromptSubmit => "UserPromptSubmit",
         HookEventName::Stop => "Stop",
+        HookEventName::SubscriptionExhausted => "SubscriptionExhausted",
     };
     let hook_source = match run.source {
         HookSource::System => "system",
@@ -498,7 +519,7 @@ fn hook_run_metric_tags(run: &HookRunSummary) -> [(&'static str, &'static str); 
     ]
 }
 
-fn hook_permission_mode(turn_context: &TurnContext) -> String {
+pub(crate) fn hook_permission_mode(turn_context: &TurnContext) -> String {
     match turn_context.approval_policy.value() {
         AskForApproval::Never => "bypassPermissions",
         AskForApproval::UnlessTrusted

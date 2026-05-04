@@ -828,6 +828,15 @@ impl ModelClientSession {
             .set_connection_reused(/*connection_reused*/ false);
     }
 
+    /// Clears transport and sticky-routing state after an out-of-band auth or account switch.
+    ///
+    /// Reusing the previous `x-codex-turn-state` can keep a retry pinned to the same exhausted
+    /// route even after the hook has selected a different account.
+    pub(crate) fn reset_after_subscription_exhaustion_recovery(&mut self) {
+        self.reset_websocket_session();
+        self.turn_state = Arc::new(OnceLock::new());
+    }
+
     fn build_responses_request(
         &self,
         provider: &codex_api::Provider,

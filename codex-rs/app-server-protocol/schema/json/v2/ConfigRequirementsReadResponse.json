@@ -237,6 +237,12 @@
           },
           "type": "array"
         },
+        "SubscriptionExhausted": {
+          "items": {
+            "$ref": "#/definitions/ConfiguredHookMatcherGroup"
+          },
+          "type": "array"
+        },
         "UserPromptSubmit": {
           "items": {
             "$ref": "#/definitions/ConfiguredHookMatcherGroup"
@@ -262,6 +268,7 @@
         "PreToolUse",
         "SessionStart",
         "Stop",
+        "SubscriptionExhausted",
         "UserPromptSubmit"
       ],
       "type": "object"

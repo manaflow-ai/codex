@@ -59,6 +59,11 @@ pub(crate) struct StopOutput {
     pub invalid_block_reason: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct SubscriptionExhaustedOutput {
+    pub universal: UniversalOutput,
+}
+
 use crate::schema::BlockDecisionWire;
 use crate::schema::HookUniversalOutputWire;
 use crate::schema::PermissionRequestBehaviorWire;
@@ -70,6 +75,7 @@ use crate::schema::PreToolUseDecisionWire;
 use crate::schema::PreToolUsePermissionDecisionWire;
 use crate::schema::SessionStartCommandOutputWire;
 use crate::schema::StopCommandOutputWire;
+use crate::schema::SubscriptionExhaustedCommandOutputWire;
 use crate::schema::UserPromptSubmitCommandOutputWire;
 
 pub(crate) fn parse_session_start(stdout: &str) -> Option<SessionStartOutput> {
@@ -229,6 +235,13 @@ pub(crate) fn parse_stop(stdout: &str) -> Option<StopOutput> {
         should_block: should_block && invalid_block_reason.is_none(),
         reason: wire.reason,
         invalid_block_reason,
+    })
+}
+
+pub(crate) fn parse_subscription_exhausted(stdout: &str) -> Option<SubscriptionExhaustedOutput> {
+    let wire: SubscriptionExhaustedCommandOutputWire = parse_json(stdout)?;
+    Some(SubscriptionExhaustedOutput {
+        universal: UniversalOutput::from(wire.universal),
     })
 }
 

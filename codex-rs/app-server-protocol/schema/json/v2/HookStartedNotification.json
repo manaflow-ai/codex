@@ -12,7 +12,8 @@
         "postToolUse",
         "sessionStart",
         "userPromptSubmit",
-        "stop"
+        "stop",
+        "subscriptionExhausted"
       ],
       "type": "string"
     },
