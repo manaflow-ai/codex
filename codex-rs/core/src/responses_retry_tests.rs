@@ -1,9 +1,36 @@
 use super::ResponsesStreamRequest;
+use super::capacity_retry_delay;
 use super::log_retry;
+use super::should_retry_response_stream_error;
 use crate::session::tests::make_session_and_context;
 use codex_protocol::error::CodexErr;
 use std::time::Duration;
 use tracing_test::internal::MockWriter;
+
+#[test]
+fn sampling_overloads_are_persistent_without_changing_compaction_retryability() {
+    let err = CodexErr::ServerOverloaded;
+
+    assert!(!err.is_retryable());
+    assert!(should_retry_response_stream_error(
+        ResponsesStreamRequest::Sampling,
+        &err
+    ));
+    assert!(!should_retry_response_stream_error(
+        ResponsesStreamRequest::RemoteCompactionV2,
+        &err
+    ));
+}
+
+#[test]
+fn capacity_retry_delay_uses_exponential_backoff_with_a_sixty_second_cap() {
+    let first = capacity_retry_delay(1);
+    let second = capacity_retry_delay(2);
+
+    assert!((Duration::from_millis(180)..Duration::from_millis(220)).contains(&first));
+    assert!((Duration::from_millis(360)..Duration::from_millis(440)).contains(&second));
+    assert_eq!(capacity_retry_delay(u64::MAX), Duration::from_secs(60));
+}
 
 #[tokio::test]
 async fn sampling_retry_logs_stream_error_context() {

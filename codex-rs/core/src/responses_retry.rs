@@ -15,6 +15,7 @@ use tracing::warn;
 
 const INITIAL_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(5);
 const MAX_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(60);
+const MAX_CAPACITY_RETRY_DELAY: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ResponsesStreamRequest {
@@ -26,6 +27,7 @@ pub(crate) struct ResponsesStreamRetryState {
     retries: u64,
     connection_retries: u64,
     connection_retry_delay: Duration,
+    capacity_retries: u64,
 }
 
 impl Default for ResponsesStreamRetryState {
@@ -34,8 +36,18 @@ impl Default for ResponsesStreamRetryState {
             retries: 0,
             connection_retries: 0,
             connection_retry_delay: INITIAL_CONNECTION_RETRY_DELAY,
+            capacity_retries: 0,
         }
     }
+}
+
+pub(crate) fn should_retry_response_stream_error(
+    request: ResponsesStreamRequest,
+    err: &CodexErr,
+) -> bool {
+    err.is_retryable()
+        || matches!(request, ResponsesStreamRequest::Sampling)
+            && matches!(err.details(), CodexErrorDetails::ServerOverloaded)
 }
 
 /// Handles a retryable stream error and returns `Ok(())` when the caller should
@@ -53,6 +65,35 @@ pub(crate) async fn handle_retryable_response_stream_error(
         ResponsesStreamRequest::Sampling => RetryOperation::Sampling,
         ResponsesStreamRequest::RemoteCompactionV2 => RetryOperation::RemoteCompactionV2,
     };
+
+    if matches!(request, ResponsesStreamRequest::Sampling)
+        && matches!(err.details(), CodexErrorDetails::ServerOverloaded)
+    {
+        retry_state.capacity_retries = retry_state.capacity_retries.saturating_add(1);
+        let retry_count = retry_state.capacity_retries;
+        let delay = err
+            .retry_delay()
+            .unwrap_or_else(|| capacity_retry_delay(retry_count))
+            .min(MAX_CAPACITY_RETRY_DELAY);
+        warn!(
+            turn_id = %turn_context.sub_id,
+            retries = retry_count,
+            ?delay,
+            "model at capacity; waiting to retry sampling request"
+        );
+        sess.notify_stream_error(
+            turn_context,
+            format!(
+                "Model at capacity. Retrying in {} (attempt {retry_count})",
+                format_retry_delay(delay)
+            ),
+            err,
+        )
+        .await;
+        codex_client::record_retry!(retry_count, delay, operation);
+        tokio::time::sleep(delay).await;
+        return Ok(());
+    }
 
     if matches!(request, ResponsesStreamRequest::Sampling)
         && matches!(err.details(), CodexErrorDetails::ConnectionFailed(_))
@@ -121,6 +162,18 @@ pub(crate) async fn handle_retryable_response_stream_error(
     }
 
     Err(err)
+}
+
+fn capacity_retry_delay(attempt: u64) -> Duration {
+    backoff(attempt.min(32)).min(MAX_CAPACITY_RETRY_DELAY)
+}
+
+fn format_retry_delay(delay: Duration) -> String {
+    if delay < Duration::from_secs(1) {
+        format!("{}ms", delay.as_millis().max(1))
+    } else {
+        format!("{:.1}s", delay.as_secs_f64())
+    }
 }
 
 fn log_retry(
