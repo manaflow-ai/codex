@@ -452,6 +452,12 @@ pub fn process_responses_event(
             let message = format!("Incomplete response returned, reason: {reason}");
             return Err(ResponsesEventError::Api(ApiError::Stream(message)));
         }
+        "response.cancelled" => {
+            return Err(ResponsesEventError::Api(ApiError::Retryable {
+                message: "Response cancelled by server.".to_string(),
+                delay: None,
+            }));
+        }
         "response.completed" => {
             if let Some(resp_val) = event.response {
                 match serde_json::from_value::<ResponseCompleted>(resp_val) {

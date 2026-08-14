@@ -4,6 +4,8 @@ use rand::Rng;
 use std::future::Future;
 use std::time::Duration;
 
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Clone)]
 pub struct RetryPolicy {
     pub max_attempts: u64,
@@ -44,7 +46,7 @@ pub fn backoff(base: Duration, attempt: u64) -> Duration {
     let millis = base.as_millis() as u64;
     let raw = millis.saturating_mul(exp);
     let jitter: f64 = rand::rng().random_range(0.9..1.1);
-    Duration::from_millis((raw as f64 * jitter) as u64)
+    Duration::from_millis((raw as f64 * jitter) as u64).min(MAX_RETRY_DELAY)
 }
 
 /// Identifies a retry path and its associated trace-event layer.
@@ -52,6 +54,7 @@ pub fn backoff(base: Duration, attempt: u64) -> Duration {
 pub enum RetryOperation {
     HttpRequest,
     Sampling,
+    RemoteCompactionV1,
     RemoteCompactionV2,
 }
 
@@ -62,6 +65,7 @@ macro_rules! record_retry {
         let (layer, operation) = match $operation {
             $crate::RetryOperation::HttpRequest => ("http", "request"),
             $crate::RetryOperation::Sampling => ("stream", "sampling"),
+            $crate::RetryOperation::RemoteCompactionV1 => ("request", "remote_compaction_v1"),
             $crate::RetryOperation::RemoteCompactionV2 => ("stream", "remote_compaction_v2"),
         };
 

@@ -7,6 +7,10 @@ use crate::client::CompactConversationRequestSettings;
 use crate::compact::CompactionAnalyticsDetails;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::CompactionTurnMetadata;
+use crate::responses_retry::ResponsesStreamRequest;
+use crate::responses_retry::ResponsesStreamRetryState;
+use crate::responses_retry::handle_retryable_response_error;
+use crate::responses_retry::should_retry_response_stream_error;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use codex_protocol::auth::AuthMode;
@@ -74,27 +78,55 @@ pub(super) async fn run_remote_compact_attempt(
         window_id,
         CodexResponsesRequestKind::Compaction(compaction_metadata),
     );
-    let new_history = sess
-        .services
-        .model_client
-        .compact_conversation_history(
-            &prompt,
-            &turn_context.model_info,
-            turn_state,
-            CompactConversationRequestSettings {
-                effort: turn_context.reasoning_effort.clone(),
-                summary: turn_context.reasoning_summary,
-                service_tier: if sess.services.auth_manager.auth_mode() == Some(AuthMode::ApiKey) {
-                    None
-                } else {
-                    turn_context.config.service_tier.clone()
+    let max_retries = turn_context.provider.info().stream_max_retries();
+    let mut retry_state = ResponsesStreamRetryState::default();
+    let new_history = loop {
+        let result = sess
+            .services
+            .model_client
+            .compact_conversation_history(
+                &prompt,
+                &turn_context.model_info,
+                turn_state.clone(),
+                CompactConversationRequestSettings {
+                    effort: turn_context.reasoning_effort.clone(),
+                    summary: turn_context.reasoning_summary,
+                    service_tier: if sess.services.auth_manager.auth_mode()
+                        == Some(AuthMode::ApiKey)
+                    {
+                        None
+                    } else {
+                        turn_context.config.service_tier.clone()
+                    },
                 },
-            },
-            &turn_context.session_telemetry,
-            compaction_trace,
-            &responses_metadata,
-        )
-        .await?;
+                &turn_context.session_telemetry,
+                compaction_trace,
+                &responses_metadata,
+            )
+            .await;
+        match result {
+            Ok(new_history) => break new_history,
+            Err(err)
+                if !should_retry_response_stream_error(
+                    ResponsesStreamRequest::RemoteCompactionV1,
+                    &err,
+                ) =>
+            {
+                return Err(err);
+            }
+            Err(err) => {
+                handle_retryable_response_error(
+                    &mut retry_state,
+                    max_retries,
+                    err,
+                    sess,
+                    turn_context,
+                    ResponsesStreamRequest::RemoteCompactionV1,
+                )
+                .await?;
+            }
+        }
+    };
     Ok(RemoteCompactAttempt {
         new_history,
         trace_input_history,
