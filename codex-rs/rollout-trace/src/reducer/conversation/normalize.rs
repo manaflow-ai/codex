@@ -1,9 +1,13 @@
 //! Normalization from Responses-shaped JSON items into conversation item data.
 
+use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
+use codex_protocol::models::AgentMessageInputContent;
+use codex_protocol::models::ResponseItem;
 use serde_json::Value;
 
+use crate::model::AgentMessageMetadata;
 use crate::model::ConversationBody;
 use crate::model::ConversationChannel;
 use crate::model::ConversationItemKind;
@@ -22,6 +26,7 @@ pub(super) struct NormalizedConversationItem {
     pub(super) role: ConversationRole,
     pub(super) channel: Option<ConversationChannel>,
     pub(super) kind: ConversationItemKind,
+    pub(super) agent_message: Option<AgentMessageMetadata>,
     pub(super) body: ConversationBody,
     pub(super) call_id: Option<String>,
 }
@@ -32,7 +37,15 @@ pub(super) fn normalize_model_items(
 ) -> Result<Vec<NormalizedConversationItem>> {
     let mut normalized_items = Vec::new();
     for item in items {
-        normalized_items.push(normalize_model_item(item, raw_payload)?);
+        if item.get("type").and_then(Value::as_str) == Some("additional_tools") {
+            continue;
+        }
+
+        let mut model_visible_item = item.clone();
+        if let Some(object) = model_visible_item.as_object_mut() {
+            object.remove("internal_chat_message_metadata_passthrough");
+        }
+        normalized_items.push(normalize_model_item(&model_visible_item, raw_payload)?);
     }
     Ok(normalized_items)
 }
@@ -41,6 +54,7 @@ pub(super) fn token_usage_from_value(value: &Value) -> Option<TokenUsage> {
     Some(TokenUsage {
         input_tokens: u64_field(value, "input_tokens")?,
         cached_input_tokens: u64_field(value, "cached_input_tokens")?,
+        cache_write_input_tokens: u64_field(value, "cache_write_input_tokens").unwrap_or(0),
         output_tokens: u64_field(value, "output_tokens")?,
         reasoning_output_tokens: u64_field(value, "reasoning_output_tokens")?,
     })
@@ -58,11 +72,13 @@ fn normalize_model_item(
     };
     match item_type {
         "message" => normalize_message_item(item, raw_payload),
+        "agent_message" => normalize_agent_message_item(item, raw_payload),
         "reasoning" => normalize_reasoning_item(item, raw_payload),
         "function_call" => Ok(NormalizedConversationItem {
             role: ConversationRole::Assistant,
             channel: Some(ConversationChannel::Commentary),
             kind: ConversationItemKind::FunctionCall,
+            agent_message: None,
             body: raw_text_or_json_body(item.get("arguments"), raw_payload),
             call_id: item
                 .get("call_id")
@@ -73,6 +89,7 @@ fn normalize_model_item(
             role: ConversationRole::Tool,
             channel: Some(ConversationChannel::Commentary),
             kind: ConversationItemKind::FunctionCallOutput,
+            agent_message: None,
             body: tool_output_body(item.get("output"), raw_payload),
             call_id: item
                 .get("call_id")
@@ -83,6 +100,7 @@ fn normalize_model_item(
             role: ConversationRole::Assistant,
             channel: Some(ConversationChannel::Commentary),
             kind: ConversationItemKind::CustomToolCall,
+            agent_message: None,
             body: custom_tool_call_body(item, raw_payload),
             call_id: item
                 .get("call_id")
@@ -93,6 +111,7 @@ fn normalize_model_item(
             role: ConversationRole::Tool,
             channel: Some(ConversationChannel::Commentary),
             kind: ConversationItemKind::CustomToolCallOutput,
+            agent_message: None,
             body: tool_output_body(item.get("output"), raw_payload),
             call_id: item
                 .get("call_id")
@@ -104,6 +123,7 @@ fn normalize_model_item(
                 role: ConversationRole::Assistant,
                 channel: Some(ConversationChannel::Commentary),
                 kind: ConversationItemKind::FunctionCall,
+                agent_message: None,
                 body: json_body(item, raw_payload),
                 call_id: item
                     .get("call_id")
@@ -115,19 +135,23 @@ fn normalize_model_item(
             role: ConversationRole::Tool,
             channel: Some(ConversationChannel::Commentary),
             kind: ConversationItemKind::FunctionCallOutput,
+            agent_message: None,
             body: json_body(item, raw_payload),
             call_id: item
                 .get("call_id")
                 .and_then(Value::as_str)
                 .map(ToString::to_string),
         }),
-        "compaction" | "compaction_summary" => Ok(NormalizedConversationItem {
-            role: ConversationRole::Assistant,
-            channel: Some(ConversationChannel::Summary),
-            kind: ConversationItemKind::Message,
-            body: compaction_body(item, raw_payload)?,
-            call_id: None,
-        }),
+        "compaction" | "compaction_summary" | "context_compaction" => {
+            Ok(NormalizedConversationItem {
+                role: ConversationRole::Assistant,
+                channel: Some(ConversationChannel::Summary),
+                kind: ConversationItemKind::Message,
+                agent_message: None,
+                body: compaction_body(item, raw_payload)?,
+                call_id: None,
+            })
+        }
         _ => bail!(
             "unsupported model item type {item_type} in payload {}",
             raw_payload.raw_payload_id
@@ -158,9 +182,54 @@ fn normalize_message_item(
             .and_then(Value::as_str)
             .and_then(channel_from_phase),
         kind: ConversationItemKind::Message,
+        agent_message: None,
         body: ConversationBody {
             parts: content_parts(item.get("content"), raw_payload),
         },
+        call_id: None,
+    })
+}
+
+fn normalize_agent_message_item(
+    item: &Value,
+    raw_payload: &RawPayloadRef,
+) -> Result<NormalizedConversationItem> {
+    let raw_payload_id = &raw_payload.raw_payload_id;
+    let response_item =
+        serde_json::from_value::<ResponseItem>(item.clone()).with_context(|| {
+            format!("failed to parse agent_message item in payload {raw_payload_id}")
+        })?;
+    let ResponseItem::AgentMessage {
+        author,
+        recipient,
+        content,
+        ..
+    } = response_item
+    else {
+        bail!("item in payload {raw_payload_id} was not an agent_message");
+    };
+    let parts = content
+        .into_iter()
+        .map(|content| match content {
+            AgentMessageInputContent::InputText { text } => ConversationPart::Text { text },
+            AgentMessageInputContent::EncryptedContent { encrypted_content } => {
+                ConversationPart::Encoded {
+                    label: "encrypted_content".to_string(),
+                    value: encrypted_content,
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        bail!("agent_message item in payload {raw_payload_id} contained no content");
+    }
+
+    Ok(NormalizedConversationItem {
+        role: ConversationRole::Assistant,
+        channel: Some(ConversationChannel::Analysis),
+        kind: ConversationItemKind::Message,
+        agent_message: Some(AgentMessageMetadata { author, recipient }),
+        body: ConversationBody { parts },
         call_id: None,
     })
 }
@@ -215,6 +284,7 @@ fn normalize_reasoning_item(
         role: ConversationRole::Assistant,
         channel: Some(ConversationChannel::Analysis),
         kind: ConversationItemKind::Reasoning,
+        agent_message: None,
         body: ConversationBody { parts },
         call_id: None,
     })

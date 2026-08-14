@@ -30,11 +30,13 @@ use tokio::sync::oneshot;
 use tracing::Event;
 use tracing::field::Field;
 use tracing::field::Visit;
+use tracing::level_filters::LevelFilter;
 use tracing::span::Attributes;
 use tracing::span::Id;
 use tracing::span::Record;
 use tracing_subscriber::Layer;
 use tracing_subscriber::field::RecordFields;
+use tracing_subscriber::filter::Targets;
 use tracing_subscriber::fmt::FormatFields;
 use tracing_subscriber::fmt::FormattedFields;
 use tracing_subscriber::fmt::format::DefaultFields;
@@ -47,6 +49,26 @@ use crate::StateRuntime;
 const LOG_QUEUE_CAPACITY: usize = 512;
 const LOG_BATCH_SIZE: usize = 128;
 const LOG_FLUSH_INTERVAL: Duration = Duration::from_secs(2);
+
+pub fn default_filter() -> Targets {
+    Targets::new()
+        .with_default(LevelFilter::TRACE)
+        .with_target("hyper_util", LevelFilter::WARN)
+        .with_target("log", LevelFilter::OFF)
+        .with_target("codex_rmcp_client", LevelFilter::INFO)
+        .with_target("codex_otel.log_only", LevelFilter::OFF)
+        .with_target("codex_otel.trace_safe", LevelFilter::OFF)
+        .with_target("rmcp", LevelFilter::INFO)
+        .with_target("codex_api::responses_websocket_timing", LevelFilter::OFF)
+        .with_target("codex_core::post_sampling_token_estimate", LevelFilter::OFF)
+        // Full model request bodies and streamed response payloads overwhelm the
+        // SQLite log database, but remain available to explicit TRACE subscribers.
+        .with_target("codex_http_client::transport", LevelFilter::DEBUG)
+        .with_target("codex_api::sse", LevelFilter::DEBUG)
+        // Per-chunk streaming traces otherwise flood the bounded SQLite log queue.
+        .with_target("codex_tui::streaming::controller", LevelFilter::DEBUG)
+        .with_target("codex_tui::streaming::table_holdback", LevelFilter::DEBUG)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LogSinkQueueConfig {
@@ -189,6 +211,24 @@ where
 
     fn on_event(&self, event: &Event<'_>, ctx: tracing_subscriber::layer::Context<'_, S>) {
         let metadata = event.metadata();
+        // `tracing-log` checks filters with the original log target before
+        // dispatching an event whose tracing target is `log`, so the outer
+        // target filter cannot reliably reject these bridged events.
+        if metadata.target() == "log" {
+            return;
+        }
+
+        // The SDK emits DEBUG timer meta-events every second per process; these
+        // were over 30% of retained logs in measured high-fanout Codex environments.
+        if metadata.target() == "opentelemetry_sdk"
+            && matches!(
+                *metadata.level(),
+                tracing::Level::TRACE | tracing::Level::DEBUG
+            )
+        {
+            return;
+        }
+
         let mut visitor = MessageVisitor::default();
         event.record(&mut visitor);
         let thread_id = visitor
@@ -452,11 +492,16 @@ impl Visit for MessageVisitor {
 }
 
 #[cfg(test)]
+#[path = "log_db_filter_tests.rs"]
+mod filter_tests;
+
+#[cfg(test)]
 mod tests {
     use std::io;
     use std::sync::Arc;
     use std::sync::Mutex;
 
+    use codex_utils_absolute_path::test_support::PathExt;
     use pretty_assertions::assert_eq;
     use tracing_subscriber::filter::Targets;
     use tracing_subscriber::fmt::writer::MakeWriter;
@@ -547,9 +592,12 @@ mod tests {
     #[tokio::test]
     async fn sqlite_feedback_logs_match_feedback_formatter_shape() {
         let codex_home = temp_codex_home();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("initialize runtime");
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("initialize runtime");
         let writer = SharedWriter::default();
         let layer = start(runtime.clone());
 
@@ -605,9 +653,12 @@ mod tests {
     #[tokio::test]
     async fn flush_persists_logs_for_query() {
         let codex_home = temp_codex_home();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("initialize runtime");
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("initialize runtime");
         let layer = start(runtime.clone());
 
         let guard = tracing_subscriber::registry()
@@ -636,9 +687,12 @@ mod tests {
     #[tokio::test]
     async fn configured_batch_size_flushes_without_explicit_flush() {
         let codex_home = temp_codex_home();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("initialize runtime");
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("initialize runtime");
         let layer = LogDbLayer::start_with_config(
             runtime.clone(),
             LogSinkQueueConfig {
@@ -685,9 +739,12 @@ mod tests {
     #[tokio::test]
     async fn configured_flush_interval_persists_buffered_logs() {
         let codex_home = temp_codex_home();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("initialize runtime");
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("initialize runtime");
         let layer = LogDbLayer::start_with_config(
             runtime.clone(),
             LogSinkQueueConfig {

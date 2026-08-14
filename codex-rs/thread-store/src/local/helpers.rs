@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs::FileTimes;
 use std::fs::OpenOptions;
@@ -9,14 +11,20 @@ use chrono::DateTime;
 use chrono::Utc;
 use codex_git_utils::GitSha;
 use codex_protocol::ThreadId;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::GitInfo;
+use codex_protocol::protocol::NetworkAccess;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::ThreadHistoryMode;
 use codex_rollout::ARCHIVED_SESSIONS_SUBDIR;
+use codex_rollout::RolloutReferenceIndex;
 use codex_rollout::ThreadItem;
+use codex_rollout::find_thread_names_by_ids;
 use codex_state::ThreadMetadata;
 
+use super::LocalThreadStore;
 use crate::StoredThread;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
@@ -59,9 +67,31 @@ pub(super) fn rollout_path_is_archived(codex_home: &Path, path: &Path) -> bool {
             .any(|component| component.as_os_str() == OsStr::new(ARCHIVED_SESSIONS_SUBDIR))
 }
 
-pub(super) fn matching_rollout_file_name(
-    rollout_path: &Path,
+/// Returns rollout files whose session metadata belongs to `thread_id`.
+pub(super) async fn owned_rollout_paths(
+    store: &LocalThreadStore,
     thread_id: ThreadId,
+) -> ThreadStoreResult<Vec<PathBuf>> {
+    RolloutReferenceIndex::scan(store.config.codex_home.as_path())
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!("failed to scan thread rollout files: {err}"),
+        })
+        .map(|index| owned_rollout_paths_from_index(&index, thread_id))
+}
+
+pub(super) fn owned_rollout_paths_from_index(
+    index: &RolloutReferenceIndex,
+    thread_id: ThreadId,
+) -> Vec<PathBuf> {
+    index
+        .rollouts_for_thread(thread_id)
+        .map(|(_, path)| path.to_path_buf())
+        .collect()
+}
+
+pub(super) fn validated_rollout_file_name(
+    rollout_path: &Path,
     display_path: &Path,
 ) -> ThreadStoreResult<std::ffi::OsString> {
     let Some(file_name) = rollout_path.file_name().map(OsStr::to_owned) else {
@@ -72,16 +102,12 @@ pub(super) fn matching_rollout_file_name(
             ),
         });
     };
-    let required_suffix = format!("{thread_id}.jsonl");
-    if file_name
-        .to_string_lossy()
-        .ends_with(required_suffix.as_str())
-    {
+    if codex_rollout::rollout_id_from_path(rollout_path).is_some() {
         Ok(file_name)
     } else {
         Err(ThreadStoreError::InvalidRequest {
             message: format!(
-                "rollout path `{}` does not match thread id {thread_id}",
+                "rollout path `{}` has an invalid filename",
                 display_path.display()
             ),
         })
@@ -91,6 +117,13 @@ pub(super) fn matching_rollout_file_name(
 pub(super) fn touch_modified_time(path: &Path) -> std::io::Result<()> {
     let times = FileTimes::new().set_modified(SystemTime::now());
     OpenOptions::new().append(true).open(path)?.set_times(times)
+}
+
+pub(super) fn restore_rollout_moves(moves: &[(PathBuf, PathBuf)]) -> std::io::Result<()> {
+    for (source, destination) in moves.iter().rev() {
+        std::fs::rename(destination, source)?;
+    }
+    Ok(())
 }
 
 pub(super) fn stored_thread_from_rollout_item(
@@ -103,6 +136,7 @@ pub(super) fn stored_thread_from_rollout_item(
         .or_else(|| thread_id_from_rollout_path(item.path.as_path()))?;
     let created_at = parse_rfc3339(item.created_at.as_deref()).unwrap_or_else(Utc::now);
     let updated_at = parse_rfc3339(item.updated_at.as_deref()).unwrap_or(created_at);
+    let recency_at = parse_rfc3339(item.recency_at.as_deref()).unwrap_or(updated_at);
     let archived_at = archived.then_some(updated_at);
     let git_info = git_info_from_parts(
         item.git_sha.clone(),
@@ -110,12 +144,19 @@ pub(super) fn stored_thread_from_rollout_item(
         item.git_origin_url.clone(),
     );
     let source = item.source.unwrap_or(SessionSource::Unknown);
-    let preview = item.first_user_message.clone().unwrap_or_default();
+    let preview = item
+        .preview
+        .clone()
+        .or_else(|| item.first_user_message.clone())
+        .unwrap_or_default();
+    let rollout_path = codex_rollout::plain_rollout_path(item.path.as_path());
 
     Some(StoredThread {
         thread_id,
-        rollout_path: Some(item.path),
+        extra_config: None,
+        rollout_path: Some(rollout_path),
         forked_from_id: None,
+        parent_thread_id: item.parent_thread_id,
         preview,
         name: None,
         model_provider: item
@@ -126,20 +167,107 @@ pub(super) fn stored_thread_from_rollout_item(
         reasoning_effort: None,
         created_at,
         updated_at,
+        recency_at,
         archived_at,
+        section: item.section,
+        section_position: None,
+        section_entered_at: None,
         cwd: item.cwd.unwrap_or_default(),
         cli_version: item.cli_version.unwrap_or_default(),
         source,
+        history_mode: item.history_mode,
+        thread_source: None,
         agent_nickname: item.agent_nickname,
         agent_role: item.agent_role,
         agent_path: None,
         git_info,
         approval_mode: AskForApproval::OnRequest,
-        sandbox_policy: SandboxPolicy::new_read_only_policy(),
+        permission_profile: PermissionProfile::read_only(),
         token_usage: None,
         first_user_message: item.first_user_message,
         history: None,
     })
+}
+
+pub(super) fn permission_profile_from_metadata_value(value: &str, cwd: &Path) -> PermissionProfile {
+    serde_json::from_str::<PermissionProfile>(value)
+        .or_else(|_| {
+            parse_legacy_sandbox_policy(value)
+                .map(|policy| PermissionProfile::from_legacy_sandbox_policy_for_cwd(&policy, cwd))
+        })
+        .unwrap_or_else(|_| PermissionProfile::read_only())
+}
+
+pub(super) fn permission_profile_to_metadata_value(
+    permission_profile: &PermissionProfile,
+) -> String {
+    match serde_json::to_string(permission_profile) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!("failed to serialize permission profile metadata: {err}");
+            String::new()
+        }
+    }
+}
+
+pub(super) fn sqlite_thread_name(metadata: &ThreadMetadata) -> Option<String> {
+    metadata
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
+pub(super) async fn resolve_thread_section_metadata(
+    state_db: &codex_state::StateRuntime,
+    thread_ids: &[ThreadId],
+) -> HashMap<ThreadId, (Option<i64>, Option<DateTime<Utc>>)> {
+    if thread_ids.is_empty() {
+        return HashMap::new();
+    }
+
+    state_db
+        .get_thread_section_ordering(thread_ids)
+        .await
+        .unwrap_or_default()
+}
+
+pub(super) async fn resolve_thread_names(
+    store: &LocalThreadStore,
+    thread_history_modes: &HashMap<ThreadId, ThreadHistoryMode>,
+) -> HashMap<ThreadId, String> {
+    let mut names = HashMap::<ThreadId, String>::with_capacity(thread_history_modes.len());
+    let legacy_thread_ids = thread_history_modes
+        .iter()
+        .filter_map(|(&thread_id, &history_mode)| {
+            (history_mode == ThreadHistoryMode::Legacy).then_some(thread_id)
+        })
+        .collect::<HashSet<_>>();
+    if let Some(state_db_ctx) = store.state_db().await {
+        for (&thread_id, &history_mode) in thread_history_modes {
+            let Ok(Some(metadata)) = state_db_ctx.get_thread(thread_id).await else {
+                continue;
+            };
+            let name = match history_mode {
+                ThreadHistoryMode::Legacy => distinct_thread_metadata_title(&metadata),
+                ThreadHistoryMode::Paginated => sqlite_thread_name(&metadata),
+            };
+            if let Some(name) = name {
+                names.insert(thread_id, name);
+            }
+        }
+    }
+    if let Ok(legacy_names) =
+        find_thread_names_by_ids(store.config.codex_home.as_path(), &legacy_thread_ids).await
+    {
+        // Legacy titles remain authoritative when present; the index only fills
+        // names for threads whose SQLite title is still derived from the preview.
+        for (thread_id, name) in legacy_names {
+            names.entry(thread_id).or_insert(name);
+        }
+    }
+    names
 }
 
 pub(super) fn distinct_thread_metadata_title(metadata: &ThreadMetadata) -> Option<String> {
@@ -151,17 +279,30 @@ pub(super) fn distinct_thread_metadata_title(metadata: &ThreadMetadata) -> Optio
     }
 }
 
-pub(super) fn set_thread_name_from_title(thread: &mut StoredThread, title: String) {
-    if title.trim().is_empty() || thread.preview.trim() == title.trim() {
-        return;
+pub(super) fn set_thread_name(thread: &mut StoredThread, name: String) {
+    if thread.history_mode == ThreadHistoryMode::Paginated || thread.preview.trim() != name.trim() {
+        thread.name = Some(name);
     }
-    thread.name = Some(title);
 }
 
 fn parse_rfc3339(value: Option<&str>) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value?)
         .ok()
         .map(|dt| dt.with_timezone(&Utc))
+}
+
+fn parse_legacy_sandbox_policy(value: &str) -> serde_json::Result<SandboxPolicy> {
+    serde_json::from_str(value)
+        .or_else(|_| serde_json::from_value(serde_json::Value::String(value.to_string())))
+        .or_else(|_| match value {
+            "danger-full-access" => Ok(SandboxPolicy::DangerFullAccess),
+            "read-only" => Ok(SandboxPolicy::new_read_only_policy()),
+            "workspace-write" => Ok(SandboxPolicy::new_workspace_write_policy()),
+            "external-sandbox" => Ok(SandboxPolicy::ExternalSandbox {
+                network_access: NetworkAccess::Restricted,
+            }),
+            _ => serde_json::from_value(serde_json::Value::String(value.to_string())),
+        })
 }
 
 pub(super) fn git_info_from_parts(
@@ -181,6 +322,7 @@ pub(super) fn git_info_from_parts(
 
 fn thread_id_from_rollout_path(path: &Path) -> Option<ThreadId> {
     let file_name = path.file_name()?.to_str()?;
+    let file_name = file_name.strip_suffix(".zst").unwrap_or(file_name);
     let stem = file_name.strip_suffix(".jsonl")?;
     if stem.len() < 37 {
         return None;
@@ -190,4 +332,37 @@ fn thread_id_from_rollout_path(path: &Path) -> Option<ThreadId> {
         return None;
     }
     ThreadId::from_string(&stem[uuid_start..]).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use codex_rollout::ThreadItem;
+    use pretty_assertions::assert_eq;
+    use uuid::Uuid;
+
+    use super::*;
+
+    #[test]
+    fn stored_thread_from_rollout_item_returns_logical_rollout_path() {
+        let uuid = Uuid::from_u128(1);
+        let compressed_path = PathBuf::from(format!(
+            "/tmp/sessions/2025/01/03/rollout-2025-01-03T12-00-00-{uuid}.jsonl.zst"
+        ));
+        let thread = stored_thread_from_rollout_item(
+            ThreadItem {
+                path: compressed_path.clone(),
+                ..Default::default()
+            },
+            /*archived*/ false,
+            "test-provider",
+        )
+        .expect("stored thread");
+
+        assert_eq!(
+            thread.rollout_path,
+            Some(
+                compressed_path.with_file_name(format!("rollout-2025-01-03T12-00-00-{uuid}.jsonl"))
+            )
+        );
+    }
 }

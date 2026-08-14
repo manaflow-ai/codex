@@ -2,6 +2,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use codex_http_client::HttpClientFactory;
+use codex_http_client::OutboundProxyPolicy;
+use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -26,12 +29,17 @@ fn exec_params_with_argv(process_id: &str, argv: Vec<String>) -> ExecParams {
     ExecParams {
         process_id: ProcessId::from(process_id),
         argv,
-        cwd: std::env::current_dir().expect("cwd"),
+        cwd: PathUri::from_host_native_path(std::env::current_dir().expect("cwd"))
+            .expect("cwd URI"),
         env_policy: None,
         env: inherited_path_env(),
         tty: false,
         pipe_stdin: false,
         arg0: None,
+        sandbox: None,
+        enforce_managed_network: false,
+        managed_network: None,
+        network_proxy: None,
     }
 }
 
@@ -75,13 +83,18 @@ fn test_runtime_paths() -> ExecServerRuntimePaths {
     .expect("runtime paths")
 }
 
+fn test_http_client_factory() -> HttpClientFactory {
+    HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault)
+}
+
 async fn initialized_handler() -> Arc<ExecServerHandler> {
     let (outgoing_tx, _outgoing_rx) = mpsc::channel(16);
-    let registry = SessionRegistry::new();
+    let registry = SessionRegistry::new(crate::ExecServerTelemetry::default());
     let handler = Arc::new(ExecServerHandler::new(
         registry,
         RpcNotificationSender::new(outgoing_tx),
         test_runtime_paths(),
+        test_http_client_factory(),
     ));
     let initialize_response = handler
         .initialize(InitializeParams {
@@ -155,11 +168,12 @@ async fn terminate_reports_false_after_process_exit() {
 #[tokio::test]
 async fn long_poll_read_fails_after_session_resume() {
     let (first_tx, _first_rx) = mpsc::channel(16);
-    let registry = SessionRegistry::new();
+    let registry = SessionRegistry::new(crate::ExecServerTelemetry::default());
     let first_handler = Arc::new(ExecServerHandler::new(
         Arc::clone(&registry),
         RpcNotificationSender::new(first_tx),
         test_runtime_paths(),
+        test_http_client_factory(),
     ));
     let initialize_response = first_handler
         .initialize(InitializeParams {
@@ -200,6 +214,7 @@ async fn long_poll_read_fails_after_session_resume() {
         registry,
         RpcNotificationSender::new(second_tx),
         test_runtime_paths(),
+        test_http_client_factory(),
     ));
     second_handler
         .initialize(InitializeParams {
@@ -228,11 +243,12 @@ async fn long_poll_read_fails_after_session_resume() {
 #[tokio::test]
 async fn active_session_resume_is_rejected() {
     let (first_tx, _first_rx) = mpsc::channel(16);
-    let registry = SessionRegistry::new();
+    let registry = SessionRegistry::new(crate::ExecServerTelemetry::default());
     let first_handler = Arc::new(ExecServerHandler::new(
         Arc::clone(&registry),
         RpcNotificationSender::new(first_tx),
         test_runtime_paths(),
+        test_http_client_factory(),
     ));
     let initialize_response = first_handler
         .initialize(InitializeParams {
@@ -247,6 +263,7 @@ async fn active_session_resume_is_rejected() {
         registry,
         RpcNotificationSender::new(second_tx),
         test_runtime_paths(),
+        test_http_client_factory(),
     ));
     let err = second_handler
         .initialize(InitializeParams {
@@ -256,7 +273,7 @@ async fn active_session_resume_is_rejected() {
         .await
         .expect_err("active session resume should fail");
 
-    assert_eq!(err.code, -32600);
+    assert_eq!(err.code, crate::rpc::SESSION_ALREADY_ATTACHED_ERROR_CODE);
     assert_eq!(
         err.message,
         format!(
@@ -272,9 +289,10 @@ async fn active_session_resume_is_rejected() {
 async fn output_and_exit_are_retained_after_notification_receiver_closes() {
     let (outgoing_tx, outgoing_rx) = mpsc::channel(16);
     let handler = Arc::new(ExecServerHandler::new(
-        SessionRegistry::new(),
+        SessionRegistry::new(crate::ExecServerTelemetry::default()),
         RpcNotificationSender::new(outgoing_tx),
         test_runtime_paths(),
+        test_http_client_factory(),
     ));
     handler
         .initialize(InitializeParams {

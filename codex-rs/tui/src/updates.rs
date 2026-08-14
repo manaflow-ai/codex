@@ -8,16 +8,21 @@ use crate::update_action::UpdateAction;
 use crate::update_versions::extract_version_from_latest_tag;
 use crate::update_versions::is_newer;
 use crate::update_versions::is_source_build_version;
-use chrono::DateTime;
+use crate::updates_cache::VersionInfo;
+use crate::updates_cache::read_version_info;
+use crate::updates_cache::version_filepath;
 use chrono::Duration;
 use chrono::Utc;
-use codex_login::default_client::create_client;
+use codex_http_client::ClientRouteClass;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::RouteAwareClientPool;
+use codex_login::default_client::default_headers;
 use serde::Deserialize;
-use serde::Serialize;
 use std::path::Path;
-use std::path::PathBuf;
 
 use crate::version::CODEX_CLI_VERSION;
+
+pub(crate) use crate::updates_cache::dismiss_version;
 
 pub fn get_upgrade_version(config: &Config) -> Option<String> {
     if !config.check_for_update_on_startup || is_source_build_version(CODEX_CLI_VERSION) {
@@ -32,11 +37,12 @@ pub fn get_upgrade_version(config: &Config) -> Option<String> {
         None => true,
         Some(info) => info.last_checked_at < Utc::now() - Duration::hours(20),
     } {
+        let http_client_factory = config.http_client_factory();
         // Refresh the cached latest version in the background so TUI startup
         // isn’t blocked by a network call. The UI reads the previously cached
         // value (if any) for this run; the next run shows the banner if needed.
         tokio::spawn(async move {
-            check_for_update(&version_file, action)
+            check_for_update(&version_file, action, http_client_factory)
                 .await
                 .inspect_err(|e| tracing::error!("Failed to update version: {e}"))
         });
@@ -51,16 +57,6 @@ pub fn get_upgrade_version(config: &Config) -> Option<String> {
     })
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct VersionInfo {
-    latest_version: String,
-    // ISO-8601 timestamp (RFC3339)
-    last_checked_at: DateTime<Utc>,
-    #[serde(default)]
-    dismissed_version: Option<String>,
-}
-
-const VERSION_FILENAME: &str = "version.json";
 // We use the latest version from the cask if installation is via homebrew - homebrew does not immediately pick up the latest release and can lag behind.
 const HOMEBREW_CASK_API_URL: &str = "https://formulae.brew.sh/api/cask/codex.json";
 const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/openai/codex/releases/latest";
@@ -75,20 +71,21 @@ struct HomebrewCaskInfo {
     version: String,
 }
 
-fn version_filepath(config: &Config) -> PathBuf {
-    config.codex_home.join(VERSION_FILENAME).into_path_buf()
-}
-
-fn read_version_info(version_file: &Path) -> anyhow::Result<VersionInfo> {
-    let contents = std::fs::read_to_string(version_file)?;
-    Ok(serde_json::from_str(&contents)?)
-}
-
-async fn check_for_update(version_file: &Path, action: Option<UpdateAction>) -> anyhow::Result<()> {
+async fn check_for_update(
+    version_file: &Path,
+    action: Option<UpdateAction>,
+    http_client_factory: HttpClientFactory,
+) -> anyhow::Result<()> {
+    let client_pool = RouteAwareClientPool::with_chatgpt_cloudflare_cookies(
+        http_client_factory,
+        ClientRouteClass::Other,
+    )
+    .with_legacy_custom_ca_fallback();
     let latest_version = match action {
         Some(UpdateAction::BrewUpgrade) => {
-            let HomebrewCaskInfo { version } = create_client()
+            let HomebrewCaskInfo { version } = client_pool
                 .get(HOMEBREW_CASK_API_URL)
+                .headers(default_headers())
                 .send()
                 .await?
                 .error_for_status()?
@@ -96,10 +93,13 @@ async fn check_for_update(version_file: &Path, action: Option<UpdateAction>) -> 
                 .await?;
             version
         }
-        Some(UpdateAction::NpmGlobalLatest) | Some(UpdateAction::BunGlobalLatest) => {
-            let latest_version = fetch_latest_github_release_version().await?;
-            let package_info = create_client()
+        Some(UpdateAction::NpmGlobalLatest)
+        | Some(UpdateAction::BunGlobalLatest)
+        | Some(UpdateAction::PnpmGlobalLatest) => {
+            let latest_version = fetch_latest_github_release_version(&client_pool).await?;
+            let package_info = client_pool
                 .get(npm_registry::PACKAGE_URL)
+                .headers(default_headers())
                 .send()
                 .await?
                 .error_for_status()?
@@ -109,7 +109,7 @@ async fn check_for_update(version_file: &Path, action: Option<UpdateAction>) -> 
             latest_version
         }
         Some(UpdateAction::StandaloneUnix) | Some(UpdateAction::StandaloneWindows) | None => {
-            fetch_latest_github_release_version().await?
+            fetch_latest_github_release_version(&client_pool).await?
         }
     };
 
@@ -129,11 +129,14 @@ async fn check_for_update(version_file: &Path, action: Option<UpdateAction>) -> 
     Ok(())
 }
 
-async fn fetch_latest_github_release_version() -> anyhow::Result<String> {
+async fn fetch_latest_github_release_version(
+    client_pool: &RouteAwareClientPool,
+) -> anyhow::Result<String> {
     let ReleaseInfo {
         tag_name: latest_tag_name,
-    } = create_client()
+    } = client_pool
         .get(LATEST_RELEASE_URL)
+        .headers(default_headers())
         .send()
         .await?
         .error_for_status()?
@@ -158,21 +161,4 @@ pub fn get_upgrade_version_for_popup(config: &Config) -> Option<String> {
         return None;
     }
     Some(latest)
-}
-
-/// Persist a dismissal for the current latest version so we don't show
-/// the update popup again for this version.
-pub async fn dismiss_version(config: &Config, version: &str) -> anyhow::Result<()> {
-    let version_file = version_filepath(config);
-    let mut info = match read_version_info(&version_file) {
-        Ok(info) => info,
-        Err(_) => return Ok(()),
-    };
-    info.dismissed_version = Some(version.to_string());
-    let json_line = format!("{}\n", serde_json::to_string(&info)?);
-    if let Some(parent) = version_file.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    tokio::fs::write(version_file, json_line).await?;
-    Ok(())
 }

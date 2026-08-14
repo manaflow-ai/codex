@@ -1,10 +1,17 @@
 use anyhow::Result;
-use app_test_support::McpProcess;
+use app_test_support::MockResponsesConfig;
+use app_test_support::TestAppServer;
 use app_test_support::create_final_assistant_message_sse_response;
+use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
 use app_test_support::to_response;
+use codex_app_server_protocol::ClientInfo;
+use codex_app_server_protocol::DeprecationNoticeNotification;
+use codex_app_server_protocol::JSONRPCError;
+use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
+use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
@@ -23,6 +30,96 @@ use tokio::time::timeout;
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[tokio::test]
+async fn thread_rollback_rejects_paginated_thread() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let start_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            history_mode: Some(ThreadHistoryMode::Paginated),
+            ..Default::default()
+        })
+        .await?;
+    let start_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response(start_resp)?;
+
+    let rollback_id = mcp
+        .send_thread_rollback_request(ThreadRollbackParams {
+            thread_id: thread.id,
+            num_turns: 1,
+        })
+        .await?;
+    let rollback_err: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(rollback_id)),
+    )
+    .await??;
+    assert_eq!(rollback_err.error.code, -32600);
+    assert_eq!(
+        rollback_err.error.message,
+        "paginated threads do not support thread/rollback"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_rollback_does_not_emit_deprecation_notice_to_codex_tui() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    let initialized = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.initialize_with_client_info(ClientInfo {
+            name: "codex-tui".to_string(),
+            title: None,
+            version: "0.1.0".to_string(),
+        }),
+    )
+    .await??;
+    let JSONRPCMessage::Response(_) = initialized else {
+        panic!("expected initialize response, got {initialized:?}");
+    };
+    mcp.clear_message_buffer();
+
+    let rollback_id = mcp
+        .send_thread_rollback_request(ThreadRollbackParams {
+            thread_id: "00000000-0000-0000-0000-000000000001".to_string(),
+            num_turns: 1,
+        })
+        .await?;
+    loop {
+        let message = timeout(DEFAULT_READ_TIMEOUT, mcp.read_next_message()).await??;
+        match message {
+            JSONRPCMessage::Notification(notification) => {
+                assert_ne!(notification.method, "deprecationNotice");
+            }
+            JSONRPCMessage::Error(error) if error.id == RequestId::Integer(rollback_id) => {
+                break;
+            }
+            message => {
+                panic!("expected rollback error response, got {message:?}");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_rollback_drops_last_turns_and_persists_to_rollout() -> Result<()> {
     // Three Codex turns hit the mock model (session start + two turn/start calls).
     let responses = vec![
@@ -33,14 +130,17 @@ async fn thread_rollback_drops_last_turns_and_persists_to_rollout() -> Result<()
     let server = create_mock_responses_server_sequence_unchecked(responses).await;
 
     let codex_home = TempDir::new()?;
-    create_config_toml(codex_home.path(), &server.uri())?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     // Start a thread.
     let start_id = mcp
-        .send_thread_start_request(ThreadStartParams {
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("mock-model".to_string()),
             ..Default::default()
         })
@@ -57,6 +157,7 @@ async fn thread_rollback_drops_last_turns_and_persists_to_rollout() -> Result<()
     let turn1_id = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![V2UserInput::Text {
                 text: first_text.to_string(),
                 text_elements: Vec::new(),
@@ -78,6 +179,7 @@ async fn thread_rollback_drops_last_turns_and_persists_to_rollout() -> Result<()
     let turn2_id = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![V2UserInput::Text {
                 text: "Second".to_string(),
                 text_elements: Vec::new(),
@@ -95,6 +197,7 @@ async fn thread_rollback_drops_last_turns_and_persists_to_rollout() -> Result<()
         mcp.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
+    mcp.clear_message_buffer();
 
     // Roll back the last turn.
     let rollback_id = mcp
@@ -103,6 +206,23 @@ async fn thread_rollback_drops_last_turns_and_persists_to_rollout() -> Result<()
             num_turns: 1,
         })
         .await?;
+    let deprecation_notice = timeout(DEFAULT_READ_TIMEOUT, mcp.read_next_message()).await??;
+    let JSONRPCMessage::Notification(deprecation_notice) = deprecation_notice else {
+        panic!("thread/rollback should emit deprecationNotice before its response");
+    };
+    assert_eq!(deprecation_notice.method, "deprecationNotice");
+    let deprecation_notice: DeprecationNoticeNotification = serde_json::from_value(
+        deprecation_notice
+            .params
+            .expect("deprecationNotice params should be present"),
+    )?;
+    assert_eq!(
+        deprecation_notice,
+        DeprecationNoticeNotification {
+            summary: "thread/rollback is deprecated and will be removed soon".to_string(),
+            details: None,
+        }
+    );
     let rollback_resp: JSONRPCResponse = timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_response_message(RequestId::Integer(rollback_id)),
@@ -119,10 +239,15 @@ async fn thread_rollback_drops_last_turns_and_persists_to_rollout() -> Result<()
         .and_then(Value::as_object)
         .expect("thread/rollback result.thread must be an object");
     assert_eq!(rolled_back_thread.name, None);
+    assert_eq!(rolled_back_thread.session_id, thread.session_id);
     assert_eq!(
         thread_json.get("name"),
         Some(&Value::Null),
         "thread/rollback must serialize `name: null` when unset"
+    );
+    assert_eq!(
+        thread_json.get("sessionId").and_then(Value::as_str),
+        Some(thread.session_id.as_str())
     );
 
     assert_eq!(rolled_back_thread.turns.len(), 1);
@@ -172,27 +297,4 @@ async fn thread_rollback_drops_last_turns_and_persists_to_rollout() -> Result<()
     }
 
     Ok(())
-}
-
-fn create_config_toml(codex_home: &std::path::Path, server_uri: &str) -> std::io::Result<()> {
-    let config_toml = codex_home.join("config.toml");
-    std::fs::write(
-        config_toml,
-        format!(
-            r#"
-model = "mock-model"
-approval_policy = "never"
-sandbox_mode = "read-only"
-
-model_provider = "mock_provider"
-
-[model_providers.mock_provider]
-name = "Mock provider for test"
-base_url = "{server_uri}/v1"
-wire_api = "responses"
-request_max_retries = 0
-stream_max_retries = 0
-"#
-        ),
-    )
 }

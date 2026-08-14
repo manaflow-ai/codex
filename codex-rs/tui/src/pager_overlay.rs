@@ -20,15 +20,20 @@ use std::sync::Arc;
 
 use crate::chatwidget::ActiveCellTranscriptKey;
 use crate::history_cell::HistoryCell;
+use crate::history_cell::SessionInfoCell;
 use crate::history_cell::UserHistoryCell;
 use crate::key_hint;
 use crate::key_hint::KeyBinding;
 use crate::key_hint::KeyBindingListExt;
+use crate::key_hint::ShortcutHint;
 use crate::keymap::PagerKeymap;
 use crate::render::Insets;
 use crate::render::renderable::InsetRenderable;
 use crate::render::renderable::Renderable;
 use crate::style::user_message_style;
+use crate::terminal_hyperlinks::HyperlinkLine;
+use crate::terminal_hyperlinks::mark_buffer_hyperlinks;
+use crate::terminal_hyperlinks::visible_lines_ref;
 use crate::tui;
 use crate::tui::TuiEvent;
 use crossterm::event::KeyCode;
@@ -44,7 +49,6 @@ use ratatui::text::Text;
 use ratatui::widgets::Clear;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Widget;
-use ratatui::widgets::WidgetRef;
 use ratatui::widgets::Wrap;
 
 pub(crate) enum Overlay {
@@ -88,12 +92,16 @@ impl Overlay {
     }
 }
 
-fn first_or_empty(bindings: &[KeyBinding]) -> Vec<KeyBinding> {
-    bindings.first().copied().into_iter().collect()
+fn first_or_empty(
+    keymap: &PagerKeymap,
+    action: &'static str,
+    bindings: &[KeyBinding],
+) -> Vec<ShortcutHint> {
+    keymap.primary_hint(action, bindings).into_iter().collect()
 }
 
 // Render a single line of key hints from (key(s), description) pairs.
-fn render_key_hints(area: Rect, buf: &mut Buffer, pairs: &[(Vec<KeyBinding>, &str)]) {
+fn render_key_hints(area: Rect, buf: &mut Buffer, pairs: &[(Vec<ShortcutHint>, &str)]) {
     let mut spans: Vec<Span<'static>> = vec![" ".into()];
     let mut first = true;
     for (keys, desc) in pairs {
@@ -104,13 +112,38 @@ fn render_key_hints(area: Rect, buf: &mut Buffer, pairs: &[(Vec<KeyBinding>, &st
             if i > 0 {
                 spans.push("/".into());
             }
-            spans.push(Span::from(key));
+            spans.push(Span::from(*key));
         }
         spans.push(" ".into());
         spans.push(Span::from(desc.to_string()));
         first = false;
     }
-    Paragraph::new(vec![Line::from(spans).dim()]).render_ref(area, buf);
+    Paragraph::new(vec![Line::from(spans).dim()]).render(area, buf);
+}
+
+fn render_navigation_hints(area: Rect, buf: &mut Buffer, keymap: &PagerKeymap) {
+    let actions = [
+        ("scroll_up", &keymap.scroll_up),
+        ("scroll_down", &keymap.scroll_down),
+        ("page_up", &keymap.page_up),
+        ("page_down", &keymap.page_down),
+        ("jump_top", &keymap.jump_top),
+        ("jump_bottom", &keymap.jump_bottom),
+    ];
+    let hints = actions
+        .chunks_exact(2)
+        .zip(["to scroll", "to page", "to jump"])
+        .map(|(actions, description)| {
+            (
+                actions
+                    .iter()
+                    .filter_map(|(action, bindings)| keymap.primary_hint(action, bindings))
+                    .collect(),
+                description,
+            )
+        })
+        .collect::<Vec<_>>();
+    render_key_hints(area, buf, &hints);
 }
 
 /// Generic widget for rendering a pager view.
@@ -121,6 +154,8 @@ struct PagerView {
     keymap: PagerKeymap,
     last_content_height: Option<usize>,
     last_rendered_height: Option<usize>,
+    /// Percentages are meaningful only when the full scrollable history is known.
+    scroll_percentage_visible: bool,
     /// If set, on next render ensure this chunk is visible.
     pending_scroll_chunk: Option<usize>,
 }
@@ -139,6 +174,7 @@ impl PagerView {
             keymap,
             last_content_height: None,
             last_rendered_height: None,
+            scroll_percentage_visible: true,
             pending_scroll_chunk: None,
         }
     }
@@ -174,9 +210,9 @@ impl PagerView {
     fn render_header(&self, area: Rect, buf: &mut Buffer) {
         Span::from("/ ".repeat(area.width as usize / 2))
             .dim()
-            .render_ref(area, buf);
+            .render(area, buf);
         let header = format!("/ {}", self.title);
-        header.dim().render_ref(area, buf);
+        header.dim().render(area, buf);
     }
 
     fn render_content(&self, area: Rect, buf: &mut Buffer) {
@@ -227,7 +263,10 @@ impl PagerView {
 
         Span::from("─".repeat(sep_rect.width as usize))
             .dim()
-            .render_ref(sep_rect, buf);
+            .render(sep_rect, buf);
+        if !self.scroll_percentage_visible {
+            return;
+        }
         let percent = if total_len == 0 {
             100
         } else {
@@ -244,7 +283,7 @@ impl PagerView {
         let pct_x = sep_rect.x + sep_rect.width - pct_w - 1;
         Span::from(pct_text)
             .dim()
-            .render_ref(Rect::new(pct_x, sep_rect.y, pct_w, 1), buf);
+            .render(Rect::new(pct_x, sep_rect.y, pct_w, 1), buf);
     }
 
     fn handle_key_event(&mut self, tui: &mut tui::Tui, key_event: KeyEvent) -> Result<()> {
@@ -390,19 +429,80 @@ impl Renderable for CachedRenderable {
 
 struct CellRenderable {
     cell: Arc<dyn HistoryCell>,
-    style: Style,
+    highlighted: bool,
 }
 
 impl Renderable for CellRenderable {
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        let p = Paragraph::new(Text::from(self.cell.transcript_lines(area.width)))
-            .style(self.style)
+        let hyperlink_lines = self.cell.transcript_hyperlink_lines(area.width);
+        let style = if self.cell.as_any().is::<UserHistoryCell>() {
+            if self.highlighted {
+                user_message_style().reversed()
+            } else {
+                user_message_style()
+            }
+        } else {
+            Style::default()
+        };
+        let p = Paragraph::new(Text::from(visible_lines_ref(&hyperlink_lines)))
+            .style(style)
             .wrap(Wrap { trim: false });
         p.render(area, buf);
+        mark_buffer_hyperlinks(buf, area, &hyperlink_lines, /*scroll_rows*/ 0);
     }
 
     fn desired_height(&self, width: u16) -> u16 {
         self.cell.desired_transcript_height(width)
+    }
+}
+
+struct HyperlinkLinesRenderable {
+    lines: Vec<HyperlinkLine>,
+}
+
+impl Renderable for HyperlinkLinesRenderable {
+    fn render(&self, area: Rect, buf: &mut Buffer) {
+        Paragraph::new(Text::from(visible_lines_ref(&self.lines)))
+            .wrap(Wrap { trim: false })
+            .render(area, buf);
+        mark_buffer_hyperlinks(buf, area, &self.lines, /*scroll_rows*/ 0);
+    }
+
+    fn desired_height(&self, width: u16) -> u16 {
+        Paragraph::new(Text::from(visible_lines_ref(&self.lines)))
+            .wrap(Wrap { trim: false })
+            .line_count(width)
+            .try_into()
+            .unwrap_or(/*default*/ 0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum TranscriptHistoryState {
+    #[default]
+    Idle,
+    LoadingOlder,
+    LoadingBeginning,
+    Partial,
+    Failed,
+    Complete,
+}
+
+impl TranscriptHistoryState {
+    fn has_unloaded_history(self) -> bool {
+        matches!(
+            self,
+            Self::LoadingOlder | Self::LoadingBeginning | Self::Partial | Self::Failed
+        )
+    }
+
+    fn session_header_placeholder(self) -> Option<&'static str> {
+        match self {
+            Self::LoadingOlder | Self::LoadingBeginning => Some("Loading earlier messages..."),
+            Self::Partial => Some("Earlier messages are available — scroll up to load them"),
+            Self::Failed => Some("Earlier messages unavailable — scroll up to retry"),
+            Self::Idle | Self::Complete => None,
+        }
     }
 }
 
@@ -417,6 +517,7 @@ pub(crate) struct TranscriptOverlay {
     highlight_cell: Option<usize>,
     /// Cache key for the render-only live tail appended after committed cells.
     live_tail_key: Option<LiveTailKey>,
+    history_state: TranscriptHistoryState,
     is_done: bool,
 }
 
@@ -443,7 +544,11 @@ impl TranscriptOverlay {
     pub(crate) fn new(transcript_cells: Vec<Arc<dyn HistoryCell>>, keymap: PagerKeymap) -> Self {
         Self {
             view: PagerView::new(
-                Self::render_cells(&transcript_cells, /*highlight_cell*/ None),
+                Self::render_cells(
+                    &transcript_cells,
+                    /*highlight_cell*/ None,
+                    TranscriptHistoryState::Idle,
+                ),
                 "T R A N S C R I P T".to_string(),
                 usize::MAX,
                 keymap,
@@ -451,51 +556,83 @@ impl TranscriptOverlay {
             cells: transcript_cells,
             highlight_cell: None,
             live_tail_key: None,
+            history_state: TranscriptHistoryState::Idle,
             is_done: false,
         }
+    }
+
+    pub(crate) fn set_history_state(
+        &mut self,
+        state: TranscriptHistoryState,
+    ) -> TranscriptHistoryState {
+        let previous = self.history_state;
+        if previous == state {
+            return previous;
+        }
+        if previous == TranscriptHistoryState::LoadingBeginning
+            && state == TranscriptHistoryState::Complete
+        {
+            self.view.scroll_offset = 0;
+        }
+        self.history_state = state;
+        self.view.scroll_percentage_visible = !state.has_unloaded_history();
+        if self
+            .cells
+            .iter()
+            .any(|cell| cell.as_any().is::<SessionInfoCell>())
+        {
+            self.rebuild_renderables();
+        }
+        previous
     }
 
     fn render_cells(
         cells: &[Arc<dyn HistoryCell>],
         highlight_cell: Option<usize>,
+        history_state: TranscriptHistoryState,
     ) -> Vec<Box<dyn Renderable>> {
         cells
             .iter()
             .enumerate()
-            .flat_map(|(i, c)| {
-                let mut v: Vec<Box<dyn Renderable>> = Vec::new();
-                let mut cell_renderable = if c.as_any().is::<UserHistoryCell>() {
-                    Box::new(CachedRenderable::new(CellRenderable {
-                        cell: c.clone(),
-                        style: if highlight_cell == Some(i) {
-                            user_message_style().reversed()
-                        } else {
-                            user_message_style()
-                        },
-                    })) as Box<dyn Renderable>
-                } else {
-                    Box::new(CachedRenderable::new(CellRenderable {
-                        cell: c.clone(),
-                        style: Style::default(),
-                    })) as Box<dyn Renderable>
-                };
-                if !c.is_stream_continuation() && i > 0 {
-                    cell_renderable = Box::new(InsetRenderable::new(
-                        cell_renderable,
-                        Insets::tlbr(
-                            /*top*/ 1, /*left*/ 0, /*bottom*/ 0, /*right*/ 0,
-                        ),
-                    ));
-                }
-                v.push(cell_renderable);
-                v
-            })
+            .map(|(i, cell)| Self::render_cell(cell, i, highlight_cell, history_state))
             .collect()
+    }
+
+    /// Build the renderable for a committed cell, caching its height when the cell is stable.
+    fn render_cell(
+        cell: &Arc<dyn HistoryCell>,
+        index: usize,
+        highlight_cell: Option<usize>,
+        history_state: TranscriptHistoryState,
+    ) -> Box<dyn Renderable> {
+        if cell.as_any().is::<SessionInfoCell>()
+            && let Some(placeholder) = history_state.session_header_placeholder()
+        {
+            return Box::new(Line::from(placeholder).dim());
+        }
+        let cell_renderable = CellRenderable {
+            cell: cell.clone(),
+            highlighted: highlight_cell == Some(index),
+        };
+        let mut cell_renderable: Box<dyn Renderable> = if cell.has_stable_transcript_height() {
+            Box::new(CachedRenderable::new(cell_renderable))
+        } else {
+            Box::new(cell_renderable)
+        };
+        if !cell.is_stream_continuation() && index > 0 {
+            cell_renderable = Box::new(InsetRenderable::new(
+                cell_renderable,
+                Insets::tlbr(
+                    /*top*/ 1, /*left*/ 0, /*bottom*/ 0, /*right*/ 0,
+                ),
+            ));
+        }
+        cell_renderable
     }
 
     /// Insert a committed history cell while keeping any cached live tail.
     ///
-    /// The live tail is temporarily removed, the committed cells are rebuilt,
+    /// The live tail is temporarily removed, the new committed cell is appended,
     /// then the tail is reattached. If the tail previously had no leading
     /// spacing because it was the only renderable, we add the missing inset
     /// when the first committed cell arrives.
@@ -507,8 +644,14 @@ impl TranscriptOverlay {
         let follow_bottom = self.view.is_scrolled_to_bottom();
         let had_prior_cells = !self.cells.is_empty();
         let tail_renderable = self.take_live_tail_renderable();
+        let cell_renderable = Self::render_cell(
+            &cell,
+            self.cells.len(),
+            self.highlight_cell,
+            self.history_state,
+        );
         self.cells.push(cell);
-        self.view.renderables = Self::render_cells(&self.cells, self.highlight_cell);
+        self.view.renderables.push(cell_renderable);
         if let Some(tail) = tail_renderable {
             let tail = if !had_prior_cells
                 && self
@@ -531,6 +674,61 @@ impl TranscriptOverlay {
         if follow_bottom {
             self.view.scroll_offset = usize::MAX;
         }
+    }
+
+    /// Returns whether an upward navigation is close enough to request older history.
+    pub(crate) fn should_load_older(&self, key_event: KeyEvent) -> bool {
+        self.should_load_from_start(key_event)
+            || (self.view.scroll_offset
+                <= self.view.last_content_height.unwrap_or(/*default*/ 0)
+                && (self.view.keymap.scroll_up.is_pressed(key_event)
+                    || self.view.keymap.page_up.is_pressed(key_event)
+                    || self.view.keymap.half_page_up.is_pressed(key_event)))
+    }
+
+    pub(crate) fn should_load_from_start(&self, key_event: KeyEvent) -> bool {
+        self.view.keymap.jump_top.is_pressed(key_event)
+    }
+
+    /// Prepends history without moving visible content and returns its insertion index.
+    pub(crate) fn prepend(&mut self, cells: Vec<Arc<dyn HistoryCell>>, width: u16) -> usize {
+        if cells.is_empty() {
+            return 0;
+        }
+        let follow_bottom = self.view.is_scrolled_to_bottom();
+        let previous_height = self.view.content_height(width);
+        let live_tail = self.take_live_tail_renderable();
+        let added_cells = cells.len();
+        let insert_at = self
+            .cells
+            .iter()
+            .rposition(|cell| cell.as_any().is::<SessionInfoCell>())
+            .map_or(/*default*/ 0, |index| index.saturating_add(/*rhs*/ 1));
+        self.cells.splice(insert_at..insert_at, cells);
+        for index in [
+            &mut self.highlight_cell,
+            &mut self.view.pending_scroll_chunk,
+        ] {
+            if let Some(index) = index.as_mut()
+                && *index >= insert_at
+            {
+                *index = index.saturating_add(added_cells);
+            }
+        }
+        self.rebuild_renderables();
+        if let Some(live_tail) = live_tail {
+            self.view.renderables.push(live_tail);
+        }
+        self.view.scroll_offset = if follow_bottom {
+            usize::MAX
+        } else {
+            self.view.scroll_offset.saturating_add(
+                self.view
+                    .content_height(width)
+                    .saturating_sub(previous_height),
+            )
+        };
+        insert_at
     }
 
     /// Replace committed transcript cells while keeping any cached in-progress output that is
@@ -612,7 +810,7 @@ impl TranscriptOverlay {
         &mut self,
         width: u16,
         active_key: Option<ActiveCellTranscriptKey>,
-        compute_lines: impl FnOnce(u16) -> Option<Vec<Line<'static>>>,
+        compute_lines: impl FnOnce(u16) -> Option<Vec<HyperlinkLine>>,
     ) {
         let next_key = active_key.map(|key| LiveTailKey {
             width,
@@ -662,7 +860,8 @@ impl TranscriptOverlay {
 
     fn rebuild_renderables(&mut self) {
         let tail_renderable = self.take_live_tail_renderable();
-        self.view.renderables = Self::render_cells(&self.cells, self.highlight_cell);
+        self.view.renderables =
+            Self::render_cells(&self.cells, self.highlight_cell, self.history_state);
         if let Some(tail) = tail_renderable {
             self.view.renderables.push(tail);
         }
@@ -678,12 +877,12 @@ impl TranscriptOverlay {
     }
 
     fn live_tail_renderable(
-        lines: Vec<Line<'static>>,
+        lines: Vec<HyperlinkLine>,
         has_prior_cells: bool,
         is_stream_continuation: bool,
     ) -> Box<dyn Renderable> {
-        let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
-        let mut renderable: Box<dyn Renderable> = Box::new(CachedRenderable::new(paragraph));
+        let mut renderable: Box<dyn Renderable> =
+            Box::new(CachedRenderable::new(HyperlinkLinesRenderable { lines }));
         if has_prior_cells && !is_stream_continuation {
             renderable = Box::new(InsetRenderable::new(
                 renderable,
@@ -698,48 +897,27 @@ impl TranscriptOverlay {
     fn render_hints(&self, area: Rect, buf: &mut Buffer) {
         let line1 = Rect::new(area.x, area.y, area.width, 1);
         let line2 = Rect::new(area.x, area.y.saturating_add(1), area.width, 1);
-        render_key_hints(
-            line1,
-            buf,
-            &[
-                (
-                    first_or_empty(&self.view.keymap.scroll_up)
-                        .into_iter()
-                        .chain(first_or_empty(&self.view.keymap.scroll_down))
-                        .collect(),
-                    "to scroll",
-                ),
-                (
-                    first_or_empty(&self.view.keymap.page_up)
-                        .into_iter()
-                        .chain(first_or_empty(&self.view.keymap.page_down))
-                        .collect(),
-                    "to page",
-                ),
-                (
-                    first_or_empty(&self.view.keymap.jump_top)
-                        .into_iter()
-                        .chain(first_or_empty(&self.view.keymap.jump_bottom))
-                        .collect(),
-                    "to jump",
-                ),
-            ],
-        );
+        render_navigation_hints(line1, buf, &self.view.keymap);
 
-        let mut pairs: Vec<(Vec<KeyBinding>, &str)> =
-            vec![(first_or_empty(&self.view.keymap.close), "to quit")];
+        let mut pairs: Vec<(Vec<ShortcutHint>, &str)> = vec![(
+            first_or_empty(&self.view.keymap, "close", &self.view.keymap.close),
+            "to quit",
+        )];
         if self.highlight_cell.is_some() {
             pairs.push((
                 vec![
-                    key_hint::plain(KeyCode::Esc),
-                    key_hint::plain(KeyCode::Left),
+                    key_hint::plain(KeyCode::Esc).into(),
+                    key_hint::plain(KeyCode::Left).into(),
                 ],
                 "to edit prev",
             ));
-            pairs.push((vec![key_hint::plain(KeyCode::Right)], "to edit next"));
-            pairs.push((vec![key_hint::plain(KeyCode::Enter)], "to edit message"));
+            pairs.push((vec![key_hint::plain(KeyCode::Right).into()], "to edit next"));
+            pairs.push((
+                vec![key_hint::plain(KeyCode::Enter).into()],
+                "to edit message",
+            ));
         } else {
-            pairs.push((vec![key_hint::plain(KeyCode::Esc)], "to edit prev"));
+            pairs.push((vec![key_hint::plain(KeyCode::Esc).into()], "to edit prev"));
         }
         render_key_hints(line2, buf, &pairs);
     }
@@ -749,7 +927,31 @@ impl TranscriptOverlay {
         let top = Rect::new(area.x, area.y, area.width, top_h);
         let bottom = Rect::new(area.x, area.y + top_h, area.width, 3);
         self.view.render(top, buf);
+        self.render_history_state(top, buf);
         self.render_hints(bottom, buf);
+    }
+
+    fn render_history_state(&self, area: Rect, buf: &mut Buffer) {
+        if area.height == 0 {
+            return;
+        }
+        let label = match self.history_state {
+            TranscriptHistoryState::Idle => return,
+            TranscriptHistoryState::LoadingOlder | TranscriptHistoryState::LoadingBeginning => {
+                " loading older history... "
+            }
+            TranscriptHistoryState::Partial => " partial history | PgUp for earlier ",
+            TranscriptHistoryState::Failed => " history unavailable | PgUp to retry ",
+            TranscriptHistoryState::Complete => " start of history ",
+        };
+        let width = (label.chars().count() as u16).min(area.width);
+        let status_area = Rect::new(
+            area.right().saturating_sub(width),
+            area.y,
+            width,
+            /*height*/ 1,
+        );
+        Span::from(label).dim().render(status_area, buf);
     }
 }
 
@@ -765,7 +967,7 @@ impl TranscriptOverlay {
                 }
                 other => self.view.handle_key_event(tui, other),
             },
-            TuiEvent::Draw | TuiEvent::Resize => {
+            TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) => {
                 tui.draw(u16::MAX, |frame| {
                     self.render(frame.area(), frame.buffer);
                 })?;
@@ -776,11 +978,6 @@ impl TranscriptOverlay {
     }
     pub(crate) fn is_done(&self) -> bool {
         self.is_done
-    }
-
-    #[cfg(test)]
-    pub(crate) fn committed_cell_count(&self) -> usize {
-        self.cells.len()
     }
 }
 
@@ -817,35 +1014,11 @@ impl StaticOverlay {
     fn render_hints(&self, area: Rect, buf: &mut Buffer) {
         let line1 = Rect::new(area.x, area.y, area.width, 1);
         let line2 = Rect::new(area.x, area.y.saturating_add(1), area.width, 1);
-        render_key_hints(
-            line1,
-            buf,
-            &[
-                (
-                    first_or_empty(&self.view.keymap.scroll_up)
-                        .into_iter()
-                        .chain(first_or_empty(&self.view.keymap.scroll_down))
-                        .collect(),
-                    "to scroll",
-                ),
-                (
-                    first_or_empty(&self.view.keymap.page_up)
-                        .into_iter()
-                        .chain(first_or_empty(&self.view.keymap.page_down))
-                        .collect(),
-                    "to page",
-                ),
-                (
-                    first_or_empty(&self.view.keymap.jump_top)
-                        .into_iter()
-                        .chain(first_or_empty(&self.view.keymap.jump_bottom))
-                        .collect(),
-                    "to jump",
-                ),
-            ],
-        );
-        let pairs: Vec<(Vec<KeyBinding>, &str)> =
-            vec![(first_or_empty(&self.view.keymap.close), "to quit")];
+        render_navigation_hints(line1, buf, &self.view.keymap);
+        let pairs: Vec<(Vec<ShortcutHint>, &str)> = vec![(
+            first_or_empty(&self.view.keymap, "close", &self.view.keymap.close),
+            "to quit",
+        )];
         render_key_hints(line2, buf, &pairs);
     }
 
@@ -868,7 +1041,7 @@ impl StaticOverlay {
                 }
                 other => self.view.handle_key_event(tui, other),
             },
-            TuiEvent::Draw | TuiEvent::Resize => {
+            TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) => {
                 tui.draw(u16::MAX, |frame| {
                     self.render(frame.area(), frame.buffer);
                 })?;
@@ -919,6 +1092,8 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     use crate::diff_model::FileChange;
@@ -941,8 +1116,32 @@ mod tests {
             self.lines.clone()
         }
 
+        fn raw_lines(&self) -> Vec<Line<'static>> {
+            self.lines.clone()
+        }
+
         fn transcript_lines(&self, _width: u16) -> Vec<Line<'static>> {
             self.lines.clone()
+        }
+    }
+
+    #[derive(Debug)]
+    struct HeightCountingCell {
+        height_calls: Arc<AtomicUsize>,
+    }
+
+    impl crate::history_cell::HistoryCell for HeightCountingCell {
+        fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
+            vec![Line::from("counted")]
+        }
+
+        fn raw_lines(&self) -> Vec<Line<'static>> {
+            vec![Line::from("counted")]
+        }
+
+        fn desired_transcript_height(&self, _width: u16) -> u16 {
+            self.height_calls.fetch_add(1, Ordering::Relaxed);
+            1
         }
     }
 
@@ -981,6 +1180,27 @@ mod tests {
     }
 
     #[test]
+    fn footer_hints_display_chords_without_internal_dispatch_keys() {
+        use codex_config::types::KeybindingSpec;
+        use codex_config::types::KeybindingsSpec;
+        use codex_config::types::TuiKeymap;
+
+        let mut config = TuiKeymap::default();
+        config.pager.page_up = Some(KeybindingsSpec::One(KeybindingSpec(
+            "ctrl-x page-up".to_string(),
+        )));
+        let keymap = crate::keymap::RuntimeKeymap::from_config(&config).expect("valid pager chord");
+
+        assert_eq!(
+            first_or_empty(&keymap.pager, "page_up", &keymap.pager.page_up),
+            vec![ShortcutHint::Chord {
+                prefix: key_hint::ctrl(KeyCode::Char('x')),
+                completion: key_hint::plain(KeyCode::PageUp),
+            }]
+        );
+    }
+
+    #[test]
     fn edit_prev_hint_is_visible() {
         let mut overlay = transcript_overlay(vec![Arc::new(TestCell {
             lines: vec![Line::from("hello")],
@@ -996,6 +1216,22 @@ mod tests {
             s.contains("edit prev"),
             "expected 'edit prev' hint in overlay footer, got: {s:?}"
         );
+    }
+
+    #[test]
+    fn jump_top_requests_older_history_from_the_bottom() {
+        let overlay = transcript_overlay(vec![Arc::new(TestCell {
+            lines: vec![Line::from("recent")],
+        })]);
+
+        let home = KeyEvent::new(KeyCode::Home, crossterm::event::KeyModifiers::NONE);
+
+        assert!(overlay.should_load_older(home));
+        assert!(overlay.should_load_from_start(home));
+        assert!(!overlay.should_load_from_start(KeyEvent::new(
+            KeyCode::PageUp,
+            crossterm::event::KeyModifiers::NONE,
+        )));
     }
 
     #[test]
@@ -1015,6 +1251,31 @@ mod tests {
             s.contains("edit next"),
             "expected 'edit next' hint in overlay footer, got: {s:?}"
         );
+    }
+
+    #[test]
+    fn transcript_overlay_snapshots_paginated_history_states() {
+        let mut overlay = transcript_overlay(vec![Arc::new(TestCell {
+            lines: vec![Line::from("recent transcript")],
+        })]);
+        let area = Rect::new(
+            /*x*/ 0, /*y*/ 0, /*width*/ 72, /*height*/ 10,
+        );
+        let mut snapshots = String::new();
+
+        for (name, state) in [
+            ("loading", TranscriptHistoryState::LoadingOlder),
+            ("partial", TranscriptHistoryState::Partial),
+            ("failed", TranscriptHistoryState::Failed),
+            ("complete", TranscriptHistoryState::Complete),
+        ] {
+            overlay.set_history_state(state);
+            let mut buf = Buffer::empty(area);
+            overlay.render(area, &mut buf);
+            snapshots.push_str(&format!("--- {name} ---\n{}", buffer_to_text(&buf, area)));
+        }
+
+        assert_snapshot!("transcript_overlay_paginated_history_states", snapshots);
     }
 
     #[test]
@@ -1038,6 +1299,27 @@ mod tests {
     }
 
     #[test]
+    fn transcript_overlay_preserves_semantic_web_links() {
+        let destination = "https://example.com/a/very/long/path";
+        let mut overlay = transcript_overlay(vec![Arc::new(history_cell::AgentMarkdownCell::new(
+            destination.to_string(),
+            std::path::Path::new("/tmp"),
+        ))]);
+        let area = Rect::new(
+            /*x*/ 0, /*y*/ 0, /*width*/ 24, /*height*/ 10,
+        );
+        let mut buf = Buffer::empty(area);
+
+        overlay.render(area, &mut buf);
+
+        assert!(area.positions().any(|position| {
+            buf[position]
+                .symbol()
+                .contains(&format!("\x1b]8;;{destination}\x07"))
+        }));
+    }
+
+    #[test]
     fn transcript_overlay_renders_live_tail() {
         let mut overlay = transcript_overlay(vec![Arc::new(TestCell {
             lines: vec![Line::from("alpha")],
@@ -1049,13 +1331,76 @@ mod tests {
                 is_stream_continuation: false,
                 animation_tick: None,
             }),
-            |_| Some(vec![Line::from("tail")]),
+            |_| Some(vec![HyperlinkLine::from("tail")]),
         );
 
         let mut term = Terminal::new(TestBackend::new(40, 10)).expect("term");
         term.draw(|f| overlay.render(f.area(), f.buffer_mut()))
             .expect("draw");
         assert_snapshot!(term.backend());
+    }
+
+    #[test]
+    fn transcript_overlay_preserves_live_tail_when_prepending_history() {
+        let mut overlay = transcript_overlay(vec![Arc::new(TestCell {
+            lines: vec![Line::from("recent")],
+        })]);
+        overlay.sync_live_tail(
+            /*width*/ 40,
+            Some(ActiveCellTranscriptKey {
+                revision: 1,
+                is_stream_continuation: false,
+                animation_tick: None,
+            }),
+            |_| Some(vec![HyperlinkLine::from("live tail")]),
+        );
+        overlay.prepend(
+            vec![Arc::new(TestCell {
+                lines: vec![Line::from("older")],
+            })],
+            /*width*/ 40,
+        );
+
+        let area = Rect::new(
+            /*x*/ 0, /*y*/ 0, /*width*/ 40, /*height*/ 10,
+        );
+        let mut buffer = Buffer::empty(area);
+        overlay.render(area, &mut buffer);
+        let rendered = buffer_to_text(&buffer, area);
+        assert!(rendered.contains("older"));
+        assert!(rendered.contains("recent"));
+        assert!(rendered.contains("live tail"));
+    }
+
+    #[test]
+    fn transcript_overlay_live_tail_preserves_semantic_web_links() {
+        let destination = "https://example.com/a/streamed/path";
+        let cell = history_cell::AgentMarkdownCell::new(
+            destination.to_string(),
+            std::path::Path::new("/tmp"),
+        );
+        let mut overlay = transcript_overlay(Vec::new());
+        let area = Rect::new(
+            /*x*/ 0, /*y*/ 0, /*width*/ 24, /*height*/ 10,
+        );
+        let mut buf = Buffer::empty(area);
+
+        overlay.sync_live_tail(
+            area.width,
+            Some(ActiveCellTranscriptKey {
+                revision: 1,
+                is_stream_continuation: false,
+                animation_tick: None,
+            }),
+            |width| Some(cell.transcript_hyperlink_lines(width)),
+        );
+        overlay.render(area, &mut buf);
+
+        assert!(area.positions().any(|position| {
+            buf[position]
+                .symbol()
+                .contains(&format!("\x1b]8;;{destination}\x07"))
+        }));
     }
 
     #[test]
@@ -1073,11 +1418,11 @@ mod tests {
 
         overlay.sync_live_tail(/*width*/ 40, Some(key), |_| {
             calls.set(calls.get() + 1);
-            Some(vec![Line::from("tail")])
+            Some(vec![HyperlinkLine::from("tail")])
         });
         overlay.sync_live_tail(/*width*/ 40, Some(key), |_| {
             calls.set(calls.get() + 1);
-            Some(vec![Line::from("tail2")])
+            Some(vec![HyperlinkLine::from("tail2")])
         });
 
         assert_eq!(calls.get(), 1);
@@ -1129,7 +1474,7 @@ mod tests {
         cells.push(apply_begin_cell);
 
         let apply_end_cell: Arc<dyn HistoryCell> = history_cell::new_approval_decision_cell(
-            vec!["ls".into()],
+            history_cell::ApprovalDecisionSubject::Command(vec!["ls".into()]),
             ReviewDecision::Approved,
             history_cell::ApprovalDecisionActor::User,
         )
@@ -1146,11 +1491,7 @@ mod tests {
         );
         exec_cell.complete_call(
             "exec-1",
-            CommandOutput {
-                exit_code: 0,
-                aggregated_output: "src\nREADME.md\n".into(),
-                formatted_output: "src\nREADME.md\n".into(),
-            },
+            CommandOutput::new(/*exit_code*/ 0, "src\nREADME.md\n".into()),
             Duration::from_millis(420),
         );
         let exec_cell: Arc<dyn HistoryCell> = Arc::new(exec_cell);
@@ -1217,6 +1558,49 @@ mod tests {
         }));
 
         assert_eq!(overlay.view.scroll_offset, 0);
+        overlay.view.scroll_offset = 3;
+        term.draw(|frame| overlay.render(frame.area(), frame.buffer_mut()))
+            .expect("draw");
+        let content_area = Rect::new(
+            /*x*/ 0, /*y*/ 1, /*width*/ 40, /*height*/ 4,
+        );
+        let visible_before = buffer_to_text(term.backend().buffer(), content_area);
+        overlay.prepend(
+            vec![Arc::new(TestCell {
+                lines: vec!["older first".into(), "older second".into()],
+            })],
+            /*width*/ 40,
+        );
+        term.draw(|frame| overlay.render(frame.area(), frame.buffer_mut()))
+            .expect("draw");
+        assert_eq!(
+            buffer_to_text(term.backend().buffer(), content_area),
+            visible_before
+        );
+        assert_snapshot!(
+            "transcript_overlay_prepended_history",
+            visible_before.trim()
+        );
+    }
+
+    #[test]
+    fn transcript_overlay_insert_preserves_cached_cell_heights() {
+        let height_calls = Arc::new(AtomicUsize::new(0));
+        let mut overlay = transcript_overlay(vec![Arc::new(HeightCountingCell {
+            height_calls: height_calls.clone(),
+        })]);
+        let area = Rect::new(0, 0, 40, 12);
+        let mut buf = Buffer::empty(area);
+
+        overlay.render(area, &mut buf);
+        assert_eq!(height_calls.load(Ordering::Relaxed), 1);
+
+        overlay.insert_cell(Arc::new(TestCell {
+            lines: vec![Line::from("inserted")],
+        }));
+        overlay.render(area, &mut buf);
+
+        assert_eq!(height_calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]

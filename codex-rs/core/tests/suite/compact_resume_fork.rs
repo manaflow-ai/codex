@@ -1,5 +1,3 @@
-#![allow(clippy::expect_used)]
-
 //! Integration tests that cover compacting, resuming, and forking conversations.
 //!
 //! Each test sets up a mocked SSE conversation and drives the conversation through
@@ -10,17 +8,26 @@
 use super::compact::COMPACT_WARNING_MESSAGE;
 use super::compact::FIRST_REPLY;
 use super::compact::SUMMARY_TEXT;
+use anyhow::Context;
 use anyhow::Result;
 use codex_core::CodexThread;
 use codex_core::ThreadManager;
+use codex_core::TurnInputRequest;
 use codex_core::compact::SUMMARIZATION_PROMPT;
 use codex_core::config::Config;
 use codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR;
+use codex_history::CodexHarnessMetadata;
+use codex_history::RolloutItem;
+use codex_history::RolloutLine;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
+use codex_protocol::mcp::ClientMcpExtensions;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
 use core_test_support::context_snapshot;
@@ -30,20 +37,24 @@ use core_test_support::responses::ResponseMock;
 use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once_match;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
+use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
+use std::path::Path;
 use std::sync::Arc;
 use tempfile::TempDir;
 use wiremock::MockServer;
 
 const AFTER_SECOND_RESUME: &str = "AFTER_SECOND_RESUME";
 const AFTER_ROLLBACK: &str = "AFTER_ROLLBACK";
+const CHECKPOINT_METADATA_KEY: &str = "replacement_history_metadata";
 
 fn network_disabled() -> bool {
     std::env::var(CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR).is_ok()
@@ -68,11 +79,78 @@ fn normalize_line_endings_str(text: &str) -> String {
     }
 }
 
+fn response_message_contains_text(item: &ResponseItem, expected: &str) -> bool {
+    matches!(
+        item,
+        ResponseItem::Message { role, content, .. }
+            if role == "user"
+                && content.iter().any(|item| {
+                    matches!(item, ContentItem::InputText { text } if text == expected)
+                })
+    )
+}
+
+fn seed_first_checkpoint_harness_metadata(path: &Path, retained_text: &str) -> Result<()> {
+    let mut lines = std::fs::read_to_string(path)?
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(serde_json::from_str::<RolloutLine>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let replacement_history = lines
+        .iter_mut()
+        .find_map(|line| match &mut line.item {
+            RolloutItem::Compacted(compacted) => compacted.replacement_history.as_mut(),
+            _ => None,
+        })
+        .context("first compacted checkpoint missing replacement history")?;
+    replacement_history
+        .iter()
+        .find(|envelope| response_message_contains_text(&envelope.item, retained_text))
+        .context("retained user message missing from first compacted checkpoint")?;
+    for envelope in replacement_history {
+        envelope.metadata = Some(CodexHarnessMetadata::default());
+    }
+
+    let rewritten = lines
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>()?
+        .join("\n");
+    std::fs::write(path, format!("{rewritten}\n"))?;
+    Ok(())
+}
+
+fn assert_latest_checkpoint_retains_harness_metadata(
+    path: &Path,
+    retained_text: &str,
+) -> Result<()> {
+    let replacement_history = std::fs::read_to_string(path)?
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(serde_json::from_str::<RolloutLine>)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .rev()
+        .find_map(|line| match line.item {
+            RolloutItem::Compacted(compacted) => compacted.replacement_history,
+            _ => None,
+        })
+        .context("latest compacted checkpoint missing replacement history")?;
+    assert!(
+        replacement_history.iter().any(|envelope| {
+            response_message_contains_text(&envelope.item, retained_text)
+                && envelope.metadata.is_some()
+        }),
+        "latest compacted checkpoint should retain aligned harness metadata on {retained_text:?}"
+    );
+    Ok(())
+}
+
 fn extract_summary_user_text(request: &Value, summary_text: &str) -> String {
     json_message_input_texts(request, "user")
         .into_iter()
         .find(|text| text.contains(summary_text))
-        .unwrap_or_else(|| panic!("expected summary message {summary_text}"))
+        .expect("expected summary message")
 }
 
 fn json_message_input_texts(request: &Value, role: &str) -> Vec<String> {
@@ -199,7 +277,7 @@ async fn compact_resume_and_fork_preserve_model_history_view() {
     let first_turn_user_index = first_request_user_texts
         .len()
         .checked_sub(1)
-        .unwrap_or_else(|| panic!("first turn request missing user messages"));
+        .expect("first turn request missing user messages");
     assert_eq!(
         first_request_user_texts[first_turn_user_index],
         "hello world"
@@ -224,7 +302,7 @@ async fn compact_resume_and_fork_preserve_model_history_view() {
     let after_resume_user_texts = json_message_input_texts(&requests[3], "user");
     let (after_resume_last, after_resume_prefix) = after_resume_user_texts
         .split_last()
-        .unwrap_or_else(|| panic!("after-resume request missing user messages"));
+        .expect("after-resume request missing user messages");
     assert_eq!(after_resume_last, "AFTER_RESUME");
     assert!(
         after_resume_prefix.starts_with(&expected_after_resume_user_texts),
@@ -254,7 +332,7 @@ async fn compact_resume_and_fork_preserve_model_history_view() {
     expected_after_fork_history_prefix.push("AFTER_COMPACT".to_string());
     let (after_fork_last, after_fork_prefix) = after_fork_user_texts
         .split_last()
-        .unwrap_or_else(|| panic!("after-fork request missing user messages"));
+        .expect("after-fork request missing user messages");
     assert_eq!(after_fork_last, "AFTER_FORK");
     assert!(
         after_fork_prefix.starts_with(&expected_after_fork_history_prefix),
@@ -306,6 +384,7 @@ async fn compact_resume_after_second_compaction_preserves_history() -> Result<()
     );
 
     shutdown_conversation(&base).await;
+    seed_first_checkpoint_harness_metadata(&base_path, "hello world")?;
     let resumed = resume_conversation(&manager, &config, base_path).await;
     user_turn(&resumed, "AFTER_RESUME").await;
     let resumed_path = fetch_conversation_path(&resumed);
@@ -326,6 +405,7 @@ async fn compact_resume_after_second_compaction_preserves_history() -> Result<()
     );
 
     shutdown_conversation(&forked).await;
+    assert_latest_checkpoint_retains_harness_metadata(&forked_path, "hello world")?;
     let resumed_again = resume_conversation(&manager, &config, forked_path).await;
     user_turn(&resumed_again, AFTER_SECOND_RESUME).await;
 
@@ -336,6 +416,15 @@ async fn compact_resume_after_second_compaction_preserves_history() -> Result<()
         .collect::<Vec<_>>();
     requests.iter_mut().for_each(normalize_line_endings);
     normalize_compact_prompts(&mut requests);
+    assert!(
+        requests
+            .iter()
+            .flat_map(|request| request["input"].as_array().expect("provider request input"))
+            .all(|item| {
+                item.get(CHECKPOINT_METADATA_KEY).is_none() && item.get("metadata").is_none()
+            }),
+        "provider requests must not contain harness metadata"
+    );
     let input_after_compact = json!(requests[requests.len() - 2]["input"]);
     let input_after_resume = json!(requests[requests.len() - 1]["input"]);
 
@@ -358,7 +447,7 @@ async fn compact_resume_after_second_compaction_preserves_history() -> Result<()
     let first_turn_user_index = first_request_user_texts
         .len()
         .checked_sub(1)
-        .unwrap_or_else(|| panic!("first turn request missing user messages"));
+        .expect("first turn request missing user messages");
     assert_eq!(
         first_request_user_texts[first_turn_user_index],
         "hello world"
@@ -382,7 +471,7 @@ async fn compact_resume_after_second_compaction_preserves_history() -> Result<()
     let final_user_texts = json_message_input_texts(&requests[requests.len() - 1], "user");
     let (final_last, final_prefix) = final_user_texts
         .split_last()
-        .unwrap_or_else(|| panic!("after-second-resume request missing user messages"));
+        .expect("after-second-resume request missing user messages");
     assert_eq!(final_last, AFTER_SECOND_RESUME);
     let matched_prefix_len = if let Some(start) = final_prefix
         .windows(expected_after_second_compact_user_texts.len())
@@ -473,7 +562,7 @@ async fn snapshot_rollback_past_compaction_replays_append_only_history() -> Resu
     let after_rollback_user_texts = requests[3].message_input_texts("user");
     let after_rollback_last = after_rollback_user_texts
         .last()
-        .unwrap_or_else(|| panic!("post-rollback request missing user messages"));
+        .expect("post-rollback request missing user messages");
     assert_eq!(after_rollback_last, AFTER_ROLLBACK);
     assert!(
         requests[3].body_contains_text("hello world"),
@@ -507,7 +596,7 @@ async fn snapshot_rollback_past_compaction_replays_append_only_history() -> Resu
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-/// Scenario: rolling back a turn that introduced persistent pre-turn context
+/// Scenario: rolling back a turn that introduced persistent pre-thread settings
 /// diffs should trim those context updates so the next request includes them
 /// only once.
 async fn snapshot_rollback_followup_turn_trims_context_updates() -> Result<()> {
@@ -535,7 +624,7 @@ async fn snapshot_rollback_followup_turn_trims_context_updates() -> Result<()> {
                 ev_assistant_message("m2", "turn 2 assistant"),
                 ev_completed("r2"),
             ]),
-            sse(vec![ev_completed("r3")]),
+            sse(vec![ev_response_created("r3"), ev_completed("r3")]),
         ],
     )
     .await;
@@ -547,18 +636,10 @@ async fn snapshot_rollback_followup_turn_trims_context_updates() -> Result<()> {
 
     let override_cwd = config.cwd.join(PRETURN_CONTEXT_DIFF_CWD);
     std::fs::create_dir_all(&override_cwd)?;
-    conversation
-        .submit(Op::OverrideTurnContext {
-            cwd: Some(override_cwd.to_path_buf()),
-            approval_policy: None,
-            approvals_reviewer: None,
-            sandbox_policy: None,
-            permission_profile: None,
-            windows_sandbox_level: None,
-            model: None,
-            effort: None,
-            summary: None,
-            service_tier: None,
+    core_test_support::submit_thread_settings(
+        &conversation,
+        ThreadSettingsOverrides {
+            environments: Some(local_selections(override_cwd.clone())),
             collaboration_mode: Some(CollaborationMode {
                 mode: ModeKind::Default,
                 settings: Settings {
@@ -567,9 +648,10 @@ async fn snapshot_rollback_followup_turn_trims_context_updates() -> Result<()> {
                     developer_instructions: Some(ROLLED_BACK_DEV_INSTRUCTIONS.to_string()),
                 },
             }),
-            personality: None,
-        })
-        .await?;
+            ..Default::default()
+        },
+    )
+    .await?;
 
     user_turn(&conversation, TURN_TWO_USER).await;
 
@@ -644,10 +726,8 @@ async fn snapshot_rollback_followup_turn_trims_context_updates() -> Result<()> {
 
 fn normalize_line_endings(value: &mut Value) {
     match value {
-        Value::String(text) => {
-            if text.contains('\r') {
-                *text = text.replace("\r\n", "\n").replace('\r', "\n");
-            }
+        Value::String(text) if text.contains('\r') => {
+            *text = text.replace("\r\n", "\n").replace('\r', "\n");
         }
         Value::Array(items) => {
             for item in items {
@@ -781,15 +861,10 @@ async fn start_test_conversation(
 
 async fn user_turn(conversation: &Arc<CodexThread>, text: &str) {
     conversation
-        .submit(Op::UserInput {
-            environments: None,
-            items: vec![UserInput::Text {
-                text: text.into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: text.into(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .expect("submit user turn");
     wait_for_event(conversation, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -838,6 +913,7 @@ async fn resume_conversation(
         path,
         auth_manager,
         /*parent_trace*/ None,
+        ClientMcpExtensions::default(),
     ))
     .await
     .expect("resume conversation")
@@ -855,7 +931,7 @@ async fn fork_thread(
         nth_user_message,
         config.clone(),
         path,
-        /*persist_extended_history*/ false,
+        /*thread_source*/ None,
         /*parent_trace*/ None,
     ))
     .await

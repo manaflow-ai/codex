@@ -3,18 +3,27 @@ use crate::outgoing_message::ConnectionRequestId;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadGoal;
 use codex_app_server_protocol::ThreadHistoryBuilder;
+use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadSettings;
 use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnError;
 use codex_core::CodexThread;
 use codex_core::ThreadConfigSnapshot;
+use codex_file_watcher::WatchRegistration;
 use codex_protocol::ThreadId;
+#[cfg(test)]
+use codex_protocol::config_types::MultiAgentMode;
+use codex_protocol::items::AgentMessageContent as CoreAgentMessageContent;
+use codex_protocol::items::TurnItem as CoreTurnItem;
+use codex_protocol::models::MessagePhase;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::RolloutItem;
+use codex_rollout::RolloutItem;
 use codex_rollout::state_db::StateDbHandle;
-use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::LegacyAppPathString;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::Weak;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
@@ -28,20 +37,35 @@ pub(crate) struct PendingThreadResumeRequest {
     pub(crate) request_id: ConnectionRequestId,
     pub(crate) history_items: Vec<RolloutItem>,
     pub(crate) config_snapshot: ThreadConfigSnapshot,
-    pub(crate) instruction_sources: Vec<AbsolutePathBuf>,
+    pub(crate) instruction_sources: Vec<LegacyAppPathString>,
     pub(crate) thread_summary: codex_app_server_protocol::Thread,
     pub(crate) emit_thread_goal_update: bool,
     pub(crate) thread_goal_state_db: Option<StateDbHandle>,
     pub(crate) include_turns: bool,
+    pub(crate) initial_turns_page:
+        Option<codex_app_server_protocol::ThreadResumeInitialTurnsPageParams>,
+    pub(crate) paginated_turns: Option<Vec<Turn>>,
+    pub(crate) paginated_initial_turns_page: Option<codex_app_server_protocol::TurnsPage>,
+    pub(crate) paginated_initial_turns_page_with_active_slot:
+        Option<codex_app_server_protocol::TurnsPage>,
+    pub(crate) resume_cursor_store: Option<Arc<dyn codex_thread_store::ThreadStore>>,
+    pub(crate) redact_resume_payloads: bool,
 }
 
 // ThreadListenerCommand is used to perform operations in the context of the thread listener, for serialization purposes.
 pub(crate) enum ThreadListenerCommand {
     // SendThreadResumeResponse is used to resume an already running thread by sending the thread's history to the client and atomically subscribing for new updates.
     SendThreadResumeResponse(Box<PendingThreadResumeRequest>),
-    // EmitThreadGoalUpdated is used to order app-server goal updates with running-thread resume responses.
+    // EmitThreadGoalUpdated is used to order goal updates with running-thread resume responses and goal clears.
     EmitThreadGoalUpdated {
+        turn_id: Option<String>,
         goal: ThreadGoal,
+    },
+    // EmitThreadQueueChanged orders durable queue updates with thread notifications.
+    EmitThreadQueueChanged,
+    // EmitWarning is used to order extension warnings with other thread notifications.
+    EmitWarning {
+        message: String,
     },
     // EmitThreadGoalCleared is used to order app-server goal clears with running-thread resume responses.
     EmitThreadGoalCleared,
@@ -63,6 +87,7 @@ pub(crate) struct TurnSummary {
     pub(crate) started_at: Option<i64>,
     pub(crate) command_execution_started: HashSet<String>,
     pub(crate) last_error: Option<TurnError>,
+    pub(crate) last_agent_message: Option<ThreadItem>,
 }
 
 #[derive(Default)]
@@ -71,12 +96,17 @@ pub(crate) struct ThreadState {
     pub(crate) pending_rollbacks: Option<ConnectionRequestId>,
     pub(crate) turn_summary: TurnSummary,
     pub(crate) last_terminal_turn_id: Option<String>,
+    /// Lets an internal runtime replacement wait until the old listener has processed Core's
+    /// `ShutdownComplete` event before that listener is superseded.
+    shutdown_drain_waiter: Option<oneshot::Sender<()>>,
     pub(crate) cancel_tx: Option<oneshot::Sender<()>>,
     pub(crate) experimental_raw_events: bool,
     pub(crate) listener_generation: u64,
+    last_thread_settings: Option<ThreadSettings>,
     listener_command_tx: Option<mpsc::UnboundedSender<ThreadListenerCommand>>,
     current_turn_history: ThreadHistoryBuilder,
     listener_thread: Option<Weak<CodexThread>>,
+    watch_registration: WatchRegistration,
 }
 
 impl ThreadState {
@@ -91,14 +121,18 @@ impl ThreadState {
         &mut self,
         cancel_tx: oneshot::Sender<()>,
         conversation: &Arc<CodexThread>,
+        watch_registration: WatchRegistration,
+        thread_settings_baseline: ThreadSettings,
     ) -> (mpsc::UnboundedReceiver<ThreadListenerCommand>, u64) {
         if let Some(previous) = self.cancel_tx.replace(cancel_tx) {
             let _ = previous.send(());
         }
         self.listener_generation = self.listener_generation.wrapping_add(1);
+        self.last_thread_settings = Some(thread_settings_baseline);
         let (listener_command_tx, listener_command_rx) = mpsc::unbounded_channel();
         self.listener_command_tx = Some(listener_command_tx);
         self.listener_thread = Some(Arc::downgrade(conversation));
+        self.watch_registration = watch_registration;
         (listener_command_rx, self.listener_generation)
     }
 
@@ -106,9 +140,11 @@ impl ThreadState {
         if let Some(cancel_tx) = self.cancel_tx.take() {
             let _ = cancel_tx.send(());
         }
+        self.shutdown_drain_waiter = None;
         self.listener_command_tx = None;
         self.current_turn_history.reset();
         self.listener_thread = None;
+        self.watch_registration = WatchRegistration::default();
     }
 
     pub(crate) fn set_experimental_raw_events(&mut self, enabled: bool) {
@@ -125,17 +161,43 @@ impl ThreadState {
         self.current_turn_history.active_turn_snapshot()
     }
 
+    pub(crate) fn register_shutdown_drain_waiter(&mut self) -> oneshot::Receiver<()> {
+        let (completion_tx, completion_rx) = oneshot::channel();
+        self.shutdown_drain_waiter = Some(completion_tx);
+        completion_rx
+    }
+
+    pub(crate) fn take_shutdown_drain_waiter(&mut self) -> Option<oneshot::Sender<()>> {
+        self.shutdown_drain_waiter.take()
+    }
+
     pub(crate) fn track_current_turn_event(&mut self, event_turn_id: &str, event: &EventMsg) {
         if let EventMsg::TurnStarted(payload) = event {
             self.turn_summary.started_at = payload.started_at;
         }
-        self.current_turn_history.handle_event(event);
-        if matches!(event, EventMsg::TurnAborted(_) | EventMsg::TurnComplete(_))
-            && !self.current_turn_history.has_active_turn()
+        if let EventMsg::ItemCompleted(payload) = event
+            && let CoreTurnItem::AgentMessage(item) = &payload.item
+            && matches!(item.phase, Some(MessagePhase::FinalAnswer) | None)
+            && item.content.iter().any(|content| {
+                matches!(content, CoreAgentMessageContent::Text { text } if !text.trim().is_empty())
+            })
         {
-            self.last_terminal_turn_id = Some(event_turn_id.to_string());
-            self.current_turn_history.reset();
+            self.turn_summary.last_agent_message =
+                Some(ThreadItem::from(CoreTurnItem::AgentMessage(item.clone())));
         }
+        self.current_turn_history.handle_event(event);
+        if matches!(event, EventMsg::TurnAborted(_) | EventMsg::TurnComplete(_)) {
+            self.last_terminal_turn_id = Some(event_turn_id.to_string());
+            if !self.current_turn_history.has_active_turn() {
+                self.current_turn_history.reset();
+            }
+        }
+    }
+
+    pub(crate) fn note_thread_settings(&mut self, thread_settings: ThreadSettings) -> bool {
+        let changed = self.last_thread_settings.as_ref() != Some(&thread_settings);
+        self.last_thread_settings = Some(thread_settings);
+        changed
     }
 }
 
@@ -171,6 +233,62 @@ pub(crate) async fn resolve_server_request_on_thread_listener(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_app_server_protocol::ApprovalsReviewer;
+    use codex_app_server_protocol::AskForApproval;
+    use codex_app_server_protocol::SandboxPolicy;
+    use codex_protocol::config_types::CollaborationMode;
+    use codex_protocol::config_types::ModeKind;
+    use codex_protocol::config_types::Settings;
+    use codex_utils_absolute_path::AbsolutePathBuf;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn note_thread_settings_reports_only_effective_changes() {
+        let mut state = ThreadState::default();
+        let initial = thread_settings("mock-model");
+        let updated = thread_settings("mock-model-2");
+
+        let results = vec![
+            state.note_thread_settings(initial.clone()),
+            state.note_thread_settings(initial),
+            state.note_thread_settings(updated.clone()),
+            state.note_thread_settings(updated),
+        ];
+
+        assert_eq!(results, vec![true, false, true, false]);
+    }
+
+    fn thread_settings(model: &str) -> ThreadSettings {
+        ThreadSettings {
+            cwd: AbsolutePathBuf::from_absolute_path("/tmp").expect("absolute path"),
+            approval_policy: AskForApproval::OnRequest,
+            approvals_reviewer: ApprovalsReviewer::User,
+            sandbox_policy: SandboxPolicy::ReadOnly {
+                network_access: false,
+            },
+            active_permission_profile: None,
+            model: model.to_string(),
+            model_provider: "mock_provider".to_string(),
+            service_tier: None,
+            effort: None,
+            summary: None,
+            collaboration_mode: CollaborationMode {
+                mode: ModeKind::Default,
+                settings: Settings {
+                    model: model.to_string(),
+                    reasoning_effort: None,
+                    developer_instructions: None,
+                },
+            },
+            multi_agent_mode: MultiAgentMode::ExplicitRequestOnly,
+            personality: None,
+        }
+    }
+}
+
 struct ThreadEntry {
     state: Arc<Mutex<ThreadState>>,
     connection_ids: HashSet<ConnectionId>,
@@ -199,14 +317,23 @@ impl ThreadEntry {
 
 #[derive(Default)]
 struct ThreadStateManagerInner {
-    live_connections: HashSet<ConnectionId>,
+    live_connections: HashMap<ConnectionId, ConnectionCapabilities>,
     threads: HashMap<ThreadId, ThreadEntry>,
     thread_ids_by_connection: HashMap<ConnectionId, HashSet<ThreadId>>,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ConnectionCapabilities {
+    pub(crate) request_attestation: bool,
 }
 
 #[derive(Clone, Default)]
 pub(crate) struct ThreadStateManager {
     state: Arc<Mutex<ThreadStateManagerInner>>,
+    // Extension event sinks are synchronous, so they need an await-free way to
+    // enqueue work on the active per-thread listener.
+    listener_commands:
+        Arc<StdMutex<HashMap<ThreadId, mpsc::UnboundedSender<ThreadListenerCommand>>>>,
 }
 
 impl ThreadStateManager {
@@ -214,12 +341,53 @@ impl ThreadStateManager {
         Self::default()
     }
 
-    pub(crate) async fn connection_initialized(&self, connection_id: ConnectionId) {
+    pub(crate) async fn connection_initialized(
+        &self,
+        connection_id: ConnectionId,
+        capabilities: ConnectionCapabilities,
+    ) {
         self.state
             .lock()
             .await
             .live_connections
-            .insert(connection_id);
+            .insert(connection_id, capabilities);
+    }
+
+    pub(crate) async fn first_attestation_capable_connection_for_thread(
+        &self,
+        thread_id: ThreadId,
+    ) -> Option<ConnectionId> {
+        let state = self.state.lock().await;
+        state
+            .threads
+            .get(&thread_id)?
+            .connection_ids
+            .iter()
+            .filter_map(|connection_id| {
+                state
+                    .live_connections
+                    .get(connection_id)?
+                    .request_attestation
+                    .then_some(*connection_id)
+            })
+            .min_by_key(|connection_id| connection_id.0)
+    }
+
+    pub(crate) async fn wait_for_thread_subscriber(&self, thread_id: ThreadId) {
+        let mut has_connections = {
+            let mut state = self.state.lock().await;
+            state
+                .threads
+                .entry(thread_id)
+                .or_default()
+                .has_connections_watcher
+                .subscribe()
+        };
+        while !*has_connections.borrow_and_update() {
+            if has_connections.changed().await.is_err() {
+                break;
+            }
+        }
     }
 
     pub(crate) async fn subscribed_connection_ids(&self, thread_id: ThreadId) -> Vec<ConnectionId> {
@@ -236,6 +404,35 @@ impl ThreadStateManager {
         state.threads.entry(thread_id).or_default().state.clone()
     }
 
+    pub(crate) fn current_listener_command_tx(
+        &self,
+        thread_id: ThreadId,
+    ) -> Option<mpsc::UnboundedSender<ThreadListenerCommand>> {
+        self.listener_commands
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&thread_id)
+            .cloned()
+    }
+
+    pub(crate) fn register_listener_command_tx(
+        &self,
+        thread_id: ThreadId,
+        tx: mpsc::UnboundedSender<ThreadListenerCommand>,
+    ) {
+        self.listener_commands
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(thread_id, tx);
+    }
+
+    pub(crate) fn unregister_listener_command_tx(&self, thread_id: ThreadId) {
+        self.listener_commands
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&thread_id);
+    }
+
     pub(crate) async fn remove_thread_state(&self, thread_id: ThreadId) {
         let thread_state = {
             let mut state = self.state.lock().await;
@@ -249,6 +446,7 @@ impl ThreadStateManager {
             });
             thread_state
         };
+        self.unregister_listener_command_tx(thread_id);
 
         if let Some(thread_state) = thread_state {
             let mut thread_state = thread_state.lock().await;
@@ -274,6 +472,7 @@ impl ThreadStateManager {
         };
 
         for (thread_id, thread_state) in thread_states {
+            self.unregister_listener_command_tx(thread_id);
             let mut thread_state = thread_state.lock().await;
             tracing::debug!(
                 thread_id = %thread_id,
@@ -338,7 +537,7 @@ impl ThreadStateManager {
     ) -> Option<Arc<Mutex<ThreadState>>> {
         let thread_state = {
             let mut state = self.state.lock().await;
-            if !state.live_connections.contains(&connection_id) {
+            if !state.live_connections.contains_key(&connection_id) {
                 return None;
             }
             state
@@ -366,7 +565,7 @@ impl ThreadStateManager {
         connection_id: ConnectionId,
     ) -> bool {
         let mut state = self.state.lock().await;
-        if !state.live_connections.contains(&connection_id) {
+        if !state.live_connections.contains_key(&connection_id) {
             return false;
         }
         state

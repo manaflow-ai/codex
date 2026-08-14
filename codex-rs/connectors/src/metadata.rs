@@ -1,11 +1,15 @@
-use codex_app_server_protocol::AppInfo;
+use crate::AppInfo;
 
 pub fn connector_display_label(connector: &AppInfo) -> String {
     connector.name.clone()
 }
 
 pub fn connector_mention_slug(connector: &AppInfo) -> String {
-    crate::connector_name_slug(&connector_display_label(connector))
+    connector_mention_slug_from_name(&connector_display_label(connector))
+}
+
+pub fn connector_mention_slug_from_name(name: &str) -> String {
+    crate::connector_name_slug(name)
 }
 
 pub fn connector_install_url(name: &str, connector_id: &str) -> String {

@@ -237,6 +237,10 @@ impl CommandExecManager {
             arg0,
             ..
         } = exec_request;
+        // TODO(anp): Keep PathUri through the local command launch boundary.
+        let cwd = cwd
+            .to_abs_path()
+            .map_err(|err| invalid_request(format!("invalid command cwd: {err}")))?;
 
         let stream_stdin = tty || stream_stdin;
         let stream_stdout_stderr = tty || stream_stdout_stderr;
@@ -271,13 +275,22 @@ impl CommandExecManager {
                 &env,
                 &arg0,
                 size.unwrap_or_default(),
+                &[],
             )
             .await
         } else if stream_stdin {
-            codex_utils_pty::spawn_pipe_process(program, args, cwd.as_path(), &env, &arg0).await
-        } else {
-            codex_utils_pty::spawn_pipe_process_no_stdin(program, args, cwd.as_path(), &env, &arg0)
+            codex_utils_pty::spawn_pipe_process(program, args, cwd.as_path(), &env, &arg0, &[])
                 .await
+        } else {
+            codex_utils_pty::spawn_pipe_process_no_stdin(
+                program,
+                args,
+                cwd.as_path(),
+                &env,
+                &arg0,
+                &[],
+            )
+            .await
         };
         let spawned = match spawned {
             Ok(spawned) => spawned,
@@ -477,7 +490,7 @@ async fn run_command(params: RunCommandParams) {
     });
     let stderr_handle = spawn_process_output(SpawnProcessOutputParams {
         connection_id: request_id.connection_id,
-        process_id,
+        process_id: process_id.clone(),
         output_rx: stderr_rx,
         stdio_timeout_rx,
         outgoing: Arc::clone(&outgoing),
@@ -697,12 +710,14 @@ mod tests {
         let cwd = AbsolutePathBuf::current_dir().expect("current dir");
         ExecRequest::new(
             vec!["cmd".to_string()],
-            cwd,
+            cwd.clone(),
             HashMap::new(),
             /*network*/ None,
+            /*network_environment_id*/ None,
             ExecExpiration::DefaultTimeout,
             codex_core::exec::ExecCapturePolicy::ShellTool,
             SandboxType::WindowsRestrictedToken,
+            vec![cwd],
             WindowsSandboxLevel::Disabled,
             /*windows_sandbox_private_desktop*/ false,
             PermissionProfile::read_only(),
@@ -816,9 +831,11 @@ mod tests {
                     cwd.clone(),
                     HashMap::new(),
                     /*network*/ None,
+                    /*network_environment_id*/ None,
                     ExecExpiration::Cancellation(CancellationToken::new()),
                     codex_core::exec::ExecCapturePolicy::ShellTool,
                     SandboxType::None,
+                    vec![cwd.clone()],
                     WindowsSandboxLevel::Disabled,
                     /*windows_sandbox_private_desktop*/ false,
                     PermissionProfile::read_only(),
@@ -868,8 +885,11 @@ mod tests {
             panic!("expected execution response after termination");
         };
         assert_eq!(response.id, request_id.request_id);
-        let response: CommandExecResponse =
-            serde_json::from_value(response.result).expect("deserialize command/exec response");
+        let codex_app_server_protocol::ClientResponsePayload::OneOffCommandExec(response) =
+            *response.result
+        else {
+            panic!("expected command/exec response");
+        };
         assert_ne!(response.exit_code, 0);
         assert_eq!(response.stdout, "");
         // The deferred response now drains any already-emitted stderr before
@@ -887,6 +907,7 @@ mod tests {
         };
         let cancellation = CancellationToken::new();
         let cancel = cancellation.clone();
+        let cwd = AbsolutePathBuf::current_dir().expect("current dir");
 
         manager
             .start(StartCommandExecParams {
@@ -898,15 +919,17 @@ mod tests {
                 process_id: Some("proc-101".to_string()),
                 exec_request: ExecRequest::new(
                     vec!["sh".to_string(), "-lc".to_string(), "sleep 30".to_string()],
-                    AbsolutePathBuf::current_dir().expect("current dir"),
+                    cwd.clone(),
                     HashMap::new(),
                     /*network*/ None,
+                    /*network_environment_id*/ None,
                     ExecExpiration::TimeoutOrCancellation {
                         timeout: Duration::from_secs(30),
                         cancellation,
                     },
                     codex_core::exec::ExecCapturePolicy::ShellTool,
                     SandboxType::None,
+                    vec![cwd],
                     WindowsSandboxLevel::Disabled,
                     /*windows_sandbox_private_desktop*/ false,
                     PermissionProfile::read_only(),
@@ -941,8 +964,11 @@ mod tests {
             panic!("expected execution response after cancellation");
         };
         assert_eq!(response.id, request_id.request_id);
-        let response: CommandExecResponse =
-            serde_json::from_value(response.result).expect("deserialize command/exec response");
+        let codex_app_server_protocol::ClientResponsePayload::OneOffCommandExec(response) =
+            *response.result
+        else {
+            panic!("expected command/exec response");
+        };
         assert_ne!(response.exit_code, EXEC_TIMEOUT_EXIT_CODE);
     }
 

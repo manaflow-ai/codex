@@ -300,10 +300,10 @@ WHERE id IN (
             return Ok(());
         };
         self.delete_logs_before(cutoff.timestamp()).await?;
-        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .execute(self.logs_pool.as_ref())
-            .await?;
-        sqlx::query("PRAGMA incremental_vacuum")
+        // Startup cleanup should not wait behind or block foreground work.
+        // PASSIVE checkpoints copy whatever is immediately available and skip
+        // frames that would require waiting on active readers or writers.
+        sqlx::query("PRAGMA wal_checkpoint(PASSIVE)")
             .execute(self.logs_pool.as_ref())
             .await?;
         Ok(())
@@ -343,11 +343,23 @@ WHERE id IN (
         let max_bytes = usize::try_from(LOG_PARTITION_SIZE_LIMIT_BYTES).unwrap_or(usize::MAX);
         // Bound the fetched rows in SQL first so over-retained partitions do not have to load
         // every row into memory, then apply the exact whole-line byte cap after formatting.
-        let requested_threads = vec!["(?)"; thread_ids.len()].join(", ");
-        let query = format!(
+        let mut builder = QueryBuilder::<Sqlite>::new(
             r#"
 WITH requested_threads(thread_id) AS (
-    VALUES {requested_threads}
+    VALUES
+            "#,
+        );
+        {
+            let mut separated = builder.separated(", ");
+            for thread_id in thread_ids {
+                separated
+                    .push("(")
+                    .push_bind_unseparated(*thread_id)
+                    .push_unseparated(")");
+            }
+        }
+        builder.push(
+            r#"
 ),
 latest_processes AS (
     SELECT (
@@ -388,16 +400,13 @@ bounded_feedback_logs AS (
 )
 SELECT ts, ts_nanos, level, feedback_log_body
 FROM bounded_feedback_logs
-WHERE cumulative_estimated_bytes <= ?
-ORDER BY ts DESC, ts_nanos DESC, id DESC
-"#
+WHERE cumulative_estimated_bytes <=
+"#,
         );
-        let mut sql = sqlx::query_as::<_, FeedbackLogRow>(query.as_str());
-        for thread_id in thread_ids {
-            sql = sql.bind(thread_id);
-        }
-        let rows = sql
-            .bind(LOG_PARTITION_SIZE_LIMIT_BYTES)
+        builder.push_bind(LOG_PARTITION_SIZE_LIMIT_BYTES);
+        builder.push(" ORDER BY ts DESC, ts_nanos DESC, id DESC");
+        let rows = builder
+            .build_query_as::<FeedbackLogRow>()
             .fetch_all(self.logs_pool.as_ref())
             .await?;
 
@@ -463,7 +472,7 @@ fn format_feedback_log_line(
     line
 }
 
-fn push_log_filters<'a>(builder: &mut QueryBuilder<'a, Sqlite>, query: &'a LogQuery) {
+fn push_log_filters(builder: &mut QueryBuilder<Sqlite>, query: &LogQuery) {
     if !query.levels_upper.is_empty() {
         builder.push(" AND UPPER(level) IN (");
         {
@@ -511,11 +520,7 @@ fn push_log_filters<'a>(builder: &mut QueryBuilder<'a, Sqlite>, query: &'a LogQu
     }
 }
 
-fn push_like_filters<'a>(
-    builder: &mut QueryBuilder<'a, Sqlite>,
-    column: &str,
-    filters: &'a [String],
-) {
+fn push_like_filters(builder: &mut QueryBuilder<Sqlite>, column: &str, filters: &[String]) {
     if filters.is_empty() {
         return;
     }
@@ -540,24 +545,20 @@ mod tests {
     use super::test_support::unique_temp_dir;
     use crate::LogEntry;
     use crate::LogQuery;
-    use crate::logs_db_path;
     use crate::migrations::LOGS_MIGRATOR;
     use chrono::Utc;
+    use codex_utils_absolute_path::test_support::PathExt;
     use pretty_assertions::assert_eq;
     use sqlx::SqlitePool;
     use sqlx::migrate::Migrator;
-    use sqlx::sqlite::SqliteConnectOptions;
     use std::borrow::Cow;
     use std::path::Path;
 
     async fn open_db_pool(path: &Path) -> SqlitePool {
-        SqlitePool::connect_with(
-            SqliteConnectOptions::new()
-                .filename(path)
-                .create_if_missing(false),
-        )
-        .await
-        .expect("open sqlite pool")
+        crate::SqliteConfig::new_for_testing(path.parent().unwrap_or(path).abs())
+            .open_read_write_pool(path)
+            .await
+            .expect("open sqlite pool")
     }
 
     async fn log_row_count(path: &Path) -> i64 {
@@ -573,9 +574,12 @@ mod tests {
     #[tokio::test]
     async fn insert_logs_use_dedicated_log_database() {
         let codex_home = unique_temp_dir();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("initialize runtime");
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("initialize runtime");
 
         runtime
             .insert_logs(&[LogEntry {
@@ -594,7 +598,9 @@ mod tests {
             .await
             .expect("insert test logs");
 
-        let logs_count = log_row_count(logs_db_path(codex_home.as_path()).as_path()).await;
+        let logs_path =
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()).logs_db_path();
+        let logs_count = log_row_count(logs_path.as_path()).await;
 
         assert_eq!(logs_count, 1);
 
@@ -607,20 +613,20 @@ mod tests {
         tokio::fs::create_dir_all(&codex_home)
             .await
             .expect("create codex home");
-        let logs_path = logs_db_path(codex_home.as_path());
+        let logs_path =
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()).logs_db_path();
         let old_logs_migrator = Migrator {
             migrations: Cow::Owned(vec![LOGS_MIGRATOR.migrations[0].clone()]),
             ignore_missing: false,
             locking: true,
             no_tx: false,
+            table_name: LOGS_MIGRATOR.table_name.clone(),
+            create_schemas: LOGS_MIGRATOR.create_schemas.clone(),
         };
-        let pool = SqlitePool::connect_with(
-            SqliteConnectOptions::new()
-                .filename(&logs_path)
-                .create_if_missing(true),
-        )
-        .await
-        .expect("open old logs db");
+        let pool = crate::SqliteConfig::new_for_testing(codex_home.as_path().abs())
+            .open_read_write_pool(&logs_path)
+            .await
+            .expect("open old logs db");
         old_logs_migrator
             .run(&pool)
             .await
@@ -645,9 +651,12 @@ mod tests {
         pool.close().await;
         drop(pool);
 
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("initialize runtime");
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("initialize runtime");
 
         let rows = runtime
             .query_logs(&LogQuery::default())
@@ -699,74 +708,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn init_recreates_legacy_logs_db_when_log_version_changes() {
-        let codex_home = unique_temp_dir();
-        tokio::fs::create_dir_all(&codex_home)
-            .await
-            .expect("create codex home");
-        let legacy_logs_path = codex_home.join("logs_1.sqlite");
-        let pool = SqlitePool::connect_with(
-            SqliteConnectOptions::new()
-                .filename(&legacy_logs_path)
-                .create_if_missing(true),
-        )
-        .await
-        .expect("open legacy logs db");
-        LOGS_MIGRATOR
-            .run(&pool)
-            .await
-            .expect("apply legacy logs schema");
-        sqlx::query(
-            "INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body, module_path, file, line, thread_id, process_uuid, estimated_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(1_i64)
-        .bind(0_i64)
-        .bind("INFO")
-        .bind("cli")
-        .bind("legacy-log-row")
-        .bind("mod")
-        .bind("main.rs")
-        .bind(7_i64)
-        .bind("thread-1")
-        .bind("proc-1")
-        .bind(16_i64)
-        .execute(&pool)
-        .await
-        .expect("insert legacy log row");
-        pool.close().await;
-        drop(pool);
-
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("initialize runtime");
-
-        assert!(
-            !legacy_logs_path.exists(),
-            "legacy logs db should be removed when the version changes"
-        );
-        assert!(
-            logs_db_path(codex_home.as_path()).exists(),
-            "current logs db should be recreated during init"
-        );
-        assert!(
-            runtime
-                .query_logs(&LogQuery::default())
-                .await
-                .expect("query recreated logs db")
-                .is_empty()
-        );
-
-        let _ = tokio::fs::remove_dir_all(codex_home).await;
-    }
-
-    #[tokio::test]
     async fn init_configures_logs_db_with_incremental_auto_vacuum() {
         let codex_home = unique_temp_dir();
-        let _runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("initialize runtime");
+        let _runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("initialize runtime");
 
-        let pool = open_db_pool(logs_db_path(codex_home.as_path()).as_path()).await;
+        let logs_path =
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()).logs_db_path();
+        let pool = open_db_pool(logs_path.as_path()).await;
         let auto_vacuum = sqlx::query_scalar::<_, i64>("PRAGMA auto_vacuum")
             .fetch_one(&pool)
             .await
@@ -806,9 +759,12 @@ mod tests {
     #[tokio::test]
     async fn query_logs_with_search_matches_rendered_body_substring() {
         let codex_home = unique_temp_dir();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("initialize runtime");
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("initialize runtime");
 
         runtime
             .insert_logs(&[
@@ -859,9 +815,12 @@ mod tests {
     #[tokio::test]
     async fn query_logs_filters_level_set_without_rewriting_stored_level() {
         let codex_home = unique_temp_dir();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("initialize runtime");
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("initialize runtime");
 
         runtime
             .insert_logs(&[
@@ -944,9 +903,12 @@ mod tests {
     #[tokio::test]
     async fn insert_logs_prunes_old_rows_when_thread_exceeds_size_limit() {
         let codex_home = unique_temp_dir();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("initialize runtime");
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("initialize runtime");
 
         let six_mebibytes = "a".repeat(6 * 1024 * 1024);
         runtime
@@ -998,9 +960,12 @@ mod tests {
     #[tokio::test]
     async fn insert_logs_prunes_single_thread_row_when_it_exceeds_size_limit() {
         let codex_home = unique_temp_dir();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("initialize runtime");
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("initialize runtime");
 
         let eleven_mebibytes = "d".repeat(11 * 1024 * 1024);
         runtime
@@ -1036,9 +1001,12 @@ mod tests {
     #[tokio::test]
     async fn insert_logs_prunes_threadless_rows_per_process_uuid_only() {
         let codex_home = unique_temp_dir();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("initialize runtime");
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("initialize runtime");
 
         let six_mebibytes = "b".repeat(6 * 1024 * 1024);
         runtime
@@ -1105,9 +1073,12 @@ mod tests {
     #[tokio::test]
     async fn insert_logs_prunes_single_threadless_process_row_when_it_exceeds_size_limit() {
         let codex_home = unique_temp_dir();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("initialize runtime");
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("initialize runtime");
 
         let eleven_mebibytes = "e".repeat(11 * 1024 * 1024);
         runtime
@@ -1143,9 +1114,12 @@ mod tests {
     #[tokio::test]
     async fn insert_logs_prunes_threadless_rows_with_null_process_uuid() {
         let codex_home = unique_temp_dir();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("initialize runtime");
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("initialize runtime");
 
         let six_mebibytes = "c".repeat(6 * 1024 * 1024);
         runtime
@@ -1211,9 +1185,12 @@ mod tests {
     #[tokio::test]
     async fn insert_logs_prunes_single_threadless_null_process_row_when_it_exceeds_limit() {
         let codex_home = unique_temp_dir();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("initialize runtime");
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("initialize runtime");
 
         let eleven_mebibytes = "f".repeat(11 * 1024 * 1024);
         runtime
@@ -1249,9 +1226,12 @@ mod tests {
     #[tokio::test]
     async fn insert_logs_prunes_old_rows_when_thread_exceeds_row_limit() {
         let codex_home = unique_temp_dir();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("initialize runtime");
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("initialize runtime");
 
         let entries: Vec<LogEntry> = (1..=1_001)
             .map(|ts| LogEntry {
@@ -1292,9 +1272,12 @@ mod tests {
     #[tokio::test]
     async fn insert_logs_prunes_old_threadless_rows_when_process_exceeds_row_limit() {
         let codex_home = unique_temp_dir();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("initialize runtime");
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("initialize runtime");
 
         let entries: Vec<LogEntry> = (1..=1_001)
             .map(|ts| LogEntry {
@@ -1339,9 +1322,12 @@ mod tests {
     #[tokio::test]
     async fn insert_logs_prunes_old_threadless_null_process_rows_when_row_limit_exceeded() {
         let codex_home = unique_temp_dir();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("initialize runtime");
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("initialize runtime");
 
         let entries: Vec<LogEntry> = (1..=1_001)
             .map(|ts| LogEntry {
@@ -1386,9 +1372,12 @@ mod tests {
     #[tokio::test]
     async fn query_feedback_logs_returns_newest_lines_within_limit_in_order() {
         let codex_home = unique_temp_dir();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("initialize runtime");
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("initialize runtime");
 
         runtime
             .insert_logs(&[
@@ -1456,9 +1445,12 @@ mod tests {
     #[tokio::test]
     async fn query_feedback_logs_excludes_oversized_newest_row() {
         let codex_home = unique_temp_dir();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("initialize runtime");
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("initialize runtime");
         let eleven_mebibytes = "z".repeat(11 * 1024 * 1024);
 
         runtime
@@ -1506,9 +1498,12 @@ mod tests {
     #[tokio::test]
     async fn query_feedback_logs_includes_threadless_rows_from_same_process() {
         let codex_home = unique_temp_dir();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("initialize runtime");
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("initialize runtime");
 
         runtime
             .insert_logs(&[
@@ -1604,9 +1599,12 @@ mod tests {
     #[tokio::test]
     async fn query_feedback_logs_excludes_threadless_rows_from_prior_processes() {
         let codex_home = unique_temp_dir();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("initialize runtime");
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("initialize runtime");
 
         runtime
             .insert_logs(&[
@@ -1702,9 +1700,12 @@ mod tests {
     #[tokio::test]
     async fn query_feedback_logs_keeps_newest_suffix_across_thread_and_threadless_logs() {
         let codex_home = unique_temp_dir();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("initialize runtime");
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("initialize runtime");
         let thread_marker = "thread-scoped-oldest";
         let threadless_older_marker = "threadless-older";
         let threadless_newer_marker = "threadless-newer";
@@ -1777,9 +1778,12 @@ mod tests {
     #[tokio::test]
     async fn query_feedback_logs_for_threads_merges_requested_threads_and_threadless_rows() {
         let codex_home = unique_temp_dir();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("initialize runtime");
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("initialize runtime");
 
         runtime
             .insert_logs(&[
@@ -1897,9 +1901,12 @@ mod tests {
     #[tokio::test]
     async fn query_feedback_logs_for_threads_returns_empty_for_empty_thread_list() {
         let codex_home = unique_temp_dir();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("initialize runtime");
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(codex_home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("initialize runtime");
 
         let bytes = runtime
             .query_feedback_logs_for_threads(&[])

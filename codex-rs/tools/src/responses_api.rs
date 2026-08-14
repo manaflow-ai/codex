@@ -1,17 +1,23 @@
 use crate::JsonSchema;
 use crate::ToolDefinition;
 use crate::ToolName;
+use crate::parse_agent_plugin_mcp_tool;
 use crate::parse_dynamic_tool;
 use crate::parse_mcp_tool;
-use codex_protocol::dynamic_tools::DynamicToolSpec;
+use codex_protocol::DEFAULT_FUNCTION_NAMESPACE;
+use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
+
+const MAX_SERIALIZED_MCP_TOOL_BYTES: usize = 8_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FreeformTool {
     pub name: String,
     pub description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub defer_loading: Option<bool>,
     pub format: FreeformToolFormat,
 }
 
@@ -55,38 +61,30 @@ pub struct ResponsesApiNamespace {
     pub tools: Vec<ResponsesApiNamespaceTool>,
 }
 
-pub(crate) fn default_namespace_description(namespace_name: &str) -> String {
-    format!("Tools in the {namespace_name} namespace.")
+pub fn default_namespace_description(namespace_name: &str) -> String {
+    if namespace_name == DEFAULT_FUNCTION_NAMESPACE {
+        String::new()
+    } else {
+        format!("Tools in the {namespace_name} namespace.")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "type")]
+#[allow(clippy::large_enum_variant)]
 pub enum ResponsesApiNamespaceTool {
     #[serde(rename = "function")]
     Function(ResponsesApiTool),
+    #[serde(rename = "custom")]
+    Custom(FreeformTool),
 }
 
 pub fn dynamic_tool_to_responses_api_tool(
-    tool: &DynamicToolSpec,
+    tool: &DynamicToolFunctionSpec,
 ) -> Result<ResponsesApiTool, serde_json::Error> {
     Ok(tool_definition_to_responses_api_tool(parse_dynamic_tool(
         tool,
     )?))
-}
-
-pub fn dynamic_tool_to_loadable_tool_spec(
-    tool: &DynamicToolSpec,
-) -> Result<LoadableToolSpec, serde_json::Error> {
-    let output_tool = dynamic_tool_to_responses_api_tool(tool)?;
-    Ok(match tool.namespace.as_ref() {
-        Some(namespace) => LoadableToolSpec::Namespace(ResponsesApiNamespace {
-            name: namespace.clone(),
-            // the user doesn't provide a description for dynamic tools, so we use the default
-            description: default_namespace_description(namespace),
-            tools: vec![ResponsesApiNamespaceTool::Function(output_tool)],
-        }),
-        None => LoadableToolSpec::Function(output_tool),
-    })
 }
 
 pub fn coalesce_loadable_tool_specs(
@@ -126,6 +124,23 @@ pub fn mcp_tool_to_responses_api_tool(
     Ok(tool_definition_to_responses_api_tool(
         parse_mcp_tool(tool)?.renamed(tool_name.name.clone()),
     ))
+}
+
+pub fn agent_plugin_mcp_tool_to_responses_api_tool(
+    tool_name: &ToolName,
+    tool: &rmcp::model::Tool,
+) -> Result<ResponsesApiTool, serde_json::Error> {
+    let mut tool = tool_definition_to_responses_api_tool(
+        parse_agent_plugin_mcp_tool(tool)?.renamed(tool_name.name.clone()),
+    );
+    if serde_json::to_vec(&tool)?.len() > MAX_SERIALIZED_MCP_TOOL_BYTES {
+        tool.parameters = JsonSchema::object(
+            Default::default(),
+            /*required*/ None,
+            Some(true.into()),
+        );
+    }
+    Ok(tool)
 }
 
 pub fn mcp_tool_to_deferred_responses_api_tool(

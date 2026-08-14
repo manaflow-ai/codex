@@ -1,15 +1,18 @@
 use super::*;
 use anyhow::Result;
+use axum::http::HeaderValue;
 use codex_app_server_protocol::AppConfig;
 use codex_app_server_protocol::AppToolApproval;
 use codex_app_server_protocol::AppsConfig;
 use codex_app_server_protocol::AskForApproval;
-use codex_config::CloudRequirementsLoader;
-use codex_config::FeatureRequirementsToml;
+use codex_app_server_protocol::ConfigLayerSource as ApiConfigLayerSource;
+use codex_config::CloudConfigBundleLoader;
 use codex_config::LoaderOverrides;
+use codex_config::test_support::CloudConfigBundleFixture;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::OutboundProxyPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
-use std::collections::BTreeMap;
 use tempfile::tempdir;
 
 #[test]
@@ -107,6 +110,47 @@ personality = true
 }
 
 #[tokio::test]
+async fn psp_feature_configures_first_party_routing() -> Result<()> {
+    let tmp = tempdir()?;
+    let service = ConfigManager::new_for_tests(
+        tmp.path().to_path_buf(),
+        Vec::new(),
+        LoaderOverrides::without_managed_config_for_tests(),
+        CloudConfigBundleLoader::default(),
+    );
+
+    let config = service
+        .load_with_overrides(
+            Some(
+                [(
+                    "features".to_string(),
+                    serde_json::json!({ "apps": true, "psp": true }),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+            Default::default(),
+        )
+        .await?;
+
+    assert!(config.features.enabled(codex_features::Feature::Psp));
+    assert_eq!(
+        config.http_client_factory(),
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault)
+            .with_chatgpt_cookies([HeaderValue::from_static("oai-chat-psp=true")])
+    );
+    assert_eq!(
+        config
+            .config_layer_stack
+            .effective_config()
+            .get("features")
+            .and_then(|features| features.get("psp")),
+        Some(&toml::Value::Boolean(true))
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn clear_missing_nested_config_is_noop() -> Result<()> {
     let tmp = tempdir().expect("tempdir");
     let path = tmp.path().join(CONFIG_TOML_FILE);
@@ -127,6 +171,169 @@ async fn clear_missing_nested_config_is_noop() -> Result<()> {
     assert_eq!(response.status, WriteStatus::Ok);
     assert_eq!(response.overridden_metadata, None);
     assert_eq!(std::fs::read_to_string(&path)?, "");
+    Ok(())
+}
+
+#[tokio::test]
+async fn clearing_user_setting_falls_back_to_packaged_default_without_override() -> Result<()> {
+    let tmp = tempdir()?;
+    let path = tmp.path().join(CONFIG_TOML_FILE);
+    std::fs::write(&path, "hide_agent_reasoning = true\n")?;
+
+    let service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
+    let response = service
+        .write_value(ConfigValueWriteParams {
+            file_path: Some(path.display().to_string()),
+            key_path: "hide_agent_reasoning".to_string(),
+            value: serde_json::Value::Null,
+            merge_strategy: MergeStrategy::Replace,
+            expected_version: None,
+        })
+        .await?;
+
+    assert_eq!(response.status, WriteStatus::Ok);
+    assert_eq!(response.overridden_metadata, None);
+    assert_eq!(std::fs::read_to_string(&path)?, "");
+    Ok(())
+}
+
+#[tokio::test]
+async fn clear_user_value_if_matches_clears_matching_value() -> Result<()> {
+    let tmp = tempdir().expect("tempdir");
+    let path = tmp.path().join(CONFIG_TOML_FILE);
+    std::fs::write(&path, "model = \"gpt-5.2\"\napproval_policy = \"never\"\n")?;
+
+    let service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
+    service
+        .clear_user_value_if_matches("model", serde_json::json!("gpt-5.2"))
+        .await?;
+
+    assert_eq!(
+        std::fs::read_to_string(&path)?,
+        "approval_policy = \"never\"\n"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn clear_user_value_if_matches_preserves_non_matching_value() -> Result<()> {
+    let tmp = tempdir().expect("tempdir");
+    let path = tmp.path().join(CONFIG_TOML_FILE);
+    let original = "model = \"gpt-5.2\"\napproval_policy = \"never\"\n";
+    std::fs::write(&path, original)?;
+
+    let service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
+    service
+        .clear_user_value_if_matches("model", serde_json::json!("gpt-5.3"))
+        .await?;
+
+    assert_eq!(std::fs::read_to_string(&path)?, original);
+    Ok(())
+}
+
+#[tokio::test]
+async fn write_value_rejects_legacy_profile_selector() -> Result<()> {
+    let tmp = tempdir().expect("tempdir");
+    let path = tmp.path().join(CONFIG_TOML_FILE);
+    std::fs::write(&path, "model = \"gpt-main\"\n")?;
+
+    let service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
+    let error = service
+        .write_value(ConfigValueWriteParams {
+            file_path: Some(path.display().to_string()),
+            key_path: "profile".to_string(),
+            value: serde_json::json!("work"),
+            merge_strategy: MergeStrategy::Replace,
+            expected_version: None,
+        })
+        .await
+        .expect_err("legacy profile selector write should fail");
+
+    assert_eq!(
+        error.write_error_code(),
+        Some(ConfigWriteErrorCode::ConfigValidationError)
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("`profile` is a legacy config selector"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read_to_string(&path)?, "model = \"gpt-main\"\n");
+    Ok(())
+}
+
+#[tokio::test]
+async fn write_value_rejects_legacy_profile_table() -> Result<()> {
+    let tmp = tempdir().expect("tempdir");
+    let path = tmp.path().join(CONFIG_TOML_FILE);
+    std::fs::write(&path, "")?;
+
+    let service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
+    let error = service
+        .write_value(ConfigValueWriteParams {
+            file_path: Some(path.display().to_string()),
+            key_path: "profiles.work.model".to_string(),
+            value: serde_json::json!("gpt-work"),
+            merge_strategy: MergeStrategy::Replace,
+            expected_version: None,
+        })
+        .await
+        .expect_err("legacy profile table write should fail");
+
+    assert_eq!(
+        error.write_error_code(),
+        Some(ConfigWriteErrorCode::ConfigValidationError)
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("`profiles` contains legacy config profile tables"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read_to_string(&path)?, "");
+    Ok(())
+}
+
+#[tokio::test]
+async fn batch_write_rejects_legacy_profile_selector() -> Result<()> {
+    let tmp = tempdir().expect("tempdir");
+    let path = tmp.path().join(CONFIG_TOML_FILE);
+    std::fs::write(&path, "model = \"gpt-main\"\n")?;
+
+    let service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
+    let error = service
+        .batch_write(ConfigBatchWriteParams {
+            edits: vec![
+                codex_app_server_protocol::ConfigEdit {
+                    key_path: "model".to_string(),
+                    value: serde_json::json!("gpt-work"),
+                    merge_strategy: MergeStrategy::Replace,
+                },
+                codex_app_server_protocol::ConfigEdit {
+                    key_path: "profile".to_string(),
+                    value: serde_json::json!("work"),
+                    merge_strategy: MergeStrategy::Replace,
+                },
+            ],
+            file_path: Some(path.display().to_string()),
+            expected_version: None,
+            reload_user_config: false,
+        })
+        .await
+        .expect_err("legacy profile selector batch write should fail");
+
+    assert_eq!(
+        error.write_error_code(),
+        Some(ConfigWriteErrorCode::ConfigValidationError)
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("`profile` is a legacy config selector"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read_to_string(&path)?, "model = \"gpt-main\"\n");
     Ok(())
 }
 
@@ -178,6 +385,7 @@ async fn write_value_supports_nested_app_paths() -> Result<()> {
                 "app1".to_string(),
                 AppConfig {
                     enabled: false,
+                    approvals_reviewer: None,
                     destructive_enabled: None,
                     open_world_enabled: None,
                     default_tools_approval_mode: Some(AppToolApproval::Prompt),
@@ -249,7 +457,7 @@ async fn read_includes_origins_and_layers() {
         tmp.path().to_path_buf(),
         vec![],
         LoaderOverrides::with_managed_config_path_for_tests(managed_path.clone()),
-        CloudRequirementsLoader::default(),
+        CloudConfigBundleLoader::default(),
     );
 
     let response = service
@@ -268,7 +476,7 @@ async fn read_includes_origins_and_layers() {
             .get("approval_policy")
             .expect("origin")
             .name,
-        ConfigLayerSource::LegacyManagedConfigTomlFromFile {
+        ApiConfigLayerSource::LegacyManagedConfigTomlFromFile {
             file: managed_file.clone()
         },
     );
@@ -277,7 +485,7 @@ async fn read_includes_origins_and_layers() {
     // top of the stack; ignore it so this test stays focused on file/user/system ordering.
     let layers = if matches!(
         layers.first().map(|layer| &layer.name),
-        Some(ConfigLayerSource::LegacyManagedConfigTomlFromMdm)
+        Some(ApiConfigLayerSource::LegacyManagedConfigTomlFromMdm)
     ) {
         &layers[1..]
     } else {
@@ -286,19 +494,20 @@ async fn read_includes_origins_and_layers() {
     assert_eq!(layers.len(), 3, "expected three layers");
     assert_eq!(
         layers.first().unwrap().name,
-        ConfigLayerSource::LegacyManagedConfigTomlFromFile {
+        ApiConfigLayerSource::LegacyManagedConfigTomlFromFile {
             file: managed_file.clone()
         }
     );
     assert_eq!(
         layers.get(1).unwrap().name,
-        ConfigLayerSource::User {
-            file: user_file.clone()
+        ApiConfigLayerSource::User {
+            file: user_file.clone(),
+            profile: None,
         }
     );
     assert!(matches!(
         layers.get(2).unwrap().name,
-        ConfigLayerSource::System { .. }
+        ApiConfigLayerSource::System { .. }
     ));
 }
 
@@ -327,7 +536,7 @@ writable_roots = ["~/code"]
         tmp.path().to_path_buf(),
         vec![],
         loader_overrides,
-        CloudRequirementsLoader::default(),
+        CloudConfigBundleLoader::default(),
     );
 
     let response = service
@@ -367,7 +576,7 @@ async fn write_value_reports_override() {
         tmp.path().to_path_buf(),
         vec![],
         LoaderOverrides::with_managed_config_path_for_tests(managed_path.clone()),
-        CloudRequirementsLoader::default(),
+        CloudConfigBundleLoader::default(),
     );
 
     let result = service
@@ -398,7 +607,7 @@ async fn write_value_reports_override() {
             .get("approval_policy")
             .expect("origin")
             .name,
-        ConfigLayerSource::LegacyManagedConfigTomlFromFile {
+        ApiConfigLayerSource::LegacyManagedConfigTomlFromFile {
             file: managed_file.clone()
         }
     );
@@ -455,6 +664,140 @@ async fn write_value_defaults_to_user_config_path() {
 }
 
 #[tokio::test]
+async fn write_value_defaults_to_selected_user_config_path() {
+    let tmp = tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join(CONFIG_TOML_FILE), "model = \"gpt-main\"").unwrap();
+    let selected_path = tmp.path().join("work.config.toml");
+    std::fs::write(&selected_path, "").unwrap();
+
+    let mut loader_overrides =
+        LoaderOverrides::with_managed_config_path_for_tests(tmp.path().join("managed_config.toml"));
+    loader_overrides.user_config_path =
+        Some(AbsolutePathBuf::from_absolute_path(&selected_path).expect("selected config path"));
+    loader_overrides.user_config_profile = Some("work".parse().expect("profile-v2 name"));
+    let service = ConfigManager::new_for_tests(
+        tmp.path().to_path_buf(),
+        vec![],
+        loader_overrides,
+        CloudConfigBundleLoader::default(),
+    );
+    service
+        .write_value(ConfigValueWriteParams {
+            file_path: None,
+            key_path: "model".to_string(),
+            value: serde_json::json!("gpt-work"),
+            merge_strategy: MergeStrategy::Replace,
+            expected_version: None,
+        })
+        .await
+        .expect("write succeeds");
+
+    assert_eq!(
+        std::fs::read_to_string(&selected_path).expect("read selected config"),
+        "model = \"gpt-work\"\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join(CONFIG_TOML_FILE)).expect("read main config"),
+        "model = \"gpt-main\""
+    );
+}
+
+#[tokio::test]
+async fn load_default_config_preserves_managed_requirements_and_selected_user_config_path() {
+    let tmp = tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join(CONFIG_TOML_FILE), "model = \"gpt-main\"").unwrap();
+    std::fs::write(
+        tmp.path().join("requirements.toml"),
+        "allowed_login_methods = [\"api\"]\nallowed_chatgpt_workspaces = [\"managed-workspace\"]\n",
+    )
+    .unwrap();
+    let selected_path = tmp.path().join("work.config.toml");
+    std::fs::write(&selected_path, "not valid toml").unwrap();
+    let selected_file =
+        AbsolutePathBuf::from_absolute_path(&selected_path).expect("selected config path");
+
+    let mut loader_overrides =
+        LoaderOverrides::with_managed_config_path_for_tests(tmp.path().join("managed_config.toml"));
+    loader_overrides.user_config_path = Some(selected_file.clone());
+    loader_overrides.user_config_profile = Some("work".parse().expect("profile-v2 name"));
+    let service = ConfigManager::new_for_tests(
+        tmp.path().to_path_buf(),
+        vec![],
+        loader_overrides,
+        CloudConfigBundleLoader::default(),
+    );
+
+    service
+        .load_latest_config(/*fallback_cwd*/ None)
+        .await
+        .expect_err("selected config should fail to load");
+    let config = service
+        .load_default_config()
+        .await
+        .expect("default config loads after selected config error");
+
+    assert_eq!(
+        config.config_layer_stack.get_user_config_file(),
+        Some(&selected_file)
+    );
+    assert_eq!(
+        config
+            .config_layer_stack
+            .requirements()
+            .managed_auth_policy(),
+        codex_config::ManagedAuthPolicy {
+            allowed_login_methods: Some(vec![codex_protocol::config_types::ForcedLoginMethod::Api]),
+            allowed_chatgpt_workspaces: Some(vec!["managed-workspace".to_string()]),
+        }
+    );
+}
+
+#[tokio::test]
+async fn managed_auth_policy_survives_unusable_requirements_file_changes() -> Result<()> {
+    let tmp = tempdir()?;
+    std::fs::write(tmp.path().join(CONFIG_TOML_FILE), "")?;
+    let requirements_path = tmp.path().join("requirements.toml");
+    std::fs::write(
+        &requirements_path,
+        "allowed_login_methods = [\"api\"]\nallowed_chatgpt_workspaces = [\"startup\"]\n",
+    )?;
+    let service = ConfigManager::new_for_tests(
+        tmp.path().to_path_buf(),
+        Vec::new(),
+        LoaderOverrides::with_managed_config_path_for_tests(tmp.path().join("managed_config.toml")),
+        CloudConfigBundleLoader::default(),
+    );
+    let startup = service.load_latest_config(/*fallback_cwd*/ None).await?;
+    let auth_manager = codex_login::AuthManager::shared_from_config(
+        &startup, /*enable_codex_api_key_env*/ false,
+    )
+    .await?;
+    std::fs::write(
+        &requirements_path,
+        "allowed_login_methods = [\"chatgpt\"]\nallowed_chatgpt_workspaces = []\n",
+    )?;
+    for refreshed in [
+        service.load_latest_config(/*fallback_cwd*/ None).await?,
+        service.load_latest_config_for_thread(&startup).await?,
+    ] {
+        assert_eq!(refreshed.forced_login_method, None);
+        assert_eq!(refreshed.forced_chatgpt_workspace_id, None);
+    }
+    assert!(
+        auth_manager.is_login_method_allowed(codex_protocol::config_types::ForcedLoginMethod::Api)
+    );
+    assert!(
+        !auth_manager
+            .is_login_method_allowed(codex_protocol::config_types::ForcedLoginMethod::Chatgpt)
+    );
+    assert_eq!(
+        auth_manager.effective_chatgpt_workspaces(),
+        Some(vec!["startup".to_string()])
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn invalid_user_value_rejected_even_if_overridden_by_managed() {
     let tmp = tempdir().expect("tempdir");
     std::fs::write(tmp.path().join(CONFIG_TOML_FILE), "model = \"user\"").unwrap();
@@ -466,7 +809,7 @@ async fn invalid_user_value_rejected_even_if_overridden_by_managed() {
         tmp.path().to_path_buf(),
         vec![],
         LoaderOverrides::with_managed_config_path_for_tests(managed_path.clone()),
-        CloudRequirementsLoader::default(),
+        CloudConfigBundleLoader::default(),
     );
 
     let error = service
@@ -526,14 +869,12 @@ async fn write_value_rejects_feature_requirement_conflict() {
         tmp.path().to_path_buf(),
         vec![],
         LoaderOverrides::without_managed_config_for_tests(),
-        CloudRequirementsLoader::new(async {
-            Ok(Some(ConfigRequirementsToml {
-                feature_requirements: Some(FeatureRequirementsToml {
-                    entries: BTreeMap::from([("personality".to_string(), true)]),
-                }),
-                ..Default::default()
-            }))
-        }),
+        CloudConfigBundleFixture::loader_with_enterprise_requirement(
+            r#"
+[features]
+personality = true
+"#,
+        ),
     );
 
     let error = service
@@ -564,48 +905,160 @@ async fn write_value_rejects_feature_requirement_conflict() {
 }
 
 #[tokio::test]
-async fn write_value_rejects_profile_feature_requirement_conflict() {
+async fn write_value_rejects_exact_managed_requirement() {
     let tmp = tempdir().expect("tempdir");
-    std::fs::write(tmp.path().join(CONFIG_TOML_FILE), "").unwrap();
+    let path = tmp.path().join(CONFIG_TOML_FILE);
+    std::fs::write(&path, "allow_login_shell = true\n").unwrap();
 
     let service = ConfigManager::new_for_tests(
         tmp.path().to_path_buf(),
         vec![],
         LoaderOverrides::without_managed_config_for_tests(),
-        CloudRequirementsLoader::new(async {
-            Ok(Some(ConfigRequirementsToml {
-                feature_requirements: Some(FeatureRequirementsToml {
-                    entries: BTreeMap::from([("personality".to_string(), true)]),
-                }),
-                ..Default::default()
-            }))
-        }),
+        CloudConfigBundleFixture::loader_with_enterprise_requirement("allow_login_shell = false"),
     );
 
     let error = service
         .write_value(ConfigValueWriteParams {
-            file_path: Some(tmp.path().join(CONFIG_TOML_FILE).display().to_string()),
-            key_path: "profiles.enterprise.features.personality".to_string(),
-            value: serde_json::json!(false),
+            file_path: Some(path.display().to_string()),
+            key_path: "allow_login_shell".to_string(),
+            value: serde_json::json!(true),
             merge_strategy: MergeStrategy::Replace,
             expected_version: None,
         })
         .await
-        .expect_err("conflicting profile feature write should fail");
+        .expect_err("managed exact field should be read-only");
 
     assert_eq!(
         error.write_error_code(),
-        Some(ConfigWriteErrorCode::ConfigValidationError)
+        Some(ConfigWriteErrorCode::ConfigRequirementReadonly)
     );
-    assert!(
-        error.to_string().contains(
-            "invalid value for `features`: `profiles.enterprise.features.personality=false`"
-        ),
-        "{error}"
-    );
+    assert!(error.to_string().contains("`allow_login_shell`"));
     assert_eq!(
-        std::fs::read_to_string(tmp.path().join(CONFIG_TOML_FILE)).unwrap(),
-        ""
+        std::fs::read_to_string(path).unwrap(),
+        "allow_login_shell = true\n"
+    );
+}
+
+fn toml_path(tmp: &Path, name: &str) -> String {
+    tmp.join(name).to_string_lossy().replace('\\', "\\\\")
+}
+
+#[tokio::test]
+async fn read_omits_origins_for_exact_managed_values() {
+    for has_user_values in [true, false] {
+        let tmp = tempdir().expect("tempdir");
+        let user_config = if has_user_values {
+            format!(
+                r#"model = "user-model"
+sqlite_home = "{}"
+allow_login_shell = true
+
+[feedback]
+enabled = true
+"#,
+                toml_path(tmp.path(), "user-sqlite"),
+            )
+        } else {
+            "model = \"user-model\"\n".to_string()
+        };
+        std::fs::write(tmp.path().join(CONFIG_TOML_FILE), user_config).unwrap();
+
+        let requirements = format!(
+            r#"sqlite_home = "{}"
+allow_login_shell = false
+
+[feedback]
+enabled = false
+"#,
+            toml_path(tmp.path(), "managed-sqlite"),
+        );
+        let service = ConfigManager::new_for_tests(
+            tmp.path().to_path_buf(),
+            vec![],
+            LoaderOverrides::without_managed_config_for_tests(),
+            CloudConfigBundleFixture::loader_with_enterprise_requirement(requirements),
+        );
+
+        let response = service
+            .read(ConfigReadParams {
+                include_layers: false,
+                cwd: None,
+            })
+            .await
+            .expect("config read should succeed");
+
+        assert_eq!(
+            response.config.additional.get("sqlite_home"),
+            Some(&serde_json::json!(tmp.path().join("managed-sqlite")))
+        );
+        assert_eq!(
+            response.config.additional.get("allow_login_shell"),
+            Some(&serde_json::json!(false))
+        );
+        assert_eq!(
+            response.config.additional.get("feedback"),
+            Some(&serde_json::json!({"enabled": false}))
+        );
+        for path in ["sqlite_home", "allow_login_shell", "feedback.enabled"] {
+            assert!(!response.origins.contains_key(path), "origin for {path}");
+        }
+        assert!(response.origins.contains_key("model"));
+    }
+}
+
+#[tokio::test]
+async fn read_materializes_default_allow_login_shell() {
+    let tmp = tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join(CONFIG_TOML_FILE), "").unwrap();
+
+    let service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
+    let response = service
+        .read(ConfigReadParams {
+            include_layers: false,
+            cwd: None,
+        })
+        .await
+        .expect("config read should succeed");
+
+    assert_eq!(
+        response.config.additional.get("allow_login_shell"),
+        Some(&serde_json::json!(true))
+    );
+}
+
+#[tokio::test]
+async fn write_value_allows_unmanaged_sibling_of_exact_requirement() {
+    let tmp = tempdir().expect("tempdir");
+    let path = tmp.path().join(CONFIG_TOML_FILE);
+    std::fs::write(&path, "").unwrap();
+
+    let service = ConfigManager::new_for_tests(
+        tmp.path().to_path_buf(),
+        vec![],
+        LoaderOverrides::without_managed_config_for_tests(),
+        CloudConfigBundleFixture::loader_with_enterprise_requirement(
+            r#"
+[windows]
+sandbox_private_desktop = false
+"#,
+        ),
+    );
+
+    service
+        .write_value(ConfigValueWriteParams {
+            file_path: Some(path.display().to_string()),
+            key_path: "windows.sandbox".to_string(),
+            value: serde_json::json!("elevated"),
+            merge_strategy: MergeStrategy::Replace,
+            expected_version: None,
+        })
+        .await
+        .expect("unmanaged sibling should remain writable");
+
+    assert!(
+        std::fs::read_to_string(path)
+            .unwrap()
+            .contains("sandbox = \"elevated\"")
     );
 }
 
@@ -629,7 +1082,7 @@ async fn read_reports_managed_overrides_user_and_session_flags() {
         tmp.path().to_path_buf(),
         cli_overrides,
         LoaderOverrides::with_managed_config_path_for_tests(managed_path.clone()),
-        CloudRequirementsLoader::default(),
+        CloudConfigBundleLoader::default(),
     );
 
     let response = service
@@ -643,7 +1096,7 @@ async fn read_reports_managed_overrides_user_and_session_flags() {
     assert_eq!(response.config.model.as_deref(), Some("system"));
     assert_eq!(
         response.origins.get("model").expect("origin").name,
-        ConfigLayerSource::LegacyManagedConfigTomlFromFile {
+        ApiConfigLayerSource::LegacyManagedConfigTomlFromFile {
             file: managed_file.clone()
         },
     );
@@ -652,7 +1105,7 @@ async fn read_reports_managed_overrides_user_and_session_flags() {
     // top of the stack; ignore it so this test stays focused on file/session/user ordering.
     let layers = if matches!(
         layers.first().map(|layer| &layer.name),
-        Some(ConfigLayerSource::LegacyManagedConfigTomlFromMdm)
+        Some(ApiConfigLayerSource::LegacyManagedConfigTomlFromMdm)
     ) {
         &layers[1..]
     } else {
@@ -660,12 +1113,18 @@ async fn read_reports_managed_overrides_user_and_session_flags() {
     };
     assert_eq!(
         layers.first().unwrap().name,
-        ConfigLayerSource::LegacyManagedConfigTomlFromFile { file: managed_file }
+        ApiConfigLayerSource::LegacyManagedConfigTomlFromFile { file: managed_file }
     );
-    assert_eq!(layers.get(1).unwrap().name, ConfigLayerSource::SessionFlags);
+    assert_eq!(
+        layers.get(1).unwrap().name,
+        ApiConfigLayerSource::SessionFlags
+    );
     assert_eq!(
         layers.get(2).unwrap().name,
-        ConfigLayerSource::User { file: user_file }
+        ApiConfigLayerSource::User {
+            file: user_file,
+            profile: None
+        }
     );
 }
 
@@ -682,7 +1141,7 @@ async fn write_value_reports_managed_override() {
         tmp.path().to_path_buf(),
         vec![],
         LoaderOverrides::with_managed_config_path_for_tests(managed_path.clone()),
-        CloudRequirementsLoader::default(),
+        CloudConfigBundleLoader::default(),
     );
 
     let result = service
@@ -700,9 +1159,66 @@ async fn write_value_reports_managed_override() {
     let overridden = result.overridden_metadata.expect("overridden metadata");
     assert_eq!(
         overridden.overriding_layer.name,
-        ConfigLayerSource::LegacyManagedConfigTomlFromFile { file: managed_file }
+        ApiConfigLayerSource::LegacyManagedConfigTomlFromFile { file: managed_file }
     );
     assert_eq!(overridden.effective_value, serde_json::json!("never"));
+}
+
+/// Legacy managed feature toggles own their normalized enabled origin and override metadata.
+#[tokio::test]
+async fn multi_agent_v2_boolean_layer_owns_enabled_origin_and_overrides() {
+    let tmp = tempdir().expect("tempdir");
+    let user_path = tmp.path().join(CONFIG_TOML_FILE);
+    std::fs::write(
+        &user_path,
+        "[features.multi_agent_v2]\nenabled = true\nsubagent_usage_hint_text = \"keep\"\n",
+    )
+    .expect("user config");
+
+    let managed_path = tmp.path().join("managed_config.toml");
+    std::fs::write(&managed_path, "[features]\nmulti_agent_v2 = false\n").expect("managed config");
+    let managed_file = AbsolutePathBuf::try_from(managed_path.clone()).expect("managed file");
+    let service = ConfigManager::new_for_tests(
+        tmp.path().to_path_buf(),
+        vec![],
+        LoaderOverrides::with_managed_config_path_for_tests(managed_path),
+        CloudConfigBundleLoader::default(),
+    );
+
+    let read = service
+        .read(ConfigReadParams {
+            include_layers: false,
+            cwd: None,
+        })
+        .await
+        .expect("read config");
+    assert_eq!(
+        read.origins
+            .get("features.multi_agent_v2.enabled")
+            .expect("enabled origin")
+            .name,
+        ApiConfigLayerSource::LegacyManagedConfigTomlFromFile {
+            file: managed_file.clone(),
+        },
+    );
+
+    let result = service
+        .write_value(ConfigValueWriteParams {
+            file_path: Some(user_path.display().to_string()),
+            key_path: "features.multi_agent_v2.enabled".to_string(),
+            value: serde_json::json!(true),
+            merge_strategy: MergeStrategy::Upsert,
+            expected_version: None,
+        })
+        .await
+        .expect("write config");
+    assert_eq!(result.status, WriteStatus::OkOverridden);
+    let overridden = result.overridden_metadata.expect("overridden metadata");
+    assert_eq!(
+        overridden.overriding_layer.name,
+        ApiConfigLayerSource::LegacyManagedConfigTomlFromFile { file: managed_file }
+    );
+    assert_eq!(overridden.effective_value, serde_json::json!(false));
 }
 
 #[tokio::test]
@@ -788,6 +1304,448 @@ beta = "b"
 "#,
     )?;
     assert_eq!(replaced, expected_replace);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn config_writes_apply_path_sensitive_merge_rules() -> Result<()> {
+    let cases = [
+        (
+            r#"[shell_environment_policy]
+exclude = ["AWS_*"]
+"#,
+            "shell_environment_policy",
+            serde_json::json!({"filters": {"AWS_*": "include"}}),
+            r#"[shell_environment_policy.filters]
+"AWS_*" = "include"
+"#,
+        ),
+        (
+            r#"[shell_environment_policy]
+inherit = "core"
+exclude = ["AWS_*"]
+"#,
+            "shell_environment_policy.filters",
+            serde_json::json!({"AWS_*": "include"}),
+            r#"[shell_environment_policy]
+inherit = "core"
+
+[shell_environment_policy.filters]
+"AWS_*" = "include"
+"#,
+        ),
+        (
+            r#"[shell_environment_policy.filters]
+"AWS_*" = "include"
+"#,
+            "shell_environment_policy.exclude",
+            serde_json::json!(["AWS_*"]),
+            r#"[shell_environment_policy]
+exclude = ["AWS_*"]
+"#,
+        ),
+        (
+            r#"[shell_environment_policy]
+exclude = ["AWS_*"]
+include_only = ["PATH"]
+"#,
+            "shell_environment_policy.filters",
+            serde_json::json!({}),
+            r#"[shell_environment_policy.filters]
+"#,
+        ),
+        (
+            r#"[shell_environment_policy.filters]
+"AWS_*" = "include"
+"#,
+            "shell_environment_policy.exclude",
+            serde_json::json!([]),
+            r#"[shell_environment_policy]
+exclude = []
+"#,
+        ),
+        (
+            r#"[shell_environment_policy.filters]
+"aws_*" = "exclude"
+"#,
+            "shell_environment_policy.filters",
+            serde_json::json!({"AWS_*": "include"}),
+            r#"[shell_environment_policy.filters]
+"aws_*" = "include"
+"#,
+        ),
+        (
+            r#"[shell_environment_policy.filters]
+"aws_*" = "exclude"
+"#,
+            "shell_environment_policy.filters.AWS_*",
+            serde_json::json!("include"),
+            r#"[shell_environment_policy.filters]
+"aws_*" = "include"
+"#,
+        ),
+        (
+            r#"[shell_environment_policy.filters]
+"секрет_*" = "exclude"
+"#,
+            "shell_environment_policy.filters.СЕКРЕТ_*",
+            serde_json::json!("include"),
+            r#"[shell_environment_policy.filters]
+"секрет_*" = "include"
+"#,
+        ),
+        (
+            r#"[permissions.dev.network.domains]
+"example.com" = "deny"
+"#,
+            "permissions.dev.network.domains",
+            serde_json::json!({"EXAMPLE.COM": "allow"}),
+            r#"[permissions.dev.network.domains]
+"example.com" = "allow"
+"#,
+        ),
+        (
+            r#"[memories]
+no_memories_if_mcp_or_web_search = false
+"#,
+            "memories",
+            serde_json::json!({"disable_on_external_context": true}),
+            r#"[memories]
+disable_on_external_context = true
+"#,
+        ),
+        (
+            r#"[features]
+multi_agent_v2 = true
+"#,
+            "features.multi_agent_v2.subagent_usage_hint_text",
+            serde_json::json!("Delegate carefully."),
+            r#"[features.multi_agent_v2]
+enabled = true
+subagent_usage_hint_text = "Delegate carefully."
+"#,
+        ),
+        (
+            r#"[features]
+multi_agent_v2 = true
+"#,
+            "features.multi_agent_v2",
+            serde_json::json!({"subagent_usage_hint_text": "Delegate carefully."}),
+            r#"[features.multi_agent_v2]
+enabled = true
+subagent_usage_hint_text = "Delegate carefully."
+"#,
+        ),
+        (
+            r#"[features.multi_agent_v2]
+enabled = true
+subagent_usage_hint_text = "Delegate carefully."
+"#,
+            "features.multi_agent_v2",
+            serde_json::json!(false),
+            r#"[features.multi_agent_v2]
+enabled = false
+subagent_usage_hint_text = "Delegate carefully."
+"#,
+        ),
+        (
+            r#"[features.multi_agent_v2]
+enabled = true
+subagent_usage_hint_text = "Delegate carefully."
+"#,
+            "features.multi_agent_v2",
+            serde_json::Value::Null,
+            "",
+        ),
+        (
+            r#"[desktop.features.multi_agent_v2]
+custom = true
+"#,
+            "desktop.features.multi_agent_v2",
+            serde_json::json!(false),
+            r#"[desktop.features]
+multi_agent_v2 = false
+"#,
+        ),
+        (
+            r#"[desktop.features]
+multi_agent_v2 = true
+"#,
+            "desktop.features.multi_agent_v2",
+            serde_json::json!({"custom": true}),
+            r#"[desktop.features.multi_agent_v2]
+custom = true
+"#,
+        ),
+    ];
+
+    for (base, key_path, value, expected) in cases {
+        let tmp = tempdir()?;
+        let path = tmp.path().join(CONFIG_TOML_FILE);
+        std::fs::write(&path, base)?;
+
+        let service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
+        service
+            .write_value(ConfigValueWriteParams {
+                file_path: Some(path.display().to_string()),
+                key_path: key_path.to_string(),
+                value,
+                merge_strategy: MergeStrategy::Upsert,
+                expected_version: None,
+            })
+            .await?;
+
+        let updated: TomlValue = toml::from_str(&std::fs::read_to_string(&path)?)?;
+        let expected: TomlValue = toml::from_str(expected)?;
+        assert_eq!(updated, expected);
+
+        service
+            .read(ConfigReadParams {
+                include_layers: false,
+                cwd: None,
+            })
+            .await?;
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn clear_shell_environment_filter_ignores_ascii_case() -> Result<()> {
+    let tmp = tempdir()?;
+    let path = tmp.path().join(CONFIG_TOML_FILE);
+    std::fs::write(
+        &path,
+        r#"[shell_environment_policy.filters]
+"aws_*" = "exclude"
+"keep_*" = "include"
+"#,
+    )?;
+
+    let service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
+    let response = service
+        .write_value(ConfigValueWriteParams {
+            file_path: Some(path.display().to_string()),
+            key_path: "shell_environment_policy.filters.AWS_*".to_string(),
+            value: serde_json::Value::Null,
+            merge_strategy: MergeStrategy::Upsert,
+            expected_version: None,
+        })
+        .await?;
+
+    assert_eq!(response.status, WriteStatus::Ok);
+    assert_eq!(response.overridden_metadata, None);
+    assert_eq!(
+        std::fs::read_to_string(&path)?,
+        r#"[shell_environment_policy.filters]
+"keep_*" = "include"
+"#
+    );
+    service
+        .read(ConfigReadParams {
+            include_layers: false,
+            cwd: None,
+        })
+        .await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn upsert_shell_environment_scalar_preserves_unrelated_formatting() -> Result<()> {
+    let tmp = tempdir()?;
+    let path = tmp.path().join(CONFIG_TOML_FILE);
+    std::fs::write(
+        &path,
+        r#"[shell_environment_policy]
+inherit = "all"
+exclude = [
+    "AWS_*", # keep this comment
+]
+set = { KEEP = "1", OTHER = "2" } # keep this inline table
+"#,
+    )?;
+
+    let service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
+    service
+        .write_value(ConfigValueWriteParams {
+            file_path: Some(path.display().to_string()),
+            key_path: "shell_environment_policy.inherit".to_string(),
+            value: serde_json::json!("core"),
+            merge_strategy: MergeStrategy::Upsert,
+            expected_version: None,
+        })
+        .await?;
+
+    assert_eq!(
+        std::fs::read_to_string(&path)?,
+        r#"[shell_environment_policy]
+inherit = "core"
+exclude = [
+    "AWS_*", # keep this comment
+]
+set = { KEEP = "1", OTHER = "2" } # keep this inline table
+"#
+    );
+    service
+        .read(ConfigReadParams {
+            include_layers: false,
+            cwd: None,
+        })
+        .await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn upsert_shell_environment_filter_scalar_preserves_formatting_and_version() -> Result<()> {
+    let tmp = tempdir()?;
+    let path = tmp.path().join(CONFIG_TOML_FILE);
+    std::fs::write(
+        &path,
+        r#"[shell_environment_policy]
+set = { KEEP = "1", OTHER = "2" } # keep this inline table
+
+[shell_environment_policy.filters]
+"AWS_*" = "exclude" # keep this edited comment
+"KEEP_*" = "include" # keep this untouched comment
+"#,
+    )?;
+    let service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
+
+    let response = service
+        .write_value(ConfigValueWriteParams {
+            file_path: Some(path.display().to_string()),
+            key_path: "shell_environment_policy.filters.aws_*".to_string(),
+            value: serde_json::json!("include"),
+            merge_strategy: MergeStrategy::Upsert,
+            expected_version: None,
+        })
+        .await?;
+
+    assert_eq!(
+        std::fs::read_to_string(&path)?,
+        r#"[shell_environment_policy]
+set = { KEEP = "1", OTHER = "2" } # keep this inline table
+
+[shell_environment_policy.filters]
+"AWS_*" = "include" # keep this edited comment
+"KEEP_*" = "include" # keep this untouched comment
+"#
+    );
+    service
+        .write_value(ConfigValueWriteParams {
+            file_path: Some(path.display().to_string()),
+            key_path: "shell_environment_policy.filters.AWS_*".to_string(),
+            value: serde_json::json!("exclude"),
+            merge_strategy: MergeStrategy::Upsert,
+            expected_version: Some(response.version),
+        })
+        .await?;
+    service
+        .read(ConfigReadParams {
+            include_layers: false,
+            cwd: None,
+        })
+        .await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn shell_environment_upsert_rejects_case_variant_filters_in_one_edit() -> Result<()> {
+    let tmp = tempdir()?;
+    let path = tmp.path().join(CONFIG_TOML_FILE);
+    let initial = r#"[shell_environment_policy.filters]
+"KEEP_*" = "include"
+"#;
+    std::fs::write(&path, initial)?;
+    let service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
+
+    let error = service
+        .write_value(ConfigValueWriteParams {
+            file_path: Some(path.display().to_string()),
+            key_path: "shell_environment_policy.filters".to_string(),
+            value: serde_json::json!({"AWS_*": "include", "aws_*": "exclude"}),
+            merge_strategy: MergeStrategy::Upsert,
+            expected_version: None,
+        })
+        .await
+        .expect_err("one filter-map edit must not contain case-variant keys");
+
+    assert_eq!(
+        error.write_error_code(),
+        Some(ConfigWriteErrorCode::ConfigValidationError)
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("duplicate shell environment filter")
+    );
+    assert_eq!(std::fs::read_to_string(&path)?, initial);
+    Ok(())
+}
+
+#[tokio::test]
+async fn shell_environment_representation_switch_reports_managed_override() -> Result<()> {
+    let cases = [
+        (
+            r#"[shell_environment_policy]
+exclude = ["AWS_*"]
+"#,
+            "shell_environment_policy.filters.AWS_*",
+            serde_json::json!("include"),
+        ),
+        (
+            r#"[shell_environment_policy.filters]
+"AWS_*" = "include"
+"#,
+            "shell_environment_policy.exclude",
+            serde_json::json!(["AWS_*"]),
+        ),
+    ];
+
+    for (managed, key_path, value) in cases {
+        let tmp = tempdir()?;
+        let path = tmp.path().join(CONFIG_TOML_FILE);
+        std::fs::write(&path, "")?;
+        let managed_path = tmp.path().join("managed_config.toml");
+        std::fs::write(&managed_path, managed)?;
+        let managed_file = AbsolutePathBuf::try_from(managed_path.clone())?;
+        let service = ConfigManager::new_for_tests(
+            tmp.path().to_path_buf(),
+            vec![],
+            LoaderOverrides::with_managed_config_path_for_tests(managed_path),
+            CloudConfigBundleLoader::default(),
+        );
+
+        let response = service
+            .write_value(ConfigValueWriteParams {
+                file_path: Some(path.display().to_string()),
+                key_path: key_path.to_string(),
+                value,
+                merge_strategy: MergeStrategy::Upsert,
+                expected_version: None,
+            })
+            .await?;
+
+        assert_eq!(response.status, WriteStatus::OkOverridden);
+        let overridden = response
+            .overridden_metadata
+            .expect("managed representation should override the user edit");
+        assert_eq!(
+            overridden.overriding_layer.name,
+            ApiConfigLayerSource::LegacyManagedConfigTomlFromFile { file: managed_file }
+        );
+        assert_eq!(overridden.effective_value, serde_json::Value::Null);
+        service
+            .read(ConfigReadParams {
+                include_layers: false,
+                cwd: None,
+            })
+            .await?;
+    }
 
     Ok(())
 }

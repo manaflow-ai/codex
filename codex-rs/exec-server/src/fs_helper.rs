@@ -1,6 +1,6 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use codex_app_server_protocol::JSONRPCErrorError;
+use codex_exec_server_protocol::JSONRPCErrorError;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::io;
@@ -10,13 +10,18 @@ use crate::CreateDirectoryOptions;
 use crate::ExecutorFileSystem;
 use crate::RemoveOptions;
 use crate::local_file_system::DirectFileSystem;
+use crate::protocol::FS_CANONICALIZE_METHOD;
 use crate::protocol::FS_COPY_METHOD;
 use crate::protocol::FS_CREATE_DIRECTORY_METHOD;
 use crate::protocol::FS_GET_METADATA_METHOD;
+use crate::protocol::FS_OPEN_METHOD;
 use crate::protocol::FS_READ_DIRECTORY_METHOD;
 use crate::protocol::FS_READ_FILE_METHOD;
 use crate::protocol::FS_REMOVE_METHOD;
+use crate::protocol::FS_WALK_METHOD;
 use crate::protocol::FS_WRITE_FILE_METHOD;
+use crate::protocol::FsCanonicalizeParams;
+use crate::protocol::FsCanonicalizeResponse;
 use crate::protocol::FsCopyParams;
 use crate::protocol::FsCopyResponse;
 use crate::protocol::FsCreateDirectoryParams;
@@ -30,6 +35,8 @@ use crate::protocol::FsReadFileParams;
 use crate::protocol::FsReadFileResponse;
 use crate::protocol::FsRemoveParams;
 use crate::protocol::FsRemoveResponse;
+use crate::protocol::FsWalkParams;
+use crate::protocol::FsWalkResponse;
 use crate::protocol::FsWriteFileParams;
 use crate::protocol::FsWriteFileResponse;
 use crate::rpc::internal_error;
@@ -41,6 +48,8 @@ pub const CODEX_FS_HELPER_ARG1: &str = "--codex-run-as-fs-helper";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", content = "params")]
 pub(crate) enum FsHelperRequest {
+    #[serde(rename = "fs/open")]
+    Open(FsReadFileParams),
     #[serde(rename = "fs/readFile")]
     ReadFile(FsReadFileParams),
     #[serde(rename = "fs/writeFile")]
@@ -49,8 +58,12 @@ pub(crate) enum FsHelperRequest {
     CreateDirectory(FsCreateDirectoryParams),
     #[serde(rename = "fs/getMetadata")]
     GetMetadata(FsGetMetadataParams),
+    #[serde(rename = "fs/canonicalize")]
+    Canonicalize(FsCanonicalizeParams),
     #[serde(rename = "fs/readDirectory")]
     ReadDirectory(FsReadDirectoryParams),
+    #[serde(rename = "fs/walk")]
+    Walk(FsWalkParams),
     #[serde(rename = "fs/remove")]
     Remove(FsRemoveParams),
     #[serde(rename = "fs/copy")]
@@ -65,8 +78,21 @@ pub(crate) enum FsHelperResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FsHelperOpenResponse {
+    // Windows duplicates the handle from the helper process.
+    #[cfg(windows)]
+    pub(crate) process_id: u32,
+    // Unix passes the fd directly instead.
+    #[cfg(windows)]
+    pub(crate) file_handle: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", content = "response")]
 pub(crate) enum FsHelperPayload {
+    #[serde(rename = "fs/open")]
+    Open(FsHelperOpenResponse),
     #[serde(rename = "fs/readFile")]
     ReadFile(FsReadFileResponse),
     #[serde(rename = "fs/writeFile")]
@@ -75,8 +101,12 @@ pub(crate) enum FsHelperPayload {
     CreateDirectory(FsCreateDirectoryResponse),
     #[serde(rename = "fs/getMetadata")]
     GetMetadata(FsGetMetadataResponse),
+    #[serde(rename = "fs/canonicalize")]
+    Canonicalize(FsCanonicalizeResponse),
     #[serde(rename = "fs/readDirectory")]
     ReadDirectory(FsReadDirectoryResponse),
+    #[serde(rename = "fs/walk")]
+    Walk(FsWalkResponse),
     #[serde(rename = "fs/remove")]
     Remove(FsRemoveResponse),
     #[serde(rename = "fs/copy")]
@@ -86,11 +116,14 @@ pub(crate) enum FsHelperPayload {
 impl FsHelperPayload {
     fn operation(&self) -> &'static str {
         match self {
+            Self::Open(_) => FS_OPEN_METHOD,
             Self::ReadFile(_) => FS_READ_FILE_METHOD,
             Self::WriteFile(_) => FS_WRITE_FILE_METHOD,
             Self::CreateDirectory(_) => FS_CREATE_DIRECTORY_METHOD,
             Self::GetMetadata(_) => FS_GET_METADATA_METHOD,
+            Self::Canonicalize(_) => FS_CANONICALIZE_METHOD,
             Self::ReadDirectory(_) => FS_READ_DIRECTORY_METHOD,
+            Self::Walk(_) => FS_WALK_METHOD,
             Self::Remove(_) => FS_REMOVE_METHOD,
             Self::Copy(_) => FS_COPY_METHOD,
         }
@@ -132,6 +165,16 @@ impl FsHelperPayload {
         }
     }
 
+    pub(crate) fn expect_canonicalize(self) -> Result<FsCanonicalizeResponse, JSONRPCErrorError> {
+        match self {
+            Self::Canonicalize(response) => Ok(response),
+            other => Err(unexpected_response(
+                FS_CANONICALIZE_METHOD,
+                other.operation(),
+            )),
+        }
+    }
+
     pub(crate) fn expect_read_directory(
         self,
     ) -> Result<FsReadDirectoryResponse, JSONRPCErrorError> {
@@ -141,6 +184,13 @@ impl FsHelperPayload {
                 FS_READ_DIRECTORY_METHOD,
                 other.operation(),
             )),
+        }
+    }
+
+    pub(crate) fn expect_walk(self) -> Result<FsWalkResponse, JSONRPCErrorError> {
+        match self {
+            Self::Walk(response) => Ok(response),
+            other => Err(unexpected_response(FS_WALK_METHOD, other.operation())),
         }
     }
 
@@ -170,6 +220,9 @@ pub(crate) async fn run_direct_request(
 ) -> Result<FsHelperPayload, JSONRPCErrorError> {
     let file_system = DirectFileSystem;
     match request {
+        FsHelperRequest::Open(_) => Err(invalid_request(
+            "opening a file requires descriptor handoff".to_string(),
+        )),
         FsHelperRequest::ReadFile(params) => {
             let data = file_system
                 .read_file(&params.path, /*sandbox*/ None)
@@ -215,8 +268,18 @@ pub(crate) async fn run_direct_request(
                 is_directory: metadata.is_directory,
                 is_file: metadata.is_file,
                 is_symlink: metadata.is_symlink,
+                size: metadata.size,
                 created_at_ms: metadata.created_at_ms,
                 modified_at_ms: metadata.modified_at_ms,
+            }))
+        }
+        FsHelperRequest::Canonicalize(params) => {
+            let path = file_system
+                .canonicalize(&params.path, /*sandbox*/ None)
+                .await
+                .map_err(map_fs_error)?;
+            Ok(FsHelperPayload::Canonicalize(FsCanonicalizeResponse {
+                path,
             }))
         }
         FsHelperRequest::ReadDirectory(params) => {
@@ -234,6 +297,13 @@ pub(crate) async fn run_direct_request(
             Ok(FsHelperPayload::ReadDirectory(FsReadDirectoryResponse {
                 entries,
             }))
+        }
+        FsHelperRequest::Walk(params) => {
+            let outcome = file_system
+                .walk(&params.path, params.options, /*sandbox*/ None)
+                .await
+                .map_err(map_fs_error)?;
+            Ok(FsHelperPayload::Walk(outcome))
         }
         FsHelperRequest::Remove(params) => {
             file_system
@@ -266,7 +336,7 @@ pub(crate) async fn run_direct_request(
     }
 }
 
-fn map_fs_error(err: io::Error) -> JSONRPCErrorError {
+pub(crate) fn map_fs_error(err: io::Error) -> JSONRPCErrorError {
     match err.kind() {
         io::ErrorKind::NotFound => not_found(err.to_string()),
         io::ErrorKind::InvalidInput | io::ErrorKind::PermissionDenied => {
@@ -278,23 +348,69 @@ fn map_fs_error(err: io::Error) -> JSONRPCErrorError {
 
 #[cfg(test)]
 mod tests {
+    use codex_utils_path_uri::PathUri;
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+
     use super::*;
 
     #[test]
-    fn helper_requests_use_fs_method_names() -> serde_json::Result<()> {
-        assert_eq!(
-            serde_json::to_value(FsHelperRequest::WriteFile(FsWriteFileParams {
-                path: std::env::current_dir()
-                    .expect("cwd")
-                    .join("file")
-                    .as_path()
-                    .try_into()
-                    .expect("absolute path"),
+    fn helper_protocol_uses_path_uris() -> serde_json::Result<()> {
+        let local_path =
+            PathUri::from_host_native_path(std::env::current_dir().expect("cwd").join("file"))
+                .expect("path URI");
+        let paths = [
+            local_path,
+            PathUri::parse("file://server/share/file").expect("path URI"),
+        ];
+
+        for path in paths {
+            let expected_path = path.to_string();
+
+            let request = serde_json::to_value(FsHelperRequest::WriteFile(FsWriteFileParams {
+                path: path.clone(),
                 data_base64: String::new(),
                 sandbox: None,
-            }))?["operation"],
-            FS_WRITE_FILE_METHOD,
-        );
+            }))?;
+            assert_eq!(
+                request,
+                json!({
+                    "operation": FS_WRITE_FILE_METHOD,
+                    "params": {
+                        "path": expected_path.as_str(),
+                        "dataBase64": "",
+                        "sandbox": null,
+                    },
+                }),
+            );
+            let request_path = request["params"]["path"]
+                .as_str()
+                .expect("request path should be a string");
+            assert_eq!(request_path, expected_path);
+            assert!(request_path.starts_with("file:"));
+
+            let response = serde_json::to_value(FsHelperResponse::Ok(
+                FsHelperPayload::Canonicalize(FsCanonicalizeResponse { path }),
+            ))?;
+            assert_eq!(
+                response,
+                json!({
+                    "status": "ok",
+                    "payload": {
+                        "operation": FS_CANONICALIZE_METHOD,
+                        "response": {
+                            "path": expected_path.as_str(),
+                        },
+                    },
+                }),
+            );
+            let response_path = response["payload"]["response"]["path"]
+                .as_str()
+                .expect("canonicalize response path should be a string");
+            assert_eq!(response_path, expected_path);
+            assert!(response_path.starts_with("file:"));
+        }
+
         Ok(())
     }
 }

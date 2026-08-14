@@ -1,10 +1,8 @@
 use super::LocalThreadStore;
 use crate::CreateThreadParams;
-use crate::ThreadEventPersistenceMode;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 use codex_protocol::protocol::ThreadMemoryMode;
-use codex_rollout::EventPersistenceMode;
 use codex_rollout::RolloutConfig;
 use codex_rollout::RolloutRecorder;
 use codex_rollout::RolloutRecorderParams;
@@ -22,36 +20,33 @@ pub(super) async fn create_thread(
         })?;
     let config = RolloutConfig {
         codex_home: store.config.codex_home.clone(),
-        sqlite_home: store.config.sqlite_home.clone(),
+        sqlite: store.config.sqlite.clone(),
         cwd,
         model_provider_id: params.metadata.model_provider.clone(),
         generate_memories: matches!(params.metadata.memory_mode, ThreadMemoryMode::Enabled),
     };
-    let state_db_ctx = store.state_db().await;
-    let recorder = RolloutRecorder::new(
+    RolloutRecorder::new(
         &config,
         RolloutRecorderParams::new(
             params.thread_id,
             params.forked_from_id,
+            params.parent_thread_id,
             params.source,
+            params.thread_source,
+            params.originator,
             params.base_instructions,
             params.dynamic_tools,
-            event_persistence_mode(params.event_persistence_mode),
-        ),
-        state_db_ctx,
-        /*state_builder*/ None,
+        )
+        .with_session_id(params.session_id)
+        .with_selected_capability_roots(params.selected_capability_roots)
+        .with_multi_agent_version(params.multi_agent_version)
+        .with_history_mode(params.history_mode)
+        .with_history_base(params.history_base)
+        .with_subagent_history_start_ordinal(params.subagent_history_start_ordinal)
+        .with_initial_window_id(params.initial_window_id),
     )
     .await
     .map_err(|err| ThreadStoreError::Internal {
         message: format!("failed to initialize local thread recorder: {err}"),
-    })?;
-
-    Ok(recorder)
-}
-
-pub(super) fn event_persistence_mode(mode: ThreadEventPersistenceMode) -> EventPersistenceMode {
-    match mode {
-        ThreadEventPersistenceMode::Limited => EventPersistenceMode::Limited,
-        ThreadEventPersistenceMode::Extended => EventPersistenceMode::Extended,
-    }
+    })
 }

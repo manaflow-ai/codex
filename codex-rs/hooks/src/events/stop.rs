@@ -11,13 +11,14 @@ use codex_protocol::protocol::HookRunSummary;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
 use super::common;
-use crate::engine::CommandShell;
+use crate::engine::ClaudeHooksEngine;
 use crate::engine::ConfiguredHandler;
-use crate::engine::command_runner::CommandRunResult;
+use crate::engine::HandlerRunResult;
 use crate::engine::dispatcher;
 use crate::engine::output_parser;
 use crate::schema::NullableString;
 use crate::schema::StopCommandInput;
+use crate::schema::SubagentStopCommandInput;
 
 #[derive(Debug, Clone)]
 pub struct StopRequest {
@@ -29,9 +30,36 @@ pub struct StopRequest {
     pub permission_mode: String,
     pub stop_hook_active: bool,
     pub last_assistant_message: Option<String>,
+    pub target: StopHookTarget,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+pub enum StopHookTarget {
+    Stop,
+    SubagentStop {
+        agent_id: String,
+        agent_type: String,
+        agent_transcript_path: Option<PathBuf>,
+    },
+}
+
+impl StopHookTarget {
+    fn event_name(&self) -> HookEventName {
+        match self {
+            Self::Stop => HookEventName::Stop,
+            Self::SubagentStop { .. } => HookEventName::SubagentStop,
+        }
+    }
+
+    fn matcher_input(&self) -> Option<&str> {
+        match self {
+            Self::Stop => None,
+            Self::SubagentStop { agent_type, .. } => Some(agent_type.as_str()),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
 pub struct StopOutcome {
     pub hook_events: Vec<HookCompletedEvent>,
     pub should_stop: bool,
@@ -52,21 +80,24 @@ struct StopHandlerData {
 
 pub(crate) fn preview(
     handlers: &[ConfiguredHandler],
-    _request: &StopRequest,
+    request: &StopRequest,
 ) -> Vec<HookRunSummary> {
-    dispatcher::select_handlers(handlers, HookEventName::Stop, /*matcher_input*/ None)
-        .into_iter()
-        .map(|handler| dispatcher::running_summary(&handler))
-        .collect()
+    dispatcher::select_handlers(
+        handlers,
+        request.target.event_name(),
+        request.target.matcher_input(),
+    )
+    .into_iter()
+    .map(|handler| dispatcher::running_summary(&handler))
+    .collect()
 }
 
-pub(crate) async fn run(
-    handlers: &[ConfiguredHandler],
-    shell: &CommandShell,
-    request: StopRequest,
-) -> StopOutcome {
-    let matched =
-        dispatcher::select_handlers(handlers, HookEventName::Stop, /*matcher_input*/ None);
+pub(crate) async fn run(engine: &ClaudeHooksEngine, request: StopRequest) -> StopOutcome {
+    let matched = dispatcher::select_handlers(
+        &engine.handlers,
+        request.target.event_name(),
+        request.target.matcher_input(),
+    );
     if matched.is_empty() {
         return StopOutcome {
             hook_events: Vec::new(),
@@ -78,29 +109,72 @@ pub(crate) async fn run(
         };
     }
 
-    let input_json = match serde_json::to_string(&StopCommandInput {
-        session_id: request.session_id.to_string(),
-        turn_id: request.turn_id.clone(),
-        transcript_path: NullableString::from_path(request.transcript_path.clone()),
-        cwd: request.cwd.display().to_string(),
-        hook_event_name: "Stop".to_string(),
-        model: request.model.clone(),
-        permission_mode: request.permission_mode.clone(),
-        stop_hook_active: request.stop_hook_active,
-        last_assistant_message: NullableString::from_string(request.last_assistant_message.clone()),
-    }) {
-        Ok(input_json) => input_json,
-        Err(error) => {
-            return serialization_failure_outcome(common::serialization_failure_hook_events(
-                matched,
-                Some(request.turn_id),
-                format!("failed to serialize stop hook input: {error}"),
-            ));
+    let input_json = match request.target {
+        StopHookTarget::Stop => {
+            let input = StopCommandInput {
+                session_id: request.session_id.to_string(),
+                turn_id: request.turn_id.clone(),
+                transcript_path: NullableString::from_path(request.transcript_path.clone()),
+                cwd: request.cwd.display().to_string(),
+                hook_event_name: "Stop".to_string(),
+                model: request.model.clone(),
+                permission_mode: request.permission_mode.clone(),
+                stop_hook_active: request.stop_hook_active,
+                last_assistant_message: NullableString::from_string(
+                    request.last_assistant_message.clone(),
+                ),
+            };
+            match serde_json::to_string(&input) {
+                Ok(input_json) => input_json,
+                Err(error) => {
+                    return serialization_failure_outcome(
+                        common::serialization_failure_hook_events(
+                            matched,
+                            Some(request.turn_id),
+                            format!("failed to serialize stop hook input: {error}"),
+                        ),
+                    );
+                }
+            }
+        }
+        StopHookTarget::SubagentStop {
+            agent_id,
+            agent_type,
+            agent_transcript_path,
+        } => {
+            let input = SubagentStopCommandInput {
+                session_id: request.session_id.to_string(),
+                turn_id: request.turn_id.clone(),
+                transcript_path: NullableString::from_path(request.transcript_path.clone()),
+                agent_transcript_path: NullableString::from_path(agent_transcript_path),
+                cwd: request.cwd.display().to_string(),
+                hook_event_name: "SubagentStop".to_string(),
+                model: request.model.clone(),
+                permission_mode: request.permission_mode.clone(),
+                stop_hook_active: request.stop_hook_active,
+                agent_id,
+                agent_type,
+                last_assistant_message: NullableString::from_string(
+                    request.last_assistant_message.clone(),
+                ),
+            };
+            match serde_json::to_string(&input) {
+                Ok(input_json) => input_json,
+                Err(error) => {
+                    return serialization_failure_outcome(
+                        common::serialization_failure_hook_events(
+                            matched,
+                            Some(request.turn_id),
+                            format!("failed to serialize subagent stop hook input: {error}"),
+                        ),
+                    );
+                }
+            }
         }
     };
 
     let results = dispatcher::execute_handlers(
-        shell,
+        engine,
         matched,
         input_json,
         request.cwd.as_path(),
@@ -123,7 +197,7 @@ pub(crate) async fn run(
 
 fn parse_completed(
     handler: &ConfiguredHandler,
-    run_result: CommandRunResult,
+    run_result: HandlerRunResult,
     turn_id: Option<String>,
 ) -> dispatcher::ParsedHandler<StopHandlerData> {
     let mut entries = Vec::new();
@@ -133,6 +207,12 @@ fn parse_completed(
     let mut should_block = false;
     let mut block_reason = None;
     let mut continuation_prompt = None;
+    let hook_event_name = match handler.event_name {
+        HookEventName::Stop | HookEventName::SubagentStop => handler.event_name,
+        event_name => {
+            panic!("expected stop hook event, got {event_name:?}");
+        }
+    };
 
     match run_result.error.as_deref() {
         Some(error) => {
@@ -146,7 +226,13 @@ fn parse_completed(
             Some(0) => {
                 let trimmed_stdout = run_result.stdout.trim();
                 if trimmed_stdout.is_empty() {
-                } else if let Some(parsed) = output_parser::parse_stop(&run_result.stdout) {
+                } else if let Some(parsed) = match hook_event_name {
+                    HookEventName::Stop => output_parser::parse_stop(&run_result.stdout),
+                    HookEventName::SubagentStop => {
+                        output_parser::parse_subagent_stop(&run_result.stdout)
+                    }
+                    _ => unreachable!("validated stop hook event"),
+                } {
                     if let Some(system_message) = parsed.universal.system_message {
                         entries.push(HookOutputEntry {
                             kind: HookOutputEntryKind::Warning,
@@ -154,25 +240,26 @@ fn parse_completed(
                         });
                     }
                     let _ = parsed.universal.suppress_output;
-                    if !parsed.universal.continue_processing {
-                        status = HookRunStatus::Stopped;
-                        should_stop = true;
-                        stop_reason = parsed.universal.stop_reason.clone();
-                        if let Some(stop_reason_text) = parsed.universal.stop_reason {
+                    if handler.can_apply_control_effects() {
+                        if !parsed.universal.continue_processing {
+                            status = HookRunStatus::Stopped;
+                            should_stop = true;
+                            stop_reason = parsed.universal.stop_reason.clone();
+                            if let Some(stop_reason_text) = parsed.universal.stop_reason {
+                                entries.push(HookOutputEntry {
+                                    kind: HookOutputEntryKind::Stop,
+                                    text: stop_reason_text,
+                                });
+                            }
+                        } else if let Some(invalid_block_reason) = parsed.invalid_block_reason {
+                            status = HookRunStatus::Failed;
                             entries.push(HookOutputEntry {
-                                kind: HookOutputEntryKind::Stop,
-                                text: stop_reason_text,
+                                kind: HookOutputEntryKind::Error,
+                                text: invalid_block_reason,
                             });
-                        }
-                    } else if let Some(invalid_block_reason) = parsed.invalid_block_reason {
-                        status = HookRunStatus::Failed;
-                        entries.push(HookOutputEntry {
-                            kind: HookOutputEntryKind::Error,
-                            text: invalid_block_reason,
-                        });
-                    } else if parsed.should_block {
-                        if let Some(reason) =
-                            parsed.reason.as_deref().and_then(common::trimmed_non_empty)
+                        } else if parsed.should_block
+                            && let Some(reason) =
+                                parsed.reason.as_deref().and_then(common::trimmed_non_empty)
                         {
                             status = HookRunStatus::Blocked;
                             should_block = true;
@@ -182,25 +269,26 @@ fn parse_completed(
                                 kind: HookOutputEntryKind::Feedback,
                                 text: reason,
                             });
-                        } else {
-                            status = HookRunStatus::Failed;
-                            entries.push(HookOutputEntry {
-                                kind: HookOutputEntryKind::Error,
-                                text:
-                                    "Stop hook returned decision:block without a non-empty reason"
-                                        .to_string(),
-                            });
                         }
                     }
-                } else {
+                } else if handler.can_apply_control_effects()
+                    || output_parser::looks_like_json(&run_result.stdout)
+                {
                     status = HookRunStatus::Failed;
                     entries.push(HookOutputEntry {
                         kind: HookOutputEntryKind::Error,
-                        text: "hook returned invalid stop hook JSON output".to_string(),
+                        text: match hook_event_name {
+                            HookEventName::Stop => "hook returned invalid stop hook JSON output",
+                            HookEventName::SubagentStop => {
+                                "hook returned invalid subagent stop hook JSON output"
+                            }
+                            _ => unreachable!("validated stop hook event"),
+                        }
+                        .to_string(),
                     });
                 }
             }
-            Some(2) => {
+            Some(2) if handler.can_apply_control_effects() => {
                 if let Some(reason) = common::trimmed_non_empty(&run_result.stderr) {
                     status = HookRunStatus::Blocked;
                     should_block = true;
@@ -214,9 +302,16 @@ fn parse_completed(
                     status = HookRunStatus::Failed;
                     entries.push(HookOutputEntry {
                         kind: HookOutputEntryKind::Error,
-                        text:
-                            "Stop hook exited with code 2 but did not write a continuation prompt to stderr"
-                                .to_string(),
+                        text: match hook_event_name {
+                            HookEventName::Stop => {
+                                "Stop hook exited with code 2 but did not write a continuation prompt to stderr"
+                            }
+                            HookEventName::SubagentStop => {
+                                "SubagentStop hook exited with code 2 but did not write a continuation prompt to stderr"
+                            }
+                            _ => unreachable!("validated stop hook event"),
+                        }
+                        .to_string(),
                     });
                 }
             }
@@ -259,6 +354,7 @@ fn parse_completed(
             block_reason,
             continuation_fragments,
         },
+        completion_order: 0,
     }
 }
 
@@ -325,7 +421,7 @@ mod tests {
     use super::aggregate_results;
     use super::parse_completed;
     use crate::engine::ConfiguredHandler;
-    use crate::engine::command_runner::CommandRunResult;
+    use crate::engine::HandlerRunResult;
 
     #[test]
     fn block_decision_with_reason_sets_continuation_prompt() {
@@ -372,6 +468,15 @@ mod tests {
                 text: "Stop hook returned decision:block without a non-empty reason".to_string(),
             }]
         );
+
+        let async_handler = handler_with_async(/*async*/ true);
+        let parsed = parse_completed(
+            &async_handler,
+            run_result(Some(0), r#"{"decision":"block"}"#, ""),
+            Some("turn-1".to_string()),
+        );
+        assert_eq!(parsed.completed.run.status, HookRunStatus::Completed);
+        assert_eq!(parsed.completed.run.entries, Vec::new());
     }
 
     #[test]
@@ -480,6 +585,15 @@ mod tests {
                 text: "hook returned invalid stop hook JSON output".to_string(),
             }]
         );
+
+        let async_handler = handler_with_async(/*async*/ true);
+        let parsed = parse_completed(
+            &async_handler,
+            run_result(Some(0), "not json", ""),
+            Some("turn-1".to_string()),
+        );
+        assert_eq!(parsed.completed.run.status, HookRunStatus::Completed);
+        assert_eq!(parsed.completed.run.entries, Vec::new());
     }
 
     #[test]
@@ -521,21 +635,29 @@ mod tests {
     }
 
     fn handler() -> ConfiguredHandler {
+        handler_with_async(/*async*/ false)
+    }
+
+    fn handler_with_async(r#async: bool) -> ConfiguredHandler {
         ConfiguredHandler {
             event_name: HookEventName::Stop,
             matcher: None,
-            command: "echo hook".to_string(),
             timeout_sec: 600,
             status_message: None,
+            additional_context_limit: Default::default(),
             source_path: test_path_buf("/tmp/hooks.json").abs(),
             source: codex_protocol::protocol::HookSource::User,
             display_order: 0,
-            env: std::collections::HashMap::new(),
+            kind: crate::engine::ConfiguredHandlerKind::Command {
+                command: "echo hook".to_string(),
+                r#async,
+                env: std::collections::HashMap::new(),
+            },
         }
     }
 
-    fn run_result(exit_code: Option<i32>, stdout: &str, stderr: &str) -> CommandRunResult {
-        CommandRunResult {
+    fn run_result(exit_code: Option<i32>, stdout: &str, stderr: &str) -> HandlerRunResult {
+        HandlerRunResult {
             started_at: 1,
             completed_at: 2,
             duration_ms: 1,

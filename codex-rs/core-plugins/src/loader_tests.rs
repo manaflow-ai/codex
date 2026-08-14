@@ -1,82 +1,388 @@
 use super::*;
 use crate::manifest::load_plugin_manifest;
+use crate::manifest::load_plugin_manifest_with_format;
+use crate::test_support::test_skill_root_loader;
+use crate::test_support::write_file;
+use codex_config::ConfigLayerEntry;
+use codex_config::ConfigLayerSource;
+use codex_config::ConfigRequirements;
+use codex_config::ConfigRequirementsToml;
 use codex_plugin::PluginId;
+use codex_utils_plugins::AGENT_PLUGIN_SCHEMA_URI;
 use pretty_assertions::assert_eq;
+use tempfile::TempDir;
 
-#[test]
-fn plugin_mcp_file_supports_mcp_servers_object_format() {
-    let parsed = serde_json::from_str::<PluginMcpFile>(
-        r#"{
-  "mcpServers": {
-    "sample": {
-      "command": "sample-mcp"
-    }
-  }
-}"#,
+fn user_config_path(temp_dir: &TempDir, file_name: &str) -> AbsolutePathBuf {
+    AbsolutePathBuf::from_absolute_path(temp_dir.path().join(file_name))
+        .expect("test user config path should be absolute")
+}
+
+fn user_layer(path: AbsolutePathBuf, config: &str) -> ConfigLayerEntry {
+    ConfigLayerEntry::new(
+        ConfigLayerSource::User {
+            file: path,
+            profile: None,
+        },
+        toml::from_str(config).expect("user config toml"),
     )
-    .expect("parse wrapped plugin mcp config")
-    .into_mcp_servers();
+}
+
+#[tokio::test]
+async fn agent_plugin_overlay_apps_are_not_runtime_active() {
+    let temp_dir = TempDir::new().expect("tempdir");
+    let plugin_root = temp_dir.path().join("plugin");
+    write_file(
+        &plugin_root.join("plugin.json"),
+        &format!(r#"{{"$schema":"{AGENT_PLUGIN_SCHEMA_URI}","name":"plugin"}}"#),
+    );
+    write_file(
+        &plugin_root.join(".codex-plugin/plugin.json"),
+        r#"{"name":"plugin","apps":"./.app.json"}"#,
+    );
+    write_file(
+        &plugin_root.join(".app.json"),
+        r#"{"apps":{"example":{"id":"connector_example"}}}"#,
+    );
+
+    assert!(load_plugin_apps(&plugin_root).await.is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn agent_plugin_mcp_rejects_config_symlink_outside_plugin_root() {
+    let temp_dir = TempDir::new().expect("tempdir");
+    let plugin_root = temp_dir.path().join("plugin");
+    let outside_config = temp_dir.path().join("outside-mcp.json");
+    fs::create_dir_all(&plugin_root).expect("create plugin root");
+    fs::write(
+        plugin_root.join("plugin.json"),
+        format!(r#"{{"$schema":"{AGENT_PLUGIN_SCHEMA_URI}","name":"plugin"}}"#),
+    )
+    .expect("write Agent Plugins manifest");
+    fs::write(
+        &outside_config,
+        r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/mcp.schema.json","mcpServers":{"outside":{"type":"stdio","command":"echo"}}}"#,
+    )
+    .expect("write outside MCP config");
+    std::os::unix::fs::symlink(&outside_config, plugin_root.join("mcp.json"))
+        .expect("create MCP symlink");
+    let config_path = AbsolutePathBuf::from_absolute_path(plugin_root.join("mcp.json"))
+        .expect("absolute MCP path");
+
+    let discovered = load_mcp_servers_from_file(
+        &plugin_root,
+        /*plugin_data_root*/ None,
+        PluginManifestFormat::AgentPlugin,
+        &config_path,
+    )
+    .await;
+
+    assert!(discovered.mcp_servers.is_empty());
+}
+
+#[tokio::test]
+async fn agent_plugin_mcp_rejects_present_nonregular_config() {
+    let temp_dir = TempDir::new().expect("tempdir");
+    let plugin_root = temp_dir.path().join("plugin");
+    let config_path = plugin_root.join("mcp.json");
+    fs::create_dir_all(&config_path).expect("create nonregular MCP config");
+
+    let discovered = load_mcp_servers_from_file(
+        &plugin_root,
+        /*plugin_data_root*/ None,
+        PluginManifestFormat::AgentPlugin,
+        &AbsolutePathBuf::from_absolute_path(config_path).expect("absolute MCP path"),
+    )
+    .await;
+
+    assert!(discovered.mcp_servers.is_empty());
+}
+
+#[tokio::test]
+async fn legacy_manifest_can_point_at_root_mcp_json() {
+    let temp_dir = TempDir::new().expect("tempdir");
+    let plugin_root = temp_dir.path().join("plugin");
+    fs::create_dir_all(plugin_root.join(".codex-plugin")).expect("create manifest directory");
+    fs::write(
+        plugin_root.join(".codex-plugin/plugin.json"),
+        r#"{"name":"plugin","mcpServers":"./mcp.json"}"#,
+    )
+    .expect("write legacy manifest");
+    fs::write(
+        plugin_root.join("mcp.json"),
+        r#"{"mcpServers":{"legacy":{"command":"echo"}}}"#,
+    )
+    .expect("write legacy MCP config");
+    let manifest = load_plugin_manifest(&plugin_root).expect("load legacy manifest");
+
+    let discovered = load_plugin_mcp_servers_from_manifest_with_format(
+        &plugin_root,
+        &manifest.paths,
+        /*plugin_policy*/ None,
+        /*plugin_data_root*/ None,
+        PluginManifestFormat::Legacy,
+    )
+    .await;
 
     assert_eq!(
-        parsed,
-        HashMap::from([(
-            "sample".to_string(),
-            serde_json::json!({
-                "command": "sample-mcp"
-            }),
-        )])
+        discovered.keys().collect::<Vec<_>>(),
+        vec![&"legacy".to_string()]
     );
 }
 
-#[test]
-fn plugin_mcp_file_supports_mcp_servers_object_format_with_metadata() {
-    let parsed = serde_json::from_str::<PluginMcpFile>(
+#[tokio::test]
+async fn installed_agent_plugin_uses_isolated_data_root_for_stdio_mcp() {
+    let temp_dir = TempDir::new().expect("tempdir");
+    let plugin_root = temp_dir.path().join("plugins/cache/c/a-b/local");
+    write_file(
+        &plugin_root.join("plugin.json"),
+        &format!(r#"{{"$schema":"{AGENT_PLUGIN_SCHEMA_URI}","name":"a-b"}}"#),
+    );
+    write_file(
+        &plugin_root.join("mcp.json"),
         r#"{
-  "$schema": "https://example.com/plugin-mcp.schema.json",
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
   "mcpServers": {
-    "sample": {
-      "command": "sample-mcp"
+    "example": {
+      "type": "stdio",
+      "command": "echo"
     }
   }
 }"#,
-    )
-    .expect("parse plugin mcp config with metadata")
-    .into_mcp_servers();
-
-    assert_eq!(
-        parsed,
-        HashMap::from([(
-            "sample".to_string(),
-            serde_json::json!({
-                "command": "sample-mcp"
-            }),
-        )])
     );
+    let stack = ConfigLayerStack::new(
+        vec![user_layer(
+            user_config_path(&temp_dir, "config.toml"),
+            "[plugins.\"a-b@c\"]\nenabled = true\n",
+        )],
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )
+    .expect("valid config layer stack");
+    let store = PluginStore::new(temp_dir.path().to_path_buf());
+
+    let plugins = load_plugins_from_layer_stack(
+        &stack,
+        RemoteInstalledPluginsSnapshot::default(),
+        &store,
+        /*plugin_skill_snapshots*/ None,
+        Some(Product::Codex),
+        /*remote_global_catalog_active*/ false,
+        test_skill_root_loader().as_ref(),
+    )
+    .await;
+
+    let expected_data_root = temp_dir
+        .path()
+        .join("plugins")
+        .join("data")
+        .join("agent-plugins")
+        .join("6920dd17774030852d11d1b94758fcaae4f894c7b2f36301ed174bc3b33e0743");
+    let expected_data_root = AbsolutePathBuf::from_absolute_path(expected_data_root)
+        .expect("absolute Agent Plugin data root")
+        .canonicalize()
+        .expect("canonical Agent Plugin data root");
+    let server = plugins
+        .first()
+        .and_then(|plugin| plugin.mcp_servers.get("example"))
+        .expect("Agent plugin stdio MCP server");
+    let McpServerTransportConfig::Stdio { env, .. } = &server.transport else {
+        panic!("expected stdio MCP server");
+    };
+    assert_eq!(
+        env.as_ref()
+            .and_then(|env| env.get("PLUGIN_DATA"))
+            .map(String::as_str),
+        expected_data_root.as_path().to_str()
+    );
+    assert!(expected_data_root.as_path().is_dir());
 }
 
 #[test]
-fn plugin_mcp_file_supports_top_level_server_map_format() {
-    let parsed = serde_json::from_str::<PluginMcpFile>(
-        r#"{
-  "linear": {
-    "type": "http",
-    "url": "https://mcp.linear.app/mcp"
-  }
-}"#,
+fn configured_plugins_from_stack_merges_user_layers() {
+    let temp_dir = TempDir::new().expect("tempdir");
+    let stack = ConfigLayerStack::new(
+        vec![
+            user_layer(
+                user_config_path(&temp_dir, "config.toml"),
+                "[plugins.base]\nenabled = true\n",
+            ),
+            user_layer(
+                user_config_path(&temp_dir, "work.config.toml"),
+                "[plugins.profile]\nenabled = false\n",
+            ),
+        ],
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
     )
-    .expect("parse flat plugin mcp config")
-    .into_mcp_servers();
+    .expect("valid config layer stack");
+
+    let plugins = configured_plugins_from_stack(&stack, temp_dir.path());
 
     assert_eq!(
-        parsed,
-        HashMap::from([(
-            "linear".to_string(),
-            serde_json::json!({
-                "type": "http",
-                "url": "https://mcp.linear.app/mcp"
-            }),
-        )])
+        plugins,
+        HashMap::from([
+            (
+                "base".to_string(),
+                PluginConfig {
+                    enabled: true,
+                    mcp_servers: HashMap::new(),
+                },
+            ),
+            (
+                "profile".to_string(),
+                PluginConfig {
+                    enabled: false,
+                    mcp_servers: HashMap::new(),
+                },
+            ),
+        ])
     );
+}
+
+#[tokio::test]
+async fn hooks_only_scope_shares_plugin_resolution_without_loading_other_capabilities() {
+    let temp_dir = TempDir::new().expect("tempdir");
+    let plugin_root = temp_dir.path().join("plugins/cache/test/valid/local");
+    write_file(
+        &plugin_root.join(".codex-plugin/plugin.json"),
+        r#"{"name":"valid"}"#,
+    );
+    write_file(
+        &plugin_root.join("skills/example/SKILL.md"),
+        "---\nname: example\ndescription: example skill\n---\n",
+    );
+    write_file(
+        &plugin_root.join(".mcp.json"),
+        r#"{"mcpServers":{"example":{"command":"echo"}}}"#,
+    );
+    write_file(
+        &plugin_root.join(".app.json"),
+        r#"{"apps":{"example":{"id":"connector_example"}}}"#,
+    );
+    write_file(
+        &plugin_root.join("hooks/hooks.json"),
+        r#"{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo startup"
+          }
+        ]
+      }
+    ]
+  }
+}"#,
+    );
+
+    let disabled_root = temp_dir.path().join("plugins/cache/test/disabled/local");
+    write_file(
+        &disabled_root.join(".codex-plugin/plugin.json"),
+        r#"{"name":"disabled"}"#,
+    );
+    write_file(
+        &disabled_root.join("hooks/hooks.json"),
+        r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"echo disabled"}]}]}}"#,
+    );
+
+    let malformed_root = temp_dir.path().join("plugins/cache/test/malformed/local");
+    write_file(
+        &malformed_root.join(".codex-plugin/plugin.json"),
+        "not valid json",
+    );
+
+    let warning_root = temp_dir.path().join("plugins/cache/test/warning/local");
+    write_file(
+        &warning_root.join(".codex-plugin/plugin.json"),
+        r#"{"name":"warning"}"#,
+    );
+    write_file(&warning_root.join("hooks/hooks.json"), "not valid json");
+
+    let stack = ConfigLayerStack::new(
+        vec![user_layer(
+            user_config_path(&temp_dir, "config.toml"),
+            r#"
+[plugins."valid@test"]
+enabled = true
+
+[plugins."disabled@test"]
+enabled = false
+
+[plugins.invalid]
+enabled = true
+
+[plugins."malformed@test"]
+enabled = true
+
+[plugins."missing@test"]
+enabled = true
+
+[plugins."warning@test"]
+enabled = true
+"#,
+        )],
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )
+    .expect("valid config layer stack");
+    let store = PluginStore::new(temp_dir.path().to_path_buf());
+
+    let full = load_plugins_from_layer_stack(
+        &stack,
+        RemoteInstalledPluginsSnapshot::default(),
+        &store,
+        /*plugin_skill_snapshots*/ None,
+        Some(Product::Codex),
+        /*remote_global_catalog_active*/ false,
+        test_skill_root_loader().as_ref(),
+    )
+    .await;
+    let hooks_only = load_plugins_from_layer_stack_with_scope(
+        &stack,
+        HashMap::new(),
+        &store,
+        /*remote_global_catalog_active*/ false,
+        PluginLoadScope::HooksOnly,
+    )
+    .await;
+
+    let validation_state = |plugins: &[LoadedPlugin<McpServerConfig>]| {
+        plugins
+            .iter()
+            .map(|plugin| {
+                (
+                    plugin.config_name.clone(),
+                    plugin.enabled,
+                    plugin.root.clone(),
+                    plugin.error.clone(),
+                    plugin.hook_sources.clone(),
+                    plugin.hook_load_warnings.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(validation_state(&hooks_only), validation_state(&full));
+
+    let full_valid = full
+        .iter()
+        .find(|plugin| plugin.config_name == "valid@test")
+        .expect("full load should include valid plugin");
+    assert!(full_valid.manifest_name.is_some());
+    assert!(!full_valid.skill_roots.is_empty());
+    assert!(!full_valid.mcp_servers.is_empty());
+    assert!(!full_valid.apps.is_empty());
+
+    let hooks_only_valid = hooks_only
+        .iter()
+        .find(|plugin| plugin.config_name == "valid@test")
+        .expect("hooks-only load should include valid plugin");
+    assert_eq!(hooks_only_valid.manifest_name, None);
+    assert!(hooks_only_valid.skill_roots.is_empty());
+    assert!(hooks_only_valid.mcp_servers.is_empty());
+    assert!(hooks_only_valid.apps.is_empty());
 }
 
 #[test]
@@ -132,7 +438,8 @@ fn write_hook_file(plugin_root: &AbsolutePathBuf, relative_path: &str, event: &s
 }
 
 fn load_sources(plugin_root: &AbsolutePathBuf) -> (Vec<PluginHookSource>, Vec<String>) {
-    let manifest = load_plugin_manifest(plugin_root.as_path()).expect("manifest");
+    let loaded_manifest =
+        load_plugin_manifest_with_format(plugin_root.as_path()).expect("manifest");
     let plugin_data_root = AbsolutePathBuf::try_from(
         plugin_root
             .as_path()
@@ -145,7 +452,7 @@ fn load_sources(plugin_root: &AbsolutePathBuf) -> (Vec<PluginHookSource>, Vec<St
         plugin_root,
         &plugin_id(),
         &plugin_data_root,
-        &manifest.paths,
+        &loaded_manifest.manifest.paths,
     )
 }
 
@@ -341,6 +648,7 @@ fn materialize_git_subdir_uses_sparse_checkout() {
     run_git(&["config", "user.name", "Test User"], Some(repo.path())).expect("configure git name");
     run_git(&["add", "."], Some(repo.path())).expect("stage git repo");
     run_git(&["commit", "-m", "init"], Some(repo.path())).expect("commit git repo");
+    let sha = run_git_output(&["rev-parse", "HEAD"], Some(repo.path())).expect("resolve commit");
 
     let materialized = materialize_marketplace_plugin_source(
         codex_home.path(),
@@ -348,7 +656,7 @@ fn materialize_git_subdir_uses_sparse_checkout() {
             url: repo.path().display().to_string(),
             path: Some("plugins/toolkit".to_string()),
             ref_name: None,
-            sha: None,
+            sha: Some(sha),
         },
     )
     .expect("materialize git source");
@@ -366,4 +674,47 @@ fn materialize_git_subdir_uses_sparse_checkout() {
         .expect("materialized path should be nested under checkout root");
     assert!(!checkout_root.join("root.txt").exists());
     assert!(!checkout_root.join("plugins/other/marker.txt").exists());
+}
+
+#[test]
+fn materialize_git_source_rejects_sha_that_resolves_to_hostile_default_branch() {
+    let codex_home = tempfile::tempdir().expect("create codex home");
+    let repo = tempfile::tempdir().expect("create git repo");
+    run_git(&["init"], Some(repo.path())).expect("init git repo");
+    run_git(
+        &["config", "user.email", "test@example.com"],
+        Some(repo.path()),
+    )
+    .expect("configure git email");
+    run_git(&["config", "user.name", "Test User"], Some(repo.path())).expect("configure git name");
+
+    fs::write(repo.path().join("marker.txt"), "benign").expect("write benign marker");
+    run_git(&["add", "."], Some(repo.path())).expect("stage git repo");
+    run_git(&["commit", "-m", "benign"], Some(repo.path())).expect("commit benign revision");
+    let benign_sha =
+        run_git_output(&["rev-parse", "HEAD"], Some(repo.path())).expect("resolve commit A");
+
+    fs::write(repo.path().join("marker.txt"), "malicious").expect("write malicious marker");
+    run_git(&["add", "."], Some(repo.path())).expect("stage malicious revision");
+    run_git(&["commit", "-m", "malicious"], Some(repo.path())).expect("commit malicious revision");
+    let malicious_sha =
+        run_git_output(&["rev-parse", "HEAD"], Some(repo.path())).expect("resolve commit B");
+    run_git(&["branch", "-m", &benign_sha], Some(repo.path()))
+        .expect("name default branch after commit A");
+
+    let err = materialize_marketplace_plugin_source(
+        codex_home.path(),
+        &MarketplacePluginSource::Git {
+            url: repo.path().display().to_string(),
+            path: None,
+            ref_name: None,
+            sha: Some(benign_sha.clone()),
+        },
+    )
+    .expect_err("hostile default branch must not satisfy SHA pinning");
+
+    assert_eq!(
+        err,
+        format!("checked out Git SHA {malicious_sha} does not match requested SHA {benign_sha}")
+    );
 }

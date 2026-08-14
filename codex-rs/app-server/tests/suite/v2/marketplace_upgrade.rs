@@ -4,9 +4,8 @@ use std::time::Duration;
 
 use anyhow::Context;
 use anyhow::Result;
-use app_test_support::McpProcess;
-use app_test_support::to_response;
-use codex_app_server_protocol::JSONRPCResponse;
+use app_test_support::TestAppServer;
+use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::MarketplaceUpgradeParams;
 use codex_app_server_protocol::MarketplaceUpgradeResponse;
 use codex_app_server_protocol::RequestId;
@@ -127,21 +126,16 @@ fn expected_installed_root(codex_home: &Path, marketplace_name: &str) -> Result<
 }
 
 async fn send_marketplace_upgrade(
-    mcp: &mut McpProcess,
+    mcp: &mut TestAppServer,
     marketplace_name: Option<&str>,
 ) -> Result<MarketplaceUpgradeResponse> {
-    let request_id = mcp
-        .send_marketplace_upgrade_request(MarketplaceUpgradeParams {
+    mcp.request(|request_id| ClientRequest::MarketplaceUpgrade {
+        request_id,
+        params: MarketplaceUpgradeParams {
             marketplace_name: marketplace_name.map(str::to_string),
-        })
-        .await?;
-
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    to_response(response)
+        },
+    })
+    .await
 }
 
 #[tokio::test]
@@ -169,8 +163,11 @@ async fn marketplace_upgrade_all_configured_git_marketplaces() -> Result<()> {
     )?;
     disable_plugin_startup_tasks(codex_home.path())?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized()
+        .await?;
 
     let debug_root = expected_installed_root(codex_home.path(), "debug")?;
     let tools_root = expected_installed_root(codex_home.path(), "tools")?;
@@ -223,8 +220,11 @@ async fn marketplace_upgrade_named_marketplace_only() -> Result<()> {
     )?;
     disable_plugin_startup_tasks(codex_home.path())?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized()
+        .await?;
 
     let tools_root = expected_installed_root(codex_home.path(), "tools")?;
     let response = send_marketplace_upgrade(&mut mcp, Some("tools")).await?;
@@ -264,8 +264,11 @@ async fn marketplace_upgrade_returns_empty_roots_when_already_up_to_date() -> Re
     )?;
     disable_plugin_startup_tasks(codex_home.path())?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized()
+        .await?;
     let first_response = send_marketplace_upgrade(&mut mcp, Some("debug")).await?;
     assert!(first_response.errors.is_empty());
 
@@ -292,8 +295,11 @@ async fn marketplace_upgrade_rejects_unknown_or_non_git_marketplace() -> Result<
         &configured_local_marketplace_update(&local_source.path().display().to_string()),
     )?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized()
+        .await?;
 
     for marketplace_name in ["missing", "local-only"] {
         let request_id = mcp

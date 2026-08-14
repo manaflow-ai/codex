@@ -16,11 +16,23 @@ pub enum ConstraintError {
         requirement_source: RequirementSource,
     },
 
+    #[error("To use model `{model}`, you need to use auto review.")]
+    AutoReviewRequired { model: String },
+
     #[error("field `{field_name}` cannot be empty")]
     EmptyField { field_name: String },
 
     #[error("invalid rules in requirements (set by {requirement_source}): {reason}")]
     ExecPolicyParse {
+        requirement_source: RequirementSource,
+        reason: String,
+    },
+
+    #[error(
+        "invalid requirement for MCP server `{server_name}` (set by {requirement_source}): {reason}"
+    )]
+    McpServerRequirementParse {
+        server_name: String,
         requirement_source: RequirementSource,
         reason: String,
     },

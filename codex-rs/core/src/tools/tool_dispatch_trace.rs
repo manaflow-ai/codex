@@ -61,9 +61,11 @@ impl ToolDispatchTrace {
 
 fn tool_dispatch_invocation(invocation: &ToolInvocation) -> Option<ToolDispatchInvocation> {
     let requester = match &invocation.source {
-        ToolCallSource::Direct => ToolDispatchRequester::Model {
-            model_visible_call_id: invocation.call_id.clone(),
-        },
+        ToolCallSource::Direct | ToolCallSource::DirectPlaintextMessage => {
+            ToolDispatchRequester::Model {
+                model_visible_call_id: invocation.call_id.clone(),
+            }
+        }
         ToolCallSource::CodeMode {
             cell_id,
             runtime_tool_call_id,
@@ -74,11 +76,16 @@ fn tool_dispatch_invocation(invocation: &ToolInvocation) -> Option<ToolDispatchI
     };
 
     Some(ToolDispatchInvocation {
-        thread_id: invocation.session.conversation_id.to_string(),
+        thread_id: invocation.session.thread_id.to_string(),
         codex_turn_id: invocation.turn.sub_id.clone(),
         tool_call_id: invocation.call_id.clone(),
         tool_name: invocation.tool_name.name.clone(),
-        tool_namespace: invocation.tool_name.namespace.clone(),
+        tool_namespace: invocation
+            .tool_name
+            .namespace
+            .as_ref()
+            .filter(|_| !invocation.tool_name.is_default_namespace())
+            .cloned(),
         requester,
         payload: tool_dispatch_payload(&invocation.payload),
     })
@@ -91,9 +98,11 @@ fn tool_dispatch_result(
     result: &dyn ToolOutput,
 ) -> Option<ToolDispatchResult> {
     match invocation.source {
-        ToolCallSource::Direct => Some(ToolDispatchResult::DirectResponse {
-            response_item: result.to_response_item(call_id, payload),
-        }),
+        ToolCallSource::Direct | ToolCallSource::DirectPlaintextMessage => {
+            Some(ToolDispatchResult::DirectResponse {
+                response_item: result.to_response_item(call_id, payload),
+            })
+        }
         ToolCallSource::CodeMode { .. } => Some(ToolDispatchResult::CodeModeResponse {
             value: result.code_mode_result(payload),
         }),
@@ -110,24 +119,6 @@ fn tool_dispatch_payload(payload: &ToolPayload) -> ToolDispatchPayload {
         },
         ToolPayload::Custom { input } => ToolDispatchPayload::Custom {
             input: input.clone(),
-        },
-        ToolPayload::LocalShell { params } => ToolDispatchPayload::LocalShell {
-            command: params.command.clone(),
-            workdir: params.workdir.clone(),
-            timeout_ms: params.timeout_ms,
-            sandbox_permissions: params.sandbox_permissions,
-            prefix_rule: params.prefix_rule.clone(),
-            additional_permissions: params.additional_permissions.clone(),
-            justification: params.justification.clone(),
-        },
-        ToolPayload::Mcp {
-            server,
-            tool,
-            raw_arguments,
-        } => ToolDispatchPayload::Mcp {
-            server: server.clone(),
-            tool: tool.clone(),
-            raw_arguments: raw_arguments.clone(),
         },
     }
 }

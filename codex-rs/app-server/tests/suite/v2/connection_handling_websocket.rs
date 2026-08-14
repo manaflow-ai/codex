@@ -7,6 +7,7 @@ use app_test_support::to_response;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use codex_app_server_protocol::ClientInfo;
+use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCMessage;
@@ -18,6 +19,8 @@ use codex_app_server_protocol::ThreadLoadedListParams;
 use codex_app_server_protocol::ThreadLoadedListResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_core::config::set_project_trust_level;
+use codex_protocol::config_types::TrustLevel;
 use futures::SinkExt;
 use futures::StreamExt;
 use hmac::Hmac;
@@ -105,6 +108,106 @@ async fn websocket_transport_routes_per_connection_handshake_and_responses() -> 
 }
 
 #[tokio::test]
+async fn thread_start_routes_project_exec_policy_warning_to_requester() -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri(), "never")?;
+
+    let project = TempDir::new()?;
+    std::fs::create_dir(project.path().join(".git"))?;
+    let rules_dir = project.path().join(".codex/rules");
+    std::fs::create_dir_all(&rules_dir)?;
+    let rules_path = rules_dir.join("broken.rules");
+    std::fs::write(&rules_path, "prefix_rule(")?;
+    set_project_trust_level(codex_home.path(), project.path(), TrustLevel::Trusted)?;
+
+    let (mut process, bind_addr) = spawn_websocket_server(codex_home.path()).await?;
+    let mut requester = connect_websocket(bind_addr).await?;
+    let mut other_client = connect_websocket(bind_addr).await?;
+
+    send_initialize_request(&mut requester, /*id*/ 1, "requester").await?;
+    read_response_for_id(&mut requester, /*id*/ 1).await?;
+    send_initialize_request(&mut other_client, /*id*/ 2, "other_client").await?;
+    read_response_for_id(&mut other_client, /*id*/ 2).await?;
+
+    send_request(
+        &mut requester,
+        "thread/start",
+        /*id*/ 3,
+        Some(serde_json::to_value(ThreadStartParams {
+            cwd: Some(project.path().display().to_string()),
+            model: Some("mock-model".to_string()),
+            ..Default::default()
+        })?),
+    )
+    .await?;
+
+    let target_id = RequestId::Integer(3);
+    let warning_summary = "Error parsing rules; custom rules not applied.";
+    let is_exec_policy_warning = |notification: &JSONRPCNotification| {
+        notification.method == "configWarning"
+            && notification
+                .params
+                .as_ref()
+                .and_then(|params| params.get("summary"))
+                .and_then(serde_json::Value::as_str)
+                == Some(warning_summary)
+    };
+    let mut response = None;
+    let mut warning = None;
+    while response.is_none() || warning.is_none() {
+        match read_jsonrpc_message(&mut requester).await? {
+            JSONRPCMessage::Response(candidate) if candidate.id == target_id => {
+                response = Some(candidate);
+            }
+            JSONRPCMessage::Notification(candidate) if is_exec_policy_warning(&candidate) => {
+                warning = Some(candidate);
+            }
+            _ => {}
+        }
+    }
+
+    let _: ThreadStartResponse = to_response(response.context("missing thread/start response")?)?;
+    let warning: ConfigWarningNotification = serde_json::from_value(
+        warning
+            .context("missing exec-policy configWarning")?
+            .params
+            .context("configWarning should include params")?,
+    )?;
+    assert_eq!(
+        warning
+            .path
+            .as_deref()
+            .map(Path::new)
+            .and_then(Path::file_name),
+        Some(std::ffi::OsStr::new("broken.rules"))
+    );
+
+    match timeout(Duration::from_millis(250), async {
+        loop {
+            let message = read_jsonrpc_message(&mut other_client).await?;
+            if let JSONRPCMessage::Notification(notification) = message
+                && is_exec_policy_warning(&notification)
+            {
+                return Ok::<_, anyhow::Error>(notification);
+            }
+        }
+    })
+    .await
+    {
+        Ok(Ok(_)) => bail!("exec-policy configWarning leaked to another connection"),
+        Ok(Err(err)) => return Err(err),
+        Err(_) => {}
+    }
+
+    process
+        .kill()
+        .await
+        .context("failed to stop websocket app-server process")?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn websocket_transport_serves_health_endpoints_on_same_listener() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let codex_home = TempDir::new()?;
@@ -175,7 +278,7 @@ async fn websocket_transport_rejects_missing_and_invalid_capability_tokens() -> 
     ];
 
     let (mut process, bind_addr) =
-        spawn_websocket_server_with_args(codex_home.path(), "ws://127.0.0.1:0", &auth_args).await?;
+        spawn_websocket_server_with_args(codex_home.path(), "ws://0.0.0.0:0", &auth_args).await?;
 
     assert_websocket_connect_rejected(bind_addr, /*bearer_token*/ None).await?;
     assert_websocket_connect_rejected(bind_addr, Some("wrong-token")).await?;
@@ -322,24 +425,23 @@ async fn websocket_transport_rejects_short_signed_bearer_secret_configuration() 
 }
 
 #[tokio::test]
-async fn websocket_transport_allows_unauthenticated_non_loopback_startup_by_default() -> Result<()>
-{
+async fn websocket_transport_rejects_unauthenticated_non_loopback_startup() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri(), "never")?;
 
-    let (mut process, bind_addr) =
-        spawn_websocket_server_with_args(codex_home.path(), "ws://0.0.0.0:0", &[]).await?;
-
-    let mut ws = connect_websocket(bind_addr).await?;
-    send_initialize_request(&mut ws, /*id*/ 1, "ws_non_loopback_default_client").await?;
-    let init = read_response_for_id(&mut ws, /*id*/ 1).await?;
-    assert_eq!(init.id, RequestId::Integer(1));
-
-    process
-        .kill()
-        .await
-        .context("failed to stop websocket app-server process")?;
+    let output =
+        run_websocket_server_to_completion_with_args(codex_home.path(), "ws://0.0.0.0:0", &[])
+            .await?;
+    assert!(
+        !output.status.success(),
+        "unauthenticated non-loopback listener should fail websocket server startup"
+    );
+    let stderr = String::from_utf8(output.stderr).context("stderr should be valid utf-8")?;
+    assert!(
+        stderr.contains("refusing to start non-loopback websocket listener"),
+        "unexpected stderr: {stderr}"
+    );
 
     Ok(())
 }
@@ -707,7 +809,7 @@ pub(super) async fn send_request(
     send_jsonrpc(stream, message).await
 }
 
-async fn send_jsonrpc(stream: &mut WsClient, message: JSONRPCMessage) -> Result<()> {
+pub(super) async fn send_jsonrpc(stream: &mut WsClient, message: JSONRPCMessage) -> Result<()> {
     let payload = serde_json::to_string(&message)?;
     stream
         .send(WebSocketMessage::Text(payload.into()))
@@ -759,12 +861,15 @@ pub(super) async fn read_response_and_notification_for_method(
             JSONRPCMessage::Response(candidate) if candidate.id == target_id => {
                 response = Some(candidate);
             }
+            JSONRPCMessage::Notification(candidate)
+                if candidate.method == method && notification.is_some() =>
+            {
+                bail!(
+                    "received duplicate notification for method `{method}` before completing paired read"
+                );
+            }
             JSONRPCMessage::Notification(candidate) if candidate.method == method => {
-                if notification.replace(candidate).is_some() {
-                    bail!(
-                        "received duplicate notification for method `{method}` before completing paired read"
-                    );
-                }
+                notification = Some(candidate);
             }
             _ => {}
         }

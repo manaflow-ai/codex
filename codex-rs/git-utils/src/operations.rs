@@ -4,7 +4,11 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
+use codex_protocol::shell_environment::scrub_non_inheritable_env_vars;
+
 use crate::GitToolingError;
+
+const DISABLED_HOOKS_PATH: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
 
 pub(crate) fn ensure_git_repository(path: &Path) -> Result<(), GitToolingError> {
     match run_git_for_stdout(
@@ -98,7 +102,14 @@ where
 {
     let iterator = args.into_iter();
     let (lower, upper) = iterator.size_hint();
-    let mut args_vec = Vec::with_capacity(upper.unwrap_or(lower));
+    let mut args_vec = Vec::with_capacity(upper.unwrap_or(lower) + 4);
+    args_vec.push(OsString::from("-c"));
+    args_vec.push(OsString::from(crate::SAFE_BARE_REPOSITORY_CONFIG));
+    // Keep internal Git helper commands independent of configured hook directories.
+    args_vec.push(OsString::from("-c"));
+    args_vec.push(OsString::from(format!(
+        "core.hooksPath={DISABLED_HOOKS_PATH}"
+    )));
     for arg in iterator {
         args_vec.push(OsString::from(arg.as_ref()));
     }
@@ -111,6 +122,7 @@ where
         }
     }
     command.args(&args_vec);
+    scrub_non_inheritable_env_vars(&mut command);
     let output = command.output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();

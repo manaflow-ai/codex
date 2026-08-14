@@ -7,6 +7,14 @@ use codex_protocol::protocol::HookRunSummary;
 
 use crate::engine::ConfiguredHandler;
 use crate::engine::dispatcher;
+use crate::output_spill::AdditionalContext;
+
+/// Identifies a thread-spawned subagent when a normal hook runs inside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentHookContext {
+    pub agent_id: String,
+    pub agent_type: String,
+}
 
 pub(crate) fn join_text_chunks(chunks: Vec<String>) -> Option<String> {
     if chunks.is_empty() {
@@ -27,19 +35,23 @@ pub(crate) fn trimmed_non_empty(text: &str) -> Option<String> {
 
 pub(crate) fn append_additional_context(
     entries: &mut Vec<HookOutputEntry>,
-    additional_contexts_for_model: &mut Vec<String>,
+    additional_contexts_for_model: &mut Vec<AdditionalContext>,
+    handler: &ConfiguredHandler,
     additional_context: String,
 ) {
     entries.push(HookOutputEntry {
         kind: HookOutputEntryKind::Context,
         text: additional_context.clone(),
     });
-    additional_contexts_for_model.push(additional_context);
+    additional_contexts_for_model.push(AdditionalContext {
+        text: additional_context,
+        limit: handler.additional_context_limit,
+    });
 }
 
 pub(crate) fn flatten_additional_contexts<'a>(
-    additional_contexts: impl IntoIterator<Item = &'a [String]>,
-) -> Vec<String> {
+    additional_contexts: impl IntoIterator<Item = &'a [AdditionalContext]>,
+) -> Vec<AdditionalContext> {
     additional_contexts
         .into_iter()
         .flat_map(|chunk| chunk.iter().cloned())
@@ -103,7 +115,12 @@ pub(crate) fn matcher_pattern_for_event(
         HookEventName::PreToolUse
         | HookEventName::PermissionRequest
         | HookEventName::PostToolUse
-        | HookEventName::SessionStart => matcher,
+        | HookEventName::SessionStart
+        | HookEventName::SessionEnd
+        | HookEventName::SubagentStart
+        | HookEventName::SubagentStop
+        | HookEventName::PreCompact
+        | HookEventName::PostCompact => matcher,
         HookEventName::UserPromptSubmit | HookEventName::Stop => None,
     }
 }
@@ -266,6 +283,18 @@ mod tests {
         assert_eq!(
             matcher_pattern_for_event(HookEventName::SessionStart, Some("startup|resume")),
             Some("startup|resume")
+        );
+        assert_eq!(
+            matcher_pattern_for_event(HookEventName::SessionEnd, Some("clear|other")),
+            Some("clear|other")
+        );
+        assert_eq!(
+            matcher_pattern_for_event(HookEventName::PreCompact, Some("^auto$")),
+            Some("^auto$")
+        );
+        assert_eq!(
+            matcher_pattern_for_event(HookEventName::PostCompact, Some("manual|auto")),
+            Some("manual|auto")
         );
     }
 }

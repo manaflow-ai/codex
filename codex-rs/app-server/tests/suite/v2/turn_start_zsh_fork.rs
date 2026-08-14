@@ -7,20 +7,18 @@
 // network access are required the first time the artifact is fetched.
 
 use anyhow::Result;
-use app_test_support::McpProcess;
+use app_test_support::MockResponsesConfig;
+use app_test_support::TestAppServer;
 use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_sequence;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
 use app_test_support::create_shell_command_sse_response;
-use app_test_support::to_response;
 use codex_app_server_protocol::CommandAction;
 use codex_app_server_protocol::CommandExecutionApprovalDecision;
 use codex_app_server_protocol::CommandExecutionRequestApprovalResponse;
 use codex_app_server_protocol::CommandExecutionStatus;
 use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::ItemStartedNotification;
-use codex_app_server_protocol::JSONRPCResponse;
-use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadStartParams;
@@ -30,13 +28,14 @@ use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput as V2UserInput;
-use codex_features::FEATURES;
 use codex_features::Feature;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
+use core_test_support::skip_if_remote;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::path::PathBuf;
 use tempfile::TempDir;
 use tokio::time::timeout;
 
@@ -47,6 +46,11 @@ const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 
 #[tokio::test]
 async fn turn_start_shell_zsh_fork_executes_command_v2() -> Result<()> {
+    // TODO(anp): Remove after zsh-fork fixtures can run in the selected remote environment.
+    skip_if_remote!(
+        Ok(()),
+        "zsh-fork fixtures use host-local zsh and workspace paths"
+    );
     skip_if_no_network!(Ok(()));
 
     let tmp = TempDir::new()?;
@@ -94,29 +98,24 @@ async fn turn_start_shell_zsh_fork_executes_command_v2() -> Result<()> {
             (Feature::UnifiedExec, false),
             (Feature::ShellSnapshot, false),
         ]),
-        &zsh_path,
     )?;
 
-    let mut mcp = create_zsh_test_mcp_process(&codex_home, &workspace).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = create_zsh_test_mcp_process(&codex_home, &workspace, &zsh_path).await?;
 
     let start_id = mcp
-        .send_thread_start_request(ThreadStartParams {
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("mock-model".to_string()),
             cwd: Some(workspace.to_string_lossy().into_owned()),
             ..Default::default()
         })
         .await?;
-    let start_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
-    )
-    .await??;
-    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+    let ThreadStartResponse { thread, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(start_id)).await??;
 
     let turn_id = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![V2UserInput::Text {
                 text: "run echo hi".to_string(),
                 text_elements: Vec::new(),
@@ -130,12 +129,8 @@ async fn turn_start_shell_zsh_fork_executes_command_v2() -> Result<()> {
             ..Default::default()
         })
         .await?;
-    let turn_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(turn_id)),
-    )
-    .await??;
-    let TurnStartResponse { turn } = to_response::<TurnStartResponse>(turn_resp)?;
+    let TurnStartResponse { turn } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(turn_id)).await??;
 
     let started_command_execution = timeout(DEFAULT_READ_TIMEOUT, async {
         loop {
@@ -162,11 +157,11 @@ async fn turn_start_shell_zsh_fork_executes_command_v2() -> Result<()> {
     };
     assert_eq!(id, "call-zsh-fork");
     assert_eq!(status, CommandExecutionStatus::InProgress);
-    assert!(command.starts_with(&zsh_path.display().to_string()));
+    assert!(command.starts_with(&command_packaged_zsh_path(&codex_home).display().to_string()));
     assert!(command.contains("/bin/sh -c"));
     assert!(command.contains("sleep 0.01"));
     assert!(command.contains(&release_marker.display().to_string()));
-    assert_eq!(cwd.as_path(), workspace.as_path());
+    assert_eq!(cwd.as_str(), workspace.to_string_lossy().as_ref());
 
     mcp.interrupt_turn_and_wait_for_aborted(thread.id, turn.id, DEFAULT_READ_TIMEOUT)
         .await?;
@@ -176,6 +171,11 @@ async fn turn_start_shell_zsh_fork_executes_command_v2() -> Result<()> {
 
 #[tokio::test]
 async fn turn_start_shell_zsh_fork_exec_approval_decline_v2() -> Result<()> {
+    // TODO(anp): Remove after zsh-fork fixtures can run in the selected remote environment.
+    skip_if_remote!(
+        Ok(()),
+        "zsh-fork fixtures use host-local zsh and workspace paths"
+    );
     skip_if_no_network!(Ok(()));
 
     let tmp = TempDir::new()?;
@@ -213,29 +213,24 @@ async fn turn_start_shell_zsh_fork_exec_approval_decline_v2() -> Result<()> {
             (Feature::UnifiedExec, false),
             (Feature::ShellSnapshot, false),
         ]),
-        &zsh_path,
     )?;
 
-    let mut mcp = create_zsh_test_mcp_process(&codex_home, &workspace).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = create_zsh_test_mcp_process(&codex_home, &workspace, &zsh_path).await?;
 
     let start_id = mcp
-        .send_thread_start_request(ThreadStartParams {
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("mock-model".to_string()),
             cwd: Some(workspace.to_string_lossy().into_owned()),
             ..Default::default()
         })
         .await?;
-    let start_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
-    )
-    .await??;
-    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+    let ThreadStartResponse { thread, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(start_id)).await??;
 
     let turn_id = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![V2UserInput::Text {
                 text: "run python".to_string(),
                 text_elements: Vec::new(),
@@ -244,11 +239,7 @@ async fn turn_start_shell_zsh_fork_exec_approval_decline_v2() -> Result<()> {
             ..Default::default()
         })
         .await?;
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(turn_id)),
-    )
-    .await??;
+    let _: TurnStartResponse = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(turn_id)).await??;
 
     let server_req = timeout(
         DEFAULT_READ_TIMEOUT,
@@ -312,6 +303,11 @@ async fn turn_start_shell_zsh_fork_exec_approval_decline_v2() -> Result<()> {
 
 #[tokio::test]
 async fn turn_start_shell_zsh_fork_exec_approval_cancel_v2() -> Result<()> {
+    // TODO(anp): Remove after zsh-fork fixtures can run in the selected remote environment.
+    skip_if_remote!(
+        Ok(()),
+        "zsh-fork fixtures use host-local zsh and workspace paths"
+    );
     skip_if_no_network!(Ok(()));
 
     let tmp = TempDir::new()?;
@@ -346,29 +342,24 @@ async fn turn_start_shell_zsh_fork_exec_approval_cancel_v2() -> Result<()> {
             (Feature::UnifiedExec, false),
             (Feature::ShellSnapshot, false),
         ]),
-        &zsh_path,
     )?;
 
-    let mut mcp = create_zsh_test_mcp_process(&codex_home, &workspace).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = create_zsh_test_mcp_process(&codex_home, &workspace, &zsh_path).await?;
 
     let start_id = mcp
-        .send_thread_start_request(ThreadStartParams {
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("mock-model".to_string()),
             cwd: Some(workspace.to_string_lossy().into_owned()),
             ..Default::default()
         })
         .await?;
-    let start_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
-    )
-    .await??;
-    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+    let ThreadStartResponse { thread, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(start_id)).await??;
 
     let turn_id = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![V2UserInput::Text {
                 text: "run python".to_string(),
                 text_elements: Vec::new(),
@@ -377,11 +368,7 @@ async fn turn_start_shell_zsh_fork_exec_approval_cancel_v2() -> Result<()> {
             ..Default::default()
         })
         .await?;
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(turn_id)),
-    )
-    .await??;
+    let _: TurnStartResponse = timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(turn_id)).await??;
 
     let server_req = timeout(
         DEFAULT_READ_TIMEOUT,
@@ -443,6 +430,11 @@ async fn turn_start_shell_zsh_fork_exec_approval_cancel_v2() -> Result<()> {
 
 #[tokio::test]
 async fn turn_start_shell_zsh_fork_subcommand_decline_marks_parent_declined_v2() -> Result<()> {
+    // TODO(anp): Remove after zsh-fork fixtures can run in the selected remote environment.
+    skip_if_remote!(
+        Ok(()),
+        "zsh-fork fixtures use host-local zsh and workspace paths"
+    );
     skip_if_no_network!(Ok(()));
 
     let tmp = TempDir::new()?;
@@ -475,7 +467,7 @@ async fn turn_start_shell_zsh_fork_subcommand_decline_marks_parent_declined_v2()
     let tool_call_arguments = serde_json::to_string(&serde_json::json!({
         "command": shell_command,
         "workdir": serde_json::Value::Null,
-        "timeout_ms": 5000
+        "timeout_ms": 20000
     }))?;
     let response = responses::sse(vec![
         responses::ev_response_created("resp-1"),
@@ -505,53 +497,43 @@ async fn turn_start_shell_zsh_fork_subcommand_decline_marks_parent_declined_v2()
             (Feature::UnifiedExec, false),
             (Feature::ShellSnapshot, false),
         ]),
-        &zsh_path,
     )?;
 
-    let mut mcp = create_zsh_test_mcp_process(&codex_home, &workspace).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = create_zsh_test_mcp_process(&codex_home, &workspace, &zsh_path).await?;
 
     let start_id = mcp
-        .send_thread_start_request(ThreadStartParams {
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("mock-model".to_string()),
             cwd: Some(workspace.to_string_lossy().into_owned()),
             ..Default::default()
         })
         .await?;
-    let start_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
-    )
-    .await??;
-    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(start_resp)?;
+    let ThreadStartResponse { thread, .. } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(start_id)).await??;
 
     let turn_id = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![V2UserInput::Text {
                 text: "remove both files".to_string(),
                 text_elements: Vec::new(),
             }],
             cwd: Some(workspace.clone()),
             approval_policy: Some(codex_app_server_protocol::AskForApproval::UnlessTrusted),
-            sandbox_policy: Some(codex_app_server_protocol::SandboxPolicy::WorkspaceWrite {
-                writable_roots: vec![workspace.clone().try_into()?],
-                network_access: false,
-                exclude_tmpdir_env_var: false,
-                exclude_slash_tmp: false,
-            }),
+            // This test is about execve-intercept approval propagation, not
+            // workspace sandboxing. Using full access avoids macOS sandbox
+            // setup failures that can terminate the parent shell before the
+            // second subcommand approval is observed.
+            sandbox_policy: Some(codex_app_server_protocol::SandboxPolicy::DangerFullAccess),
             model: Some("mock-model".to_string()),
             effort: Some(codex_protocol::openai_models::ReasoningEffort::Medium),
             summary: Some(codex_protocol::config_types::ReasoningSummary::Auto),
             ..Default::default()
         })
         .await?;
-    let turn_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(turn_id)),
-    )
-    .await??;
-    let TurnStartResponse { turn } = to_response::<TurnStartResponse>(turn_resp)?;
+    let TurnStartResponse { turn } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(turn_id)).await??;
 
     let mut approved_subcommand_strings = Vec::new();
     let mut approved_subcommand_ids = Vec::new();
@@ -603,7 +585,8 @@ async fn turn_start_shell_zsh_fork_subcommand_decline_marks_parent_declined_v2()
             );
             approved_subcommand_strings.push(approval_command.to_string());
         }
-        let is_parent_approval = approval_command.contains(&zsh_path.display().to_string())
+        let is_parent_approval = approval_command
+            .contains(&command_packaged_zsh_path(&codex_home).display().to_string())
             && (approval_command.contains(&shell_command)
                 || (has_first_file && has_second_file)
                 || approval_command.contains(&parent_shell_hint));
@@ -738,9 +721,58 @@ async fn turn_start_shell_zsh_fork_subcommand_decline_marks_parent_declined_v2()
     Ok(())
 }
 
-async fn create_zsh_test_mcp_process(codex_home: &Path, zdotdir: &Path) -> Result<McpProcess> {
+async fn create_zsh_test_mcp_process(
+    codex_home: &Path,
+    zdotdir: &Path,
+    zsh_path: &Path,
+) -> Result<TestAppServer> {
+    let app_server = create_test_package_app_server(codex_home, zsh_path)?;
     let zdotdir = zdotdir.to_string_lossy().into_owned();
-    McpProcess::new_with_env(codex_home, &[("ZDOTDIR", Some(zdotdir.as_str()))]).await
+    TestAppServer::builder()
+        .with_codex_home(codex_home)
+        .with_program(&app_server)
+        .with_env_overrides(&[("ZDOTDIR", Some(zdotdir.as_str()))])
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await
+}
+
+fn create_test_package_app_server(codex_home: &Path, zsh_path: &Path) -> Result<PathBuf> {
+    let package_dir = codex_home.join("test-package");
+    let bin_dir = package_dir.join("bin");
+    let package_zsh_path = packaged_zsh_path(codex_home);
+    let Some(zsh_bin_dir) = package_zsh_path.parent() else {
+        anyhow::bail!("packaged zsh path should have parent");
+    };
+    std::fs::create_dir_all(&bin_dir)?;
+    std::fs::create_dir_all(zsh_bin_dir)?;
+    std::fs::write(package_dir.join("codex-package.json"), "{}")?;
+
+    let app_server = bin_dir.join("codex-app-server");
+    copy_with_permissions(
+        &codex_utils_cargo_bin::cargo_bin("codex-app-server")?,
+        &app_server,
+    )?;
+    copy_with_permissions(zsh_path, &package_zsh_path)?;
+    Ok(app_server)
+}
+
+fn packaged_zsh_path(codex_home: &Path) -> PathBuf {
+    codex_home
+        .join("test-package")
+        .join("codex-resources")
+        .join("zsh")
+        .join("bin")
+        .join("zsh")
+}
+
+fn command_packaged_zsh_path(codex_home: &Path) -> PathBuf {
+    let path = packaged_zsh_path(codex_home);
+    std::fs::canonicalize(&path).unwrap_or(path)
+}
+
+fn copy_with_permissions(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::copy(source, destination)?;
+    std::fs::set_permissions(destination, std::fs::metadata(source)?.permissions())
 }
 
 fn create_config_toml(
@@ -748,50 +780,12 @@ fn create_config_toml(
     server_uri: &str,
     approval_policy: &str,
     feature_flags: &BTreeMap<Feature, bool>,
-    zsh_path: &Path,
 ) -> std::io::Result<()> {
-    let mut features = BTreeMap::from([(Feature::RemoteModels, false)]);
-    for (feature, enabled) in feature_flags {
-        features.insert(*feature, *enabled);
-    }
-    let feature_entries = features
-        .into_iter()
-        .map(|(feature, enabled)| {
-            let key = FEATURES
-                .iter()
-                .find(|spec| spec.id == feature)
-                .map(|spec| spec.key)
-                .unwrap_or_else(|| panic!("missing feature key for {feature:?}"));
-            format!("{key} = {enabled}")
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let config_toml = codex_home.join("config.toml");
-    std::fs::write(
-        config_toml,
-        format!(
-            r#"
-model = "mock-model"
-approval_policy = "{approval_policy}"
-sandbox_mode = "read-only"
-zsh_path = "{zsh_path}"
-
-model_provider = "mock_provider"
-
-[features]
-{feature_entries}
-
-[model_providers.mock_provider]
-name = "Mock provider for test"
-base_url = "{server_uri}/v1"
-wire_api = "responses"
-request_max_retries = 0
-stream_max_retries = 0
-"#,
-            approval_policy = approval_policy,
-            zsh_path = zsh_path.display()
-        ),
-    )
+    MockResponsesConfig::new(server_uri)
+        .with_approval_policy(approval_policy)
+        .disable_feature(Feature::RemoteModels)
+        .with_features(feature_flags)
+        .write(codex_home)
 }
 
 fn find_test_zsh_path() -> Result<Option<std::path::PathBuf>> {

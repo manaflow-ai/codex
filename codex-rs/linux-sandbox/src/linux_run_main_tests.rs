@@ -61,6 +61,7 @@ fn inserts_bwrap_argv0_before_command_separator() {
             ..Default::default()
         },
     )
+    .expect("build bwrap argv")
     .args;
     apply_inner_command_argv0_for_launcher(
         &mut argv,
@@ -104,6 +105,7 @@ fn rewrites_inner_command_path_when_bwrap_lacks_argv0() {
             ..Default::default()
         },
     )
+    .expect("build bwrap argv")
     .args;
     apply_inner_command_argv0_for_launcher(
         &mut argv,
@@ -172,6 +174,7 @@ fn inserts_unshare_net_when_network_isolation_requested() {
             ..Default::default()
         },
     )
+    .expect("build bwrap argv")
     .args;
     assert!(argv.contains(&"--unshare-net".to_string()));
 }
@@ -190,6 +193,7 @@ fn inserts_unshare_net_when_proxy_only_network_mode_requested() {
             ..Default::default()
         },
     )
+    .expect("build bwrap argv")
     .args;
     assert!(argv.contains(&"--unshare-net".to_string()));
 }
@@ -217,10 +221,12 @@ fn split_only_filesystem_policy_requires_direct_runtime_enforcement() {
                 ),
             },
             access: codex_protocol::permissions::FileSystemAccessMode::Write,
+            missing_path_behavior: None,
         },
         codex_protocol::permissions::FileSystemSandboxEntry {
             path: codex_protocol::permissions::FileSystemPath::Path { path: docs },
             access: codex_protocol::permissions::FileSystemAccessMode::Read,
+            missing_path_behavior: None,
         },
     ]);
 
@@ -241,10 +247,12 @@ fn root_write_read_only_carveout_requires_direct_runtime_enforcement() {
                 value: codex_protocol::permissions::FileSystemSpecialPath::Root,
             },
             access: codex_protocol::permissions::FileSystemAccessMode::Write,
+            missing_path_behavior: None,
         },
         codex_protocol::permissions::FileSystemSandboxEntry {
             path: codex_protocol::permissions::FileSystemPath::Path { path: docs },
             access: codex_protocol::permissions::FileSystemAccessMode::Read,
+            missing_path_behavior: None,
         },
     ]);
 
@@ -254,19 +262,32 @@ fn root_write_read_only_carveout_requires_direct_runtime_enforcement() {
 }
 
 #[test]
-fn managed_proxy_preflight_argv_is_wrapped_for_full_access_policy() {
+fn managed_proxy_preflight_argv_unshares_network() {
     let mode = bwrap_network_mode(
         NetworkSandboxPolicy::Enabled,
         /*allow_network_for_proxy*/ true,
     );
-    let argv = build_preflight_bwrap_argv(
-        Path::new("/"),
-        Path::new("/"),
-        &FileSystemSandboxPolicy::unrestricted(),
-        mode,
-    )
-    .args;
+    let argv = build_preflight_bwrap_argv(mode)
+        .expect("build preflight argv")
+        .args;
     assert!(argv.iter().any(|arg| arg == "--"));
+    assert!(argv.iter().any(|arg| arg == "--unshare-net"));
+}
+
+#[test]
+fn proc_mount_preflight_does_not_bind_the_full_filesystem() {
+    let argv = build_preflight_bwrap_argv(BwrapNetworkMode::FullAccess)
+        .expect("build preflight argv")
+        .args;
+
+    assert!(argv.windows(2).any(|window| window == ["--tmpfs", "/"]));
+    assert!(argv.windows(2).any(|window| window == ["--proc", "/proc"]));
+    assert!(
+        !argv
+            .windows(3)
+            .any(|window| window == ["--ro-bind", "/", "/"])
+    );
+    assert!(!argv.windows(3).any(|window| window == ["--bind", "/", "/"]));
 }
 
 #[test]
@@ -295,6 +316,17 @@ fn cleanup_synthetic_mount_targets_removes_only_empty_mount_targets() {
         "keep"
     );
     assert!(!missing_file.exists());
+}
+
+#[test]
+fn synthetic_mount_registry_root_is_unique_to_effective_user() {
+    let effective_uid = unsafe { libc::geteuid() };
+    assert_eq!(
+        synthetic_mount_registry_root(),
+        std::env::temp_dir().join(format!(
+            "codex-bwrap-synthetic-mount-targets-{effective_uid}"
+        ))
+    );
 }
 
 #[test]
@@ -538,10 +570,12 @@ fn resolve_permission_profile_preserves_direct_runtime_profile() {
                 value: codex_protocol::permissions::FileSystemSpecialPath::Root,
             },
             access: codex_protocol::permissions::FileSystemAccessMode::Read,
+            missing_path_behavior: None,
         },
         codex_protocol::permissions::FileSystemSandboxEntry {
             path: codex_protocol::permissions::FileSystemPath::Path { path: docs },
             access: codex_protocol::permissions::FileSystemAccessMode::Write,
+            missing_path_behavior: None,
         },
     ]);
     let permission_profile = PermissionProfile::from_runtime_permissions(
@@ -592,10 +626,12 @@ fn legacy_landlock_rejects_split_only_filesystem_policies() {
                 value: codex_protocol::permissions::FileSystemSpecialPath::Root,
             },
             access: codex_protocol::permissions::FileSystemAccessMode::Read,
+            missing_path_behavior: None,
         },
         codex_protocol::permissions::FileSystemSandboxEntry {
             path: codex_protocol::permissions::FileSystemPath::Path { path: docs },
             access: codex_protocol::permissions::FileSystemAccessMode::Write,
+            missing_path_behavior: None,
         },
     ]);
 

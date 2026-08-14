@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::sync::Arc;
 
 use crossterm::cursor::SetCursorStyle;
@@ -6,6 +7,7 @@ use ratatui::layout::Rect;
 use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::widgets::Paragraph;
+use ratatui::widgets::Widget;
 use ratatui::widgets::WidgetRef;
 
 use crate::render::Insets;
@@ -108,7 +110,7 @@ impl<'a> Renderable for Span<'a> {
 
 impl<'a> Renderable for Line<'a> {
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        WidgetRef::render_ref(self, area, buf);
+        Widget::render(self, area, buf);
     }
     fn desired_height(&self, _width: u16) -> u16 {
         1
@@ -247,6 +249,7 @@ impl<'a> ColumnRenderable<'a> {
 pub struct FlexChild<'a> {
     flex: i32,
     child: RenderableItem<'a>,
+    cached_height: Cell<Option<(u16, u16)>>,
 }
 
 pub struct FlexRenderable<'a> {
@@ -266,6 +269,7 @@ impl<'a> FlexRenderable<'a> {
         self.children.push(FlexChild {
             flex,
             child: child.into(),
+            cached_height: Cell::new(None),
         });
     }
 
@@ -276,41 +280,63 @@ impl<'a> FlexRenderable<'a> {
         let mut allocated_rects = Vec::with_capacity(self.children.len());
         let mut child_sizes = vec![0; self.children.len()];
         let mut allocated_size = 0;
-        let mut total_flex = 0;
+        let mut flex_children = Vec::new();
 
         // 1. Allocate space to non-flex children.
         let max_size = area.height;
-        let mut last_flex_child_idx = 0;
-        for (i, FlexChild { flex, child }) in self.children.iter().enumerate() {
-            if *flex > 0 {
-                total_flex += flex;
-                last_flex_child_idx = i;
+        for (i, child) in self.children.iter().enumerate() {
+            let desired_height = if let Some((width, height)) = child.cached_height.get()
+                && width == area.width
+            {
+                height
             } else {
-                child_sizes[i] = child
-                    .desired_height(area.width)
-                    .min(max_size.saturating_sub(allocated_size));
+                let height = child.child.desired_height(area.width);
+                child.cached_height.set(Some((area.width, height)));
+                height
+            };
+            if child.flex > 0 {
+                flex_children.push((i, child.flex as u16, desired_height));
+            } else {
+                child_sizes[i] = desired_height.min(max_size.saturating_sub(allocated_size));
                 allocated_size += child_sizes[i];
             }
         }
         let free_space = max_size.saturating_sub(allocated_size);
-        // 2. Allocate space to flex children, proportional to their flex factor.
-        let mut allocated_flex_space = 0;
-        if total_flex > 0 {
-            let space_per_flex = free_space / total_flex as u16;
-            for (i, FlexChild { flex, child }) in self.children.iter().enumerate() {
-                if *flex > 0 {
-                    // Last flex child gets all the remaining space, to prevent a rounding error
-                    // from not allocating all the space.
-                    let max_child_extent = if i == last_flex_child_idx {
-                        free_space - allocated_flex_space
-                    } else {
-                        space_per_flex * *flex as u16
-                    };
-                    let child_size = child.desired_height(area.width).min(max_child_extent);
-                    child_sizes[i] = child_size;
-                    allocated_flex_space += child_size;
+        // 2. Satisfy flex children that need less than their proportional share so their unused
+        // space can be redistributed instead of leaving blank rows.
+        let mut remaining_space = free_space;
+        while !flex_children.is_empty() {
+            let total_flex = flex_children.iter().map(|(_, flex, _)| *flex).sum::<u16>();
+            let mut satisfied_any = false;
+            flex_children.retain(|(i, flex, desired_height)| {
+                let proportional_share =
+                    (u32::from(remaining_space) * u32::from(*flex) / u32::from(total_flex)) as u16;
+                if *desired_height <= proportional_share {
+                    child_sizes[*i] = *desired_height;
+                    remaining_space = remaining_space.saturating_sub(*desired_height);
+                    satisfied_any = true;
+                    false
+                } else {
+                    true
                 }
+            });
+            if !satisfied_any {
+                break;
             }
+        }
+        // 3. Divide the remaining space proportionally. The final child absorbs rounding slack.
+        let total_flex = flex_children.iter().map(|(_, flex, _)| *flex).sum::<u16>();
+        let mut allocated_flex_space = 0;
+        let last_flex_child_idx = flex_children.last().map(|(i, _, _)| *i);
+        for (i, flex, desired_height) in flex_children {
+            let max_child_extent = if Some(i) == last_flex_child_idx {
+                remaining_space.saturating_sub(allocated_flex_space)
+            } else {
+                (u32::from(remaining_space) * u32::from(flex) / u32::from(total_flex)) as u16
+            };
+            let child_size = desired_height.min(max_child_extent);
+            child_sizes[i] = child_size;
+            allocated_flex_space += child_size;
         }
 
         let mut y = area.y;
@@ -482,3 +508,7 @@ where
         RenderableItem::Owned(Box::new(InsetRenderable { child, insets }))
     }
 }
+
+#[cfg(test)]
+#[path = "renderable_tests.rs"]
+mod tests;

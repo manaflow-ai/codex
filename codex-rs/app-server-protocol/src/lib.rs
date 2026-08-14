@@ -1,22 +1,31 @@
 mod experimental_api;
+#[cfg(test)]
 mod export;
-mod jsonrpc_lite;
+mod precomputed_exports;
+#[cfg(test)]
+#[path = "precomputed_exports_tests.rs"]
+mod precomputed_exports_tests;
 mod protocol;
+pub mod rpc;
+#[cfg(test)]
 mod schema_fixtures;
+#[cfg(test)]
+#[path = "schema_fixtures_tests.rs"]
+mod schema_fixtures_tests;
 
 pub use experimental_api::*;
-pub use export::GenerateTsOptions;
-pub use export::generate_internal_json_schema;
-pub use export::generate_json;
-pub use export::generate_json_with_experimental;
-pub use export::generate_ts;
-pub use export::generate_ts_with_options;
-pub use export::generate_types;
-pub use jsonrpc_lite::*;
+pub use precomputed_exports::GenerateTsOptions;
+pub use precomputed_exports::generate_internal_json_schema;
+pub use precomputed_exports::generate_json;
+pub use precomputed_exports::generate_json_with_experimental;
+pub use precomputed_exports::generate_ts;
+pub use precomputed_exports::generate_ts_with_options;
+pub use precomputed_exports::generate_types;
 pub use protocol::common::*;
 pub use protocol::event_mapping::*;
 pub use protocol::item_builders::*;
 pub use protocol::thread_history::*;
+pub use protocol::thread_history_projection::*;
 pub use protocol::v1::ApplyPatchApprovalParams;
 pub use protocol::v1::ApplyPatchApprovalResponse;
 pub use protocol::v1::ClientInfo;
@@ -36,15 +45,27 @@ pub use protocol::v1::InitializeParams;
 pub use protocol::v1::InitializeResponse;
 pub use protocol::v1::InterruptConversationResponse;
 pub use protocol::v1::LoginApiKeyParams;
-pub use protocol::v1::Profile;
 pub use protocol::v1::SandboxSettings;
 pub use protocol::v1::Tools;
 pub use protocol::v1::UserSavedConfig;
 pub use protocol::v2::*;
+pub use rpc::*;
+#[cfg(test)]
 pub use schema_fixtures::SchemaFixtureOptions;
-#[doc(hidden)]
-pub use schema_fixtures::generate_typescript_schema_fixture_subtree_for_tests;
+#[cfg(test)]
 pub use schema_fixtures::read_schema_fixture_subtree;
+#[cfg(test)]
 pub use schema_fixtures::read_schema_fixture_tree;
+#[cfg(test)]
 pub use schema_fixtures::write_schema_fixtures;
+#[cfg(test)]
 pub use schema_fixtures::write_schema_fixtures_with_options;
+
+#[cfg(not(test))]
+pub(crate) use codex_app_server_protocol_noop_macros::JsonSchema;
+#[cfg(not(test))]
+pub(crate) use codex_app_server_protocol_noop_macros::TS;
+#[cfg(test)]
+pub(crate) use schemars::JsonSchema;
+#[cfg(test)]
+pub(crate) use ts_rs::TS;

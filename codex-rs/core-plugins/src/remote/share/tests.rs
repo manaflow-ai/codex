@@ -1,4 +1,6 @@
 use super::*;
+use crate::test_support::recorded_http_client_urls;
+use crate::test_support::recording_remote_plugin_service_config;
 use codex_app_server_protocol::PluginAuthPolicy;
 use codex_app_server_protocol::PluginInstallPolicy;
 use codex_app_server_protocol::PluginInterface;
@@ -23,9 +25,10 @@ use wiremock::matchers::query_param;
 use wiremock::matchers::query_param_is_missing;
 
 fn test_config(server: &MockServer) -> RemotePluginServiceConfig {
-    RemotePluginServiceConfig {
-        chatgpt_base_url: format!("{}/backend-api", server.uri()),
-    }
+    RemotePluginServiceConfig::new(
+        format!("{}/backend-api", server.uri()),
+        crate::test_support::test_http_client_factory(),
+    )
 }
 
 fn test_auth() -> CodexAuth {
@@ -93,9 +96,11 @@ fn remote_plugin_json(plugin_id: &str) -> serde_json::Value {
         "id": plugin_id,
         "name": "demo-plugin",
         "scope": "WORKSPACE",
+        "discoverability": "PRIVATE",
         "installation_policy": "AVAILABLE",
         "authentication_policy": "ON_USE",
         "release": {
+            "version": "0.1.0",
             "display_name": "Demo Plugin",
             "description": "Demo plugin description",
             "interface": {
@@ -107,15 +112,18 @@ fn remote_plugin_json(plugin_id: &str) -> serde_json::Value {
     })
 }
 
-fn remote_plugin_json_with_share_url(
+fn remote_plugin_json_with_share_url_and_principals(
     plugin_id: &str,
     share_url: Option<&str>,
+    share_principals: serde_json::Value,
 ) -> serde_json::Value {
     let mut plugin = remote_plugin_json(plugin_id);
     let serde_json::Value::Object(fields) = &mut plugin else {
         unreachable!("plugin json should be an object");
     };
+    fields.insert("discoverability".to_string(), json!("PRIVATE"));
     fields.insert("share_url".to_string(), json!(share_url));
+    fields.insert("share_principals".to_string(), share_principals);
     plugin
 }
 
@@ -151,7 +159,9 @@ fn expected_plugin_interface() -> PluginInterface {
         composer_icon: None,
         composer_icon_url: None,
         logo: None,
+        logo_dark: None,
         logo_url: None,
+        logo_url_dark: None,
         screenshots: Vec::new(),
         screenshot_urls: Vec::new(),
     }
@@ -167,7 +177,8 @@ async fn save_remote_plugin_share_creates_workspace_plugin() {
         .unwrap()
         .len();
     let server = MockServer::start().await;
-    let config = test_config(&server);
+    let (config, selected_urls) =
+        recording_remote_plugin_service_config(format!("{}/backend-api", server.uri()));
     let auth = test_auth();
 
     Mock::given(method("POST"))
@@ -202,10 +213,24 @@ async fn save_remote_plugin_share_creates_workspace_plugin() {
         .and(body_json(json!({
             "file_id": "file_123",
             "etag": "\"upload_etag_123\"",
+            "discoverability": "UNLISTED",
+            "share_targets": [
+                {
+                    "principal_type": "user",
+                    "principal_id": "user-1",
+                    "role": "reader",
+                },
+                {
+                    "principal_type": "workspace",
+                    "principal_id": "account_id",
+                    "role": "reader",
+                },
+            ],
         })))
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({
             "plugin_id": "plugins_123",
             "share_url": "https://chatgpt.example/plugins/share/share-key-1",
+            "can_publish_to_workspace": true,
         })))
         .expect(1)
         .mount(&server)
@@ -217,6 +242,14 @@ async fn save_remote_plugin_share_creates_workspace_plugin() {
         codex_home.path(),
         &plugin_path,
         /*remote_plugin_id*/ None,
+        RemotePluginShareAccessPolicy {
+            discoverability: Some(RemotePluginShareDiscoverability::Unlisted),
+            share_targets: Some(vec![RemotePluginShareTarget {
+                principal_type: RemotePluginSharePrincipalType::User,
+                principal_id: "user-1".to_string(),
+                role: RemotePluginShareTargetRole::Reader,
+            }]),
+        },
     )
     .await
     .unwrap();
@@ -226,11 +259,23 @@ async fn save_remote_plugin_share_creates_workspace_plugin() {
         RemotePluginShareSaveResult {
             remote_plugin_id: "plugins_123".to_string(),
             share_url: Some("https://chatgpt.example/plugins/share/share-key-1".to_string()),
+            can_publish_to_workspace: Some(true),
         }
     );
     assert_eq!(
         local_paths::load_plugin_share_local_paths(codex_home.path()).unwrap(),
         BTreeMap::from([("plugins_123".to_string(), plugin_path)])
+    );
+    assert_eq!(
+        recorded_http_client_urls(&selected_urls),
+        vec![
+            format!(
+                "{}/backend-api/public/plugins/workspace/upload-url",
+                server.uri()
+            ),
+            format!("{}/upload/file_123", server.uri()),
+            format!("{}/backend-api/public/plugins/workspace", server.uri()),
+        ]
     );
 
     let requests = server.received_requests().await.unwrap_or_default();
@@ -300,6 +345,34 @@ fn archive_plugin_for_upload_places_manifest_at_archive_root() {
     );
 }
 
+#[test]
+fn archive_plugin_for_upload_round_trips_through_plugin_bundle_archive_with_long_paths() {
+    let temp_dir = TempDir::new().unwrap();
+    let plugin_path = write_test_plugin(temp_dir.path(), "demo-plugin");
+    let long_skill_path = Path::new("skills")
+        .join(["segment"; 40].join("/"))
+        .join("SKILL.md");
+    write_file(&plugin_path.join(&long_skill_path), "# Long path skill\n");
+
+    let archive_bytes = archive_plugin_for_upload(&plugin_path).unwrap();
+    let destination = TempDir::new().unwrap();
+    crate::plugin_bundle_archive::unpack_plugin_bundle_tar_gz(
+        &archive_bytes,
+        destination.path(),
+        /*max_total_bytes*/ 1024 * 1024,
+    )
+    .expect("extract shared plugin archive");
+
+    assert_eq!(
+        fs::read_to_string(destination.path().join(".codex-plugin/plugin.json")).unwrap(),
+        r#"{"name":"demo-plugin"}"#
+    );
+    assert_eq!(
+        fs::read_to_string(destination.path().join(long_skill_path)).unwrap(),
+        "# Long path skill\n"
+    );
+}
+
 #[tokio::test]
 async fn save_remote_plugin_share_updates_existing_workspace_plugin() {
     let codex_home = TempDir::new().unwrap();
@@ -354,6 +427,7 @@ async fn save_remote_plugin_share_updates_existing_workspace_plugin() {
         codex_home.path(),
         &plugin_path,
         Some("plugins_123"),
+        RemotePluginShareAccessPolicy::default(),
     )
     .await
     .unwrap();
@@ -363,6 +437,101 @@ async fn save_remote_plugin_share_updates_existing_workspace_plugin() {
         RemotePluginShareSaveResult {
             remote_plugin_id: "plugins_123".to_string(),
             share_url: None,
+            can_publish_to_workspace: None,
+        }
+    );
+}
+
+#[tokio::test]
+async fn update_remote_plugin_share_targets_updates_targets() {
+    let server = MockServer::start().await;
+    let config = test_config(&server);
+    let auth = test_auth();
+
+    Mock::given(method("PUT"))
+        .and(path("/backend-api/ps/plugins/plugins_123/shares"))
+        .and(header("authorization", "Bearer Access Token"))
+        .and(header("chatgpt-account-id", "account_id"))
+        .and(body_json(json!({
+            "discoverability": "UNLISTED",
+            "targets": [
+                {
+                    "principal_type": "user",
+                    "principal_id": "user-1",
+                    "role": "editor",
+                },
+                {
+                    "principal_type": "group",
+                    "principal_id": "group-1",
+                    "role": "reader",
+                },
+                {
+                    "principal_type": "workspace",
+                    "principal_id": "account_id",
+                    "role": "reader",
+                },
+            ],
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "principals": [
+                {
+                    "principal_type": "user",
+                    "principal_id": "user-1",
+                    "role": "editor",
+                    "name": "Gavin",
+                },
+                {
+                    "principal_type": "group",
+                    "principal_id": "group-1",
+                    "role": "reader",
+                    "name": "Engineering",
+                },
+            ],
+            "discoverability": "UNLISTED",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = update_remote_plugin_share_targets(
+        &config,
+        Some(&auth),
+        "plugins_123",
+        vec![
+            RemotePluginShareTarget {
+                principal_type: RemotePluginSharePrincipalType::User,
+                principal_id: "user-1".to_string(),
+                role: RemotePluginShareTargetRole::Editor,
+            },
+            RemotePluginShareTarget {
+                principal_type: RemotePluginSharePrincipalType::Group,
+                principal_id: "group-1".to_string(),
+                role: RemotePluginShareTargetRole::Reader,
+            },
+        ],
+        RemotePluginShareUpdateDiscoverability::Unlisted,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        result,
+        RemotePluginShareUpdateTargetsResult {
+            principals: vec![
+                RemotePluginSharePrincipal {
+                    principal_type: RemotePluginSharePrincipalType::User,
+                    principal_id: "user-1".to_string(),
+                    role: RemotePluginSharePrincipalRole::Editor,
+                    name: "Gavin".to_string(),
+                },
+                RemotePluginSharePrincipal {
+                    principal_type: RemotePluginSharePrincipalType::Group,
+                    principal_id: "group-1".to_string(),
+                    role: RemotePluginSharePrincipalRole::Reader,
+                    name: "Engineering".to_string(),
+                },
+            ],
+            discoverability: RemotePluginShareDiscoverability::Unlisted,
         }
     );
 }
@@ -387,9 +556,23 @@ async fn list_remote_plugin_shares_fetches_created_workspace_plugins() {
         ))
         .and(query_param_is_missing("pageToken"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "plugins": [remote_plugin_json_with_share_url(
+            "plugins": [remote_plugin_json_with_share_url_and_principals(
                 "plugins_123",
                 Some("https://chatgpt.example/plugins/share/share-key-1"),
+                json!([
+                    {
+                        "principal_type": "user",
+                        "principal_id": "user-owner",
+                        "role": "owner",
+                        "name": "Owner",
+                    },
+                    {
+                        "principal_type": "user",
+                        "principal_id": "user-reader",
+                        "role": "reader",
+                        "name": "Reader",
+                    },
+                ]),
             )],
             "pagination": {
                 "next_page_token": "page-2"
@@ -408,7 +591,24 @@ async fn list_remote_plugin_shares_fetches_created_workspace_plugins() {
         ))
         .and(query_param("pageToken", "page-2"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "plugins": [remote_plugin_json_with_share_url("plugins_456", /*share_url*/ None)],
+            "plugins": [remote_plugin_json_with_share_url_and_principals(
+                "plugins_456",
+                /*share_url*/ None,
+                json!([
+                    {
+                        "principal_type": "user",
+                        "principal_id": "user-owner",
+                        "role": "owner",
+                        "name": "Owner",
+                    },
+                    {
+                        "principal_type": "user",
+                        "principal_id": "user-editor",
+                        "role": "editor",
+                        "name": "Editor",
+                    },
+                ]),
+            )],
             "pagination": empty_pagination_json(),
         })))
         .expect(1)
@@ -434,30 +634,94 @@ async fn list_remote_plugin_shares_fetches_created_workspace_plugins() {
         vec![
             RemotePluginShareSummary {
                 summary: RemotePluginSummary {
-                    id: "plugins_123".to_string(),
+                    id: "demo-plugin@workspace-shared-with-me".to_string(),
+                    remote_plugin_id: "plugins_123".to_string(),
+                    version: Some("0.1.0".to_string()),
+                    local_version: None,
                     name: "demo-plugin".to_string(),
+                    share_context: Some(RemotePluginShareContext {
+                        remote_plugin_id: "plugins_123".to_string(),
+                        remote_version: Some("0.1.0".to_string()),
+                        discoverability: RemotePluginShareDiscoverability::Private,
+                        share_url: Some(
+                            "https://chatgpt.example/plugins/share/share-key-1".to_string(),
+                        ),
+                        creator_account_user_id: None,
+                        creator_name: None,
+                        share_principals: Some(vec![
+                            RemotePluginSharePrincipal {
+                                principal_type: RemotePluginSharePrincipalType::User,
+                                principal_id: "user-owner".to_string(),
+                                role: RemotePluginSharePrincipalRole::Owner,
+                                name: "Owner".to_string(),
+                            },
+                            RemotePluginSharePrincipal {
+                                principal_type: RemotePluginSharePrincipalType::User,
+                                principal_id: "user-reader".to_string(),
+                                role: RemotePluginSharePrincipalRole::Reader,
+                                name: "Reader".to_string(),
+                            },
+                        ]),
+                        can_publish_to_workspace: None,
+                    }),
                     installed: false,
+                    installed_at: None,
                     enabled: false,
                     install_policy: PluginInstallPolicy::Available,
+                    install_policy_source: None,
+                    must_show_installation_interstitial: None,
                     auth_policy: PluginAuthPolicy::OnUse,
                     availability: PluginAvailability::Available,
+                    disabled_reason: None,
+                    eligible_plan_types: None,
                     interface: Some(expected_plugin_interface()),
+                    keywords: Vec::new(),
                 },
-                share_url: Some("https://chatgpt.example/plugins/share/share-key-1".to_string()),
                 local_plugin_path: Some(local_plugin_path),
             },
             RemotePluginShareSummary {
                 summary: RemotePluginSummary {
-                    id: "plugins_456".to_string(),
+                    id: "demo-plugin@workspace-shared-with-me".to_string(),
+                    remote_plugin_id: "plugins_456".to_string(),
+                    version: Some("0.1.0".to_string()),
+                    local_version: Some("0.1.0".to_string()),
                     name: "demo-plugin".to_string(),
+                    share_context: Some(RemotePluginShareContext {
+                        remote_plugin_id: "plugins_456".to_string(),
+                        remote_version: Some("0.1.0".to_string()),
+                        discoverability: RemotePluginShareDiscoverability::Private,
+                        share_url: None,
+                        creator_account_user_id: None,
+                        creator_name: None,
+                        share_principals: Some(vec![
+                            RemotePluginSharePrincipal {
+                                principal_type: RemotePluginSharePrincipalType::User,
+                                principal_id: "user-owner".to_string(),
+                                role: RemotePluginSharePrincipalRole::Owner,
+                                name: "Owner".to_string(),
+                            },
+                            RemotePluginSharePrincipal {
+                                principal_type: RemotePluginSharePrincipalType::User,
+                                principal_id: "user-editor".to_string(),
+                                role: RemotePluginSharePrincipalRole::Editor,
+                                name: "Editor".to_string(),
+                            },
+                        ]),
+                        can_publish_to_workspace: None,
+                    }),
                     installed: true,
+                    installed_at: None,
                     enabled: true,
                     install_policy: PluginInstallPolicy::Available,
+                    install_policy_source: None,
+                    must_show_installation_interstitial: None,
                     auth_policy: PluginAuthPolicy::OnUse,
                     availability: PluginAvailability::Available,
+                    disabled_reason: None,
+                    eligible_plan_types: None,
                     interface: Some(expected_plugin_interface()),
+                    keywords: Vec::new(),
                 },
-                share_url: None,
                 local_plugin_path: None,
             }
         ]

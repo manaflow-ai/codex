@@ -5,7 +5,7 @@
 # Usage (source-only):
 #   source scripts/test-remote-env.sh
 #   cd codex-rs
-#   cargo test -p codex-core --test all remote_env_connects_creates_temp_dir_and_runs_sample_script
+#   just test -p codex-core --test all remote_test_env_can_connect_and_use_filesystem
 #   codex_remote_env_cleanup
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -25,7 +25,7 @@ setup_remote_env() {
   local remote_exec_server_stdout_path
 
   container_name="${CODEX_TEST_REMOTE_ENV_CONTAINER_NAME:-codex-remote-test-env-local-$(date +%s)-${RANDOM}}"
-  codex_binary_path="${REPO_ROOT}/codex-rs/target/debug/codex"
+  codex_binary_path="${CARGO_TARGET_DIR:-${REPO_ROOT}/codex-rs/target}/debug/codex"
 
   if ! command -v docker >/dev/null 2>&1; then
     echo "docker is required (Colima or Docker Desktop)" >&2
@@ -59,7 +59,7 @@ setup_remote_env() {
     --privileged \
     --security-opt seccomp=unconfined \
     ubuntu:24.04 sleep infinity >/dev/null
-  if ! docker exec "${container_name}" sh -lc "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y python3 zsh"; then
+  if ! docker exec "${container_name}" sh -lc "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y python3 zsh bubblewrap"; then
     docker rm -f "${container_name}" >/dev/null 2>&1 || true
     return 1
   fi
@@ -89,6 +89,8 @@ setup_remote_env() {
   fi
 
   export CODEX_TEST_REMOTE_ENV="${container_name}"
+  export CODEX_TEST_REMOTE_ENV_CONTAINER_NAME="${container_name}"
+  export CODEX_TEST_ENVIRONMENT="docker"
 }
 
 wait_for_remote_exec_server_port() {
@@ -114,8 +116,10 @@ codex_remote_env_cleanup() {
     docker rm -f "${CODEX_TEST_REMOTE_ENV}" >/dev/null 2>&1 || true
     unset CODEX_TEST_REMOTE_ENV
   fi
+  unset CODEX_TEST_REMOTE_ENV_CONTAINER_NAME
   unset CODEX_TEST_REMOTE_EXEC_SERVER_PID
   unset CODEX_TEST_REMOTE_EXEC_SERVER_URL
+  unset CODEX_TEST_ENVIRONMENT
 }
 
 if ! is_sourced; then
@@ -128,6 +132,7 @@ set -euo pipefail
 if setup_remote_env; then
   status=0
   echo "CODEX_TEST_REMOTE_ENV=${CODEX_TEST_REMOTE_ENV}"
+  echo "CODEX_TEST_ENVIRONMENT=${CODEX_TEST_ENVIRONMENT}"
   echo "CODEX_TEST_REMOTE_EXEC_SERVER_URL=${CODEX_TEST_REMOTE_EXEC_SERVER_URL}"
   echo "Remote env ready. Run your command, then call: codex_remote_env_cleanup"
 else

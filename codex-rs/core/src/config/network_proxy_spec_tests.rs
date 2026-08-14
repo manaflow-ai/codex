@@ -5,12 +5,7 @@ use codex_network_proxy::NetworkDomainPermission;
 use codex_protocol::models::ManagedFileSystemPermissions;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::NetworkSandboxPolicy;
-use codex_protocol::protocol::SandboxPolicy;
 use pretty_assertions::assert_eq;
-
-fn permission_profile_for_sandbox_policy(sandbox_policy: &SandboxPolicy) -> PermissionProfile {
-    PermissionProfile::from_legacy_sandbox_policy(sandbox_policy)
-}
 
 fn domain_permissions(
     entries: impl IntoIterator<Item = (&'static str, NetworkDomainPermissionToml)>,
@@ -48,9 +43,7 @@ fn build_state_with_audit_metadata_threads_metadata_to_state() {
 #[test]
 fn requirements_allowed_domains_are_a_baseline_for_user_allowlist() {
     let mut config = NetworkProxyConfig::default();
-    config
-        .network
-        .set_allowed_domains(vec!["api.example.com".to_string()]);
+    config.set_allowed_domains(vec!["api.example.com".to_string()]);
     let requirements = NetworkConstraints {
         domains: Some(domain_permissions([(
             "*.example.com",
@@ -62,12 +55,12 @@ fn requirements_allowed_domains_are_a_baseline_for_user_allowlist() {
     let spec = NetworkProxySpec::from_config_and_constraints(
         config,
         Some(requirements),
-        &permission_profile_for_sandbox_policy(&SandboxPolicy::new_read_only_policy()),
+        &PermissionProfile::read_only(),
     )
     .expect("config should stay within the managed allowlist");
 
     assert_eq!(
-        spec.config.network.allowed_domains(),
+        spec.config.allowed_domains(),
         Some(vec![
             "*.example.com".to_string(),
             "api.example.com".to_string()
@@ -83,9 +76,7 @@ fn requirements_allowed_domains_are_a_baseline_for_user_allowlist() {
 #[test]
 fn requirements_allowed_domains_do_not_override_user_denies_for_same_pattern() {
     let mut config = NetworkProxyConfig::default();
-    config
-        .network
-        .set_denied_domains(vec!["api.example.com".to_string()]);
+    config.set_denied_domains(vec!["api.example.com".to_string()]);
     let requirements = NetworkConstraints {
         domains: Some(domain_permissions([(
             "api.example.com",
@@ -97,13 +88,13 @@ fn requirements_allowed_domains_do_not_override_user_denies_for_same_pattern() {
     let spec = NetworkProxySpec::from_config_and_constraints(
         config,
         Some(requirements),
-        &permission_profile_for_sandbox_policy(&SandboxPolicy::new_workspace_write_policy()),
+        &PermissionProfile::workspace_write(),
     )
     .expect("managed allowlist should not erase a user deny");
 
-    assert_eq!(spec.config.network.allowed_domains(), None);
+    assert_eq!(spec.config.allowed_domains(), None);
     assert_eq!(
-        spec.config.network.denied_domains(),
+        spec.config.denied_domains(),
         Some(vec!["api.example.com".to_string()])
     );
     assert_eq!(
@@ -115,9 +106,7 @@ fn requirements_allowed_domains_do_not_override_user_denies_for_same_pattern() {
 #[test]
 fn requirements_allowlist_expansion_keeps_user_entries_mutable() {
     let mut config = NetworkProxyConfig::default();
-    config
-        .network
-        .set_allowed_domains(vec!["api.example.com".to_string()]);
+    config.set_allowed_domains(vec!["api.example.com".to_string()]);
     let requirements = NetworkConstraints {
         domains: Some(domain_permissions([(
             "*.example.com",
@@ -129,23 +118,23 @@ fn requirements_allowlist_expansion_keeps_user_entries_mutable() {
     let spec = NetworkProxySpec::from_config_and_constraints(
         config,
         Some(requirements),
-        &permission_profile_for_sandbox_policy(&SandboxPolicy::new_workspace_write_policy()),
+        &PermissionProfile::workspace_write(),
     )
     .expect("managed baseline should still allow user edits");
 
     let mut candidate = spec.config.clone();
-    candidate.network.upsert_domain_permission(
+    candidate.upsert_domain_permission(
         "api.example.com".to_string(),
         NetworkDomainPermission::Deny,
         normalize_host,
     );
 
     assert_eq!(
-        candidate.network.allowed_domains(),
+        candidate.allowed_domains(),
         Some(vec!["*.example.com".to_string()])
     );
     assert_eq!(
-        candidate.network.denied_domains(),
+        candidate.denied_domains(),
         Some(vec!["api.example.com".to_string()])
     );
     validate_policy_against_constraints(&candidate, &spec.constraints)
@@ -155,9 +144,7 @@ fn requirements_allowlist_expansion_keeps_user_entries_mutable() {
 #[test]
 fn managed_unrestricted_profile_allows_domain_expansion() {
     let mut config = NetworkProxyConfig::default();
-    config
-        .network
-        .set_allowed_domains(vec!["api.example.com".to_string()]);
+    config.set_allowed_domains(vec!["api.example.com".to_string()]);
     let requirements = NetworkConstraints {
         domains: Some(domain_permissions([(
             "*.example.com",
@@ -178,7 +165,7 @@ fn managed_unrestricted_profile_allows_domain_expansion() {
     .expect("managed unrestricted filesystem should still use managed network constraints");
 
     assert_eq!(
-        spec.config.network.allowed_domains(),
+        spec.config.allowed_domains(),
         Some(vec![
             "*.example.com".to_string(),
             "api.example.com".to_string()
@@ -190,12 +177,8 @@ fn managed_unrestricted_profile_allows_domain_expansion() {
 #[test]
 fn danger_full_access_keeps_managed_allowlist_and_denylist_fixed() {
     let mut config = NetworkProxyConfig::default();
-    config
-        .network
-        .set_allowed_domains(vec!["evil.com".to_string()]);
-    config
-        .network
-        .set_denied_domains(vec!["more-blocked.example.com".to_string()]);
+    config.set_allowed_domains(vec!["evil.com".to_string()]);
+    config.set_denied_domains(vec!["more-blocked.example.com".to_string()]);
     let requirements = NetworkConstraints {
         domains: Some(domain_permissions([
             ("*.example.com", NetworkDomainPermissionToml::Allow),
@@ -207,16 +190,16 @@ fn danger_full_access_keeps_managed_allowlist_and_denylist_fixed() {
     let spec = NetworkProxySpec::from_config_and_constraints(
         config,
         Some(requirements),
-        &permission_profile_for_sandbox_policy(&SandboxPolicy::DangerFullAccess),
+        &PermissionProfile::Disabled,
     )
     .expect("yolo mode should pin the effective policy to the managed baseline");
 
     assert_eq!(
-        spec.config.network.allowed_domains(),
+        spec.config.allowed_domains(),
         Some(vec!["*.example.com".to_string()])
     );
     assert_eq!(
-        spec.config.network.denied_domains(),
+        spec.config.denied_domains(),
         Some(vec!["blocked.example.com".to_string()])
     );
     assert_eq!(spec.constraints.allowlist_expansion_enabled, Some(false));
@@ -226,9 +209,7 @@ fn danger_full_access_keeps_managed_allowlist_and_denylist_fixed() {
 #[test]
 fn managed_allowed_domains_only_disables_default_mode_allowlist_expansion() {
     let mut config = NetworkProxyConfig::default();
-    config
-        .network
-        .set_allowed_domains(vec!["api.example.com".to_string()]);
+    config.set_allowed_domains(vec!["api.example.com".to_string()]);
     let requirements = NetworkConstraints {
         domains: Some(domain_permissions([(
             "*.example.com",
@@ -241,12 +222,12 @@ fn managed_allowed_domains_only_disables_default_mode_allowlist_expansion() {
     let spec = NetworkProxySpec::from_config_and_constraints(
         config,
         Some(requirements),
-        &permission_profile_for_sandbox_policy(&SandboxPolicy::new_workspace_write_policy()),
+        &PermissionProfile::workspace_write(),
     )
     .expect("managed baseline should still load");
 
     assert_eq!(
-        spec.config.network.allowed_domains(),
+        spec.config.allowed_domains(),
         Some(vec!["*.example.com".to_string()])
     );
     assert_eq!(spec.constraints.allowlist_expansion_enabled, Some(false));
@@ -255,9 +236,7 @@ fn managed_allowed_domains_only_disables_default_mode_allowlist_expansion() {
 #[test]
 fn managed_allowed_domains_only_ignores_user_allowlist_and_hard_denies_misses() {
     let mut config = NetworkProxyConfig::default();
-    config
-        .network
-        .set_allowed_domains(vec!["api.example.com".to_string()]);
+    config.set_allowed_domains(vec!["api.example.com".to_string()]);
     let requirements = NetworkConstraints {
         domains: Some(domain_permissions([(
             "managed.example.com",
@@ -270,12 +249,12 @@ fn managed_allowed_domains_only_ignores_user_allowlist_and_hard_denies_misses() 
     let spec = NetworkProxySpec::from_config_and_constraints(
         config,
         Some(requirements),
-        &permission_profile_for_sandbox_policy(&SandboxPolicy::new_workspace_write_policy()),
+        &PermissionProfile::workspace_write(),
     )
     .expect("managed-only allowlist should still load");
 
     assert_eq!(
-        spec.config.network.allowed_domains(),
+        spec.config.allowed_domains(),
         Some(vec!["managed.example.com".to_string()])
     );
     assert_eq!(
@@ -289,9 +268,7 @@ fn managed_allowed_domains_only_ignores_user_allowlist_and_hard_denies_misses() 
 #[test]
 fn managed_allowed_domains_only_without_managed_allowlist_blocks_all_user_domains() {
     let mut config = NetworkProxyConfig::default();
-    config
-        .network
-        .set_allowed_domains(vec!["api.example.com".to_string()]);
+    config.set_allowed_domains(vec!["api.example.com".to_string()]);
     let requirements = NetworkConstraints {
         managed_allowed_domains_only: Some(true),
         ..Default::default()
@@ -300,11 +277,11 @@ fn managed_allowed_domains_only_without_managed_allowlist_blocks_all_user_domain
     let spec = NetworkProxySpec::from_config_and_constraints(
         config,
         Some(requirements),
-        &permission_profile_for_sandbox_policy(&SandboxPolicy::new_workspace_write_policy()),
+        &PermissionProfile::workspace_write(),
     )
     .expect("managed-only mode should treat missing managed allowlist as empty");
 
-    assert_eq!(spec.config.network.allowed_domains(), None);
+    assert_eq!(spec.config.allowed_domains(), None);
     assert_eq!(spec.constraints.allowed_domains, Some(Vec::new()));
     assert_eq!(spec.constraints.allowlist_expansion_enabled, Some(false));
     assert!(spec.hard_deny_allowlist_misses);
@@ -313,9 +290,7 @@ fn managed_allowed_domains_only_without_managed_allowlist_blocks_all_user_domain
 #[test]
 fn managed_allowed_domains_only_blocks_all_user_domains_in_full_access_without_managed_list() {
     let mut config = NetworkProxyConfig::default();
-    config
-        .network
-        .set_allowed_domains(vec!["api.example.com".to_string()]);
+    config.set_allowed_domains(vec!["api.example.com".to_string()]);
     let requirements = NetworkConstraints {
         managed_allowed_domains_only: Some(true),
         ..Default::default()
@@ -324,11 +299,11 @@ fn managed_allowed_domains_only_blocks_all_user_domains_in_full_access_without_m
     let spec = NetworkProxySpec::from_config_and_constraints(
         config,
         Some(requirements),
-        &permission_profile_for_sandbox_policy(&SandboxPolicy::DangerFullAccess),
+        &PermissionProfile::Disabled,
     )
     .expect("managed-only mode should treat missing managed allowlist as empty");
 
-    assert_eq!(spec.config.network.allowed_domains(), None);
+    assert_eq!(spec.config.allowed_domains(), None);
     assert_eq!(spec.constraints.allowed_domains, Some(Vec::new()));
     assert_eq!(spec.constraints.allowlist_expansion_enabled, Some(false));
     assert!(spec.hard_deny_allowlist_misses);
@@ -337,9 +312,7 @@ fn managed_allowed_domains_only_blocks_all_user_domains_in_full_access_without_m
 #[test]
 fn deny_only_requirements_do_not_create_allow_constraints_in_full_access() {
     let mut config = NetworkProxyConfig::default();
-    config
-        .network
-        .set_allowed_domains(vec!["api.example.com".to_string()]);
+    config.set_allowed_domains(vec!["api.example.com".to_string()]);
     let requirements = NetworkConstraints {
         domains: Some(domain_permissions([(
             "managed-blocked.example.com",
@@ -351,18 +324,18 @@ fn deny_only_requirements_do_not_create_allow_constraints_in_full_access() {
     let spec = NetworkProxySpec::from_config_and_constraints(
         config,
         Some(requirements),
-        &permission_profile_for_sandbox_policy(&SandboxPolicy::DangerFullAccess),
+        &PermissionProfile::Disabled,
     )
     .expect("deny-only requirements should not constrain the allowlist");
 
     assert_eq!(
-        spec.config.network.allowed_domains(),
+        spec.config.allowed_domains(),
         Some(vec!["api.example.com".to_string()])
     );
     assert_eq!(spec.constraints.allowed_domains, None);
     assert_eq!(spec.constraints.allowlist_expansion_enabled, None);
     assert_eq!(
-        spec.config.network.denied_domains(),
+        spec.config.denied_domains(),
         Some(vec!["managed-blocked.example.com".to_string()])
     );
 }
@@ -370,9 +343,7 @@ fn deny_only_requirements_do_not_create_allow_constraints_in_full_access() {
 #[test]
 fn allow_only_requirements_do_not_create_deny_constraints_in_full_access() {
     let mut config = NetworkProxyConfig::default();
-    config
-        .network
-        .set_denied_domains(vec!["blocked.example.com".to_string()]);
+    config.set_denied_domains(vec!["blocked.example.com".to_string()]);
     let requirements = NetworkConstraints {
         domains: Some(domain_permissions([(
             "managed.example.com",
@@ -384,16 +355,16 @@ fn allow_only_requirements_do_not_create_deny_constraints_in_full_access() {
     let spec = NetworkProxySpec::from_config_and_constraints(
         config,
         Some(requirements),
-        &permission_profile_for_sandbox_policy(&SandboxPolicy::DangerFullAccess),
+        &PermissionProfile::Disabled,
     )
     .expect("allow-only requirements should not constrain the denylist");
 
     assert_eq!(
-        spec.config.network.allowed_domains(),
+        spec.config.allowed_domains(),
         Some(vec!["managed.example.com".to_string()])
     );
     assert_eq!(
-        spec.config.network.denied_domains(),
+        spec.config.denied_domains(),
         Some(vec!["blocked.example.com".to_string()])
     );
     assert_eq!(spec.constraints.denied_domains, None);
@@ -403,9 +374,7 @@ fn allow_only_requirements_do_not_create_deny_constraints_in_full_access() {
 #[test]
 fn requirements_denied_domains_are_a_baseline_for_default_mode() {
     let mut config = NetworkProxyConfig::default();
-    config
-        .network
-        .set_denied_domains(vec!["blocked.example.com".to_string()]);
+    config.set_denied_domains(vec!["blocked.example.com".to_string()]);
     let requirements = NetworkConstraints {
         domains: Some(domain_permissions([(
             "managed-blocked.example.com",
@@ -417,12 +386,12 @@ fn requirements_denied_domains_are_a_baseline_for_default_mode() {
     let spec = NetworkProxySpec::from_config_and_constraints(
         config,
         Some(requirements),
-        &permission_profile_for_sandbox_policy(&SandboxPolicy::new_workspace_write_policy()),
+        &PermissionProfile::workspace_write(),
     )
     .expect("default mode should merge managed and user deny entries");
 
     assert_eq!(
-        spec.config.network.denied_domains(),
+        spec.config.denied_domains(),
         Some(vec![
             "managed-blocked.example.com".to_string(),
             "blocked.example.com".to_string()
@@ -438,9 +407,7 @@ fn requirements_denied_domains_are_a_baseline_for_default_mode() {
 #[test]
 fn requirements_denylist_expansion_keeps_user_entries_mutable() {
     let mut config = NetworkProxyConfig::default();
-    config
-        .network
-        .set_denied_domains(vec!["blocked.example.com".to_string()]);
+    config.set_denied_domains(vec!["blocked.example.com".to_string()]);
     let requirements = NetworkConstraints {
         domains: Some(domain_permissions([(
             "managed-blocked.example.com",
@@ -452,23 +419,23 @@ fn requirements_denylist_expansion_keeps_user_entries_mutable() {
     let spec = NetworkProxySpec::from_config_and_constraints(
         config,
         Some(requirements),
-        &permission_profile_for_sandbox_policy(&SandboxPolicy::new_workspace_write_policy()),
+        &PermissionProfile::workspace_write(),
     )
     .expect("managed baseline should still allow user edits");
 
     let mut candidate = spec.config.clone();
-    candidate.network.upsert_domain_permission(
+    candidate.upsert_domain_permission(
         "blocked.example.com".to_string(),
         NetworkDomainPermission::Allow,
         normalize_host,
     );
 
     assert_eq!(
-        candidate.network.allowed_domains(),
+        candidate.allowed_domains(),
         Some(vec!["blocked.example.com".to_string()])
     );
     assert_eq!(
-        candidate.network.denied_domains(),
+        candidate.denied_domains(),
         Some(vec!["managed-blocked.example.com".to_string()])
     );
     validate_policy_against_constraints(&candidate, &spec.constraints)

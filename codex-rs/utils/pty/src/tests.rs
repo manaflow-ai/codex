@@ -4,17 +4,18 @@ use std::path::Path;
 use pretty_assertions::assert_eq;
 
 use crate::ProcessDriver;
+use crate::ProcessSignal;
 use crate::SpawnedProcess;
 use crate::TerminalSize;
 use crate::combine_output_receivers;
-#[cfg(unix)]
-use crate::pipe::spawn_process_no_stdin_with_inherited_fds;
-#[cfg(unix)]
-use crate::pty::spawn_process_with_inherited_fds;
 use crate::spawn_from_driver;
 use crate::spawn_pipe_process;
 use crate::spawn_pipe_process_no_stdin;
 use crate::spawn_pty_process;
+
+#[cfg(windows)]
+#[path = "windows_tests.rs"]
+mod windows_tests;
 
 fn find_python() -> Option<String> {
     for candidate in ["python3", "python"] {
@@ -140,7 +141,6 @@ async fn collect_output_until_exit(
     }
 }
 
-#[cfg(unix)]
 async fn wait_for_output_contains(
     output_rx: &mut tokio::sync::broadcast::Receiver<Vec<u8>>,
     needle: &str,
@@ -362,6 +362,7 @@ async fn pty_python_repl_emits_output_and_exits() -> anyhow::Result<()> {
         &env_map,
         &None,
         TerminalSize::default(),
+        &[],
     )
     .await?;
     let (session, mut output_rx, exit_rx) = combine_spawned_output(spawned);
@@ -418,7 +419,7 @@ async fn pipe_process_round_trips_stdin() -> anyhow::Result<()> {
         )
     };
     let env_map: HashMap<String, String> = std::env::vars().collect();
-    let spawned = spawn_pipe_process(&program, &args, Path::new("."), &env_map, &None).await?;
+    let spawned = spawn_pipe_process(&program, &args, Path::new("."), &env_map, &None, &[]).await?;
     let (session, output_rx, exit_rx) = combine_spawned_output(spawned);
     let writer = session.writer_sender();
     let newline = if cfg!(windows) { "\r\n" } else { "\n" };
@@ -451,7 +452,7 @@ async fn pipe_process_detaches_from_parent_session() -> anyhow::Result<()> {
     let env_map: HashMap<String, String> = std::env::vars().collect();
     let script = "echo $$; sleep 0.2";
     let (program, args) = shell_command(script);
-    let spawned = spawn_pipe_process(&program, &args, Path::new("."), &env_map, &None).await?;
+    let spawned = spawn_pipe_process(&program, &args, Path::new("."), &env_map, &None, &[]).await?;
 
     let (_session, mut output_rx, exit_rx) = combine_spawned_output(spawned);
     let pid_bytes =
@@ -490,8 +491,15 @@ async fn pipe_and_pty_share_interface() -> anyhow::Result<()> {
     let (pipe_program, pipe_args) = shell_command(&echo_sleep_command("pipe_ok"));
     let (pty_program, pty_args) = shell_command(&echo_sleep_command("pty_ok"));
 
-    let pipe =
-        spawn_pipe_process(&pipe_program, &pipe_args, Path::new("."), &env_map, &None).await?;
+    let pipe = spawn_pipe_process(
+        &pipe_program,
+        &pipe_args,
+        Path::new("."),
+        &env_map,
+        &None,
+        &[],
+    )
+    .await?;
     let pty = spawn_pty_process(
         &pty_program,
         &pty_args,
@@ -499,6 +507,7 @@ async fn pipe_and_pty_share_interface() -> anyhow::Result<()> {
         &env_map,
         &None,
         TerminalSize::default(),
+        &[],
     )
     .await?;
     let (_pipe_session, pipe_output_rx, pipe_exit_rx) = combine_spawned_output(pipe);
@@ -534,7 +543,7 @@ async fn pipe_drains_stderr_without_stdout_activity() -> anyhow::Result<()> {
     let script = "import sys\nchunk = 'E' * 65536\nfor _ in range(64):\n    sys.stderr.write(chunk)\n    sys.stderr.flush()\n";
     let args = vec!["-c".to_string(), script.to_string()];
     let env_map: HashMap<String, String> = std::env::vars().collect();
-    let spawned = spawn_pipe_process(&python, &args, Path::new("."), &env_map, &None).await?;
+    let spawned = spawn_pipe_process(&python, &args, Path::new("."), &env_map, &None, &[]).await?;
     let (_session, output_rx, exit_rx) = combine_spawned_output(spawned);
 
     let (output, code) = collect_output_until_exit(output_rx, exit_rx, /*timeout_ms*/ 10_000).await;
@@ -550,7 +559,7 @@ async fn pipe_process_can_expose_split_stdout_and_stderr() -> anyhow::Result<()>
     let env_map: HashMap<String, String> = std::env::vars().collect();
     let (program, args) = shell_command(&split_stdout_stderr_command());
     let spawned =
-        spawn_pipe_process_no_stdin(&program, &args, Path::new("."), &env_map, &None).await?;
+        spawn_pipe_process_no_stdin(&program, &args, Path::new("."), &env_map, &None, &[]).await?;
     let SpawnedProcess {
         session: _session,
         stdout_rx,
@@ -606,7 +615,14 @@ async fn driver_backed_process_can_expose_split_stdout_and_stderr() -> anyhow::R
         terminator: None,
         writer_handle: None,
         resizer: None,
+        #[cfg(windows)]
+        tty: false,
     });
+    let error = spawned
+        .session
+        .signal(ProcessSignal::Interrupt)
+        .expect_err("interrupting a driver without a terminator should remain unsupported");
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
 
     let SpawnedProcess {
         session: _session,
@@ -642,6 +658,37 @@ async fn driver_backed_process_can_expose_split_stdout_and_stderr() -> anyhow::R
     Ok(())
 }
 
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn driver_backed_interrupt_terminates_once() {
+    let terminations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let callback_terminations = std::sync::Arc::clone(&terminations);
+    let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+    let (_stdout_tx, stdout_rx) = tokio::sync::broadcast::channel::<Vec<u8>>(1);
+    let (_exit_tx, exit_rx) = tokio::sync::oneshot::channel::<i32>();
+    let spawned = spawn_from_driver(ProcessDriver {
+        writer_tx,
+        stdout_rx,
+        stderr_rx: None,
+        exit_rx,
+        terminator: Some(Box::new(move || {
+            callback_terminations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })),
+        writer_handle: None,
+        resizer: None,
+        #[cfg(windows)]
+        tty: false,
+    });
+
+    spawned
+        .session
+        .signal(ProcessSignal::Interrupt)
+        .expect("interrupt should terminate the driver-backed process");
+    drop(spawned.session);
+
+    assert_eq!(terminations.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn driver_backed_process_can_resize_via_resizer_hook() -> anyhow::Result<()> {
     let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
@@ -655,7 +702,7 @@ async fn driver_backed_process_can_resize_via_resizer_hook() -> anyhow::Result<(
         stdout_rx: stdout_driver_rx,
         stderr_rx: None,
         exit_rx,
-        terminator: None,
+        terminator: Some(Box::new(|| {})),
         writer_handle: None,
         resizer: Some(Box::new(move |size| {
             if let Ok(mut guard) = size_tx.lock()
@@ -665,7 +712,15 @@ async fn driver_backed_process_can_resize_via_resizer_hook() -> anyhow::Result<(
             }
             Ok(())
         })),
+        #[cfg(windows)]
+        tty: true,
     });
+
+    let error = spawned
+        .session
+        .signal(ProcessSignal::Interrupt)
+        .expect_err("interrupting a PTY-backed driver should remain unsupported");
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
 
     spawned.session.resize(TerminalSize {
         rows: 40,
@@ -703,6 +758,8 @@ async fn driver_backed_process_drains_output_that_arrives_after_exit_signal() ->
         terminator: None,
         writer_handle: None,
         resizer: None,
+        #[cfg(windows)]
+        tty: false,
     });
 
     let SpawnedProcess {
@@ -744,7 +801,7 @@ async fn pipe_terminate_aborts_detached_readers() -> anyhow::Result<()> {
     let script =
         "setsid sh -c 'i=0; while [ $i -lt 200 ]; do echo tick; sleep 0.01; i=$((i+1)); done' &";
     let (program, args) = shell_command(script);
-    let spawned = spawn_pipe_process(&program, &args, Path::new("."), &env_map, &None).await?;
+    let spawned = spawn_pipe_process(&program, &args, Path::new("."), &env_map, &None, &[]).await?;
     let (session, mut output_rx, _exit_rx) = combine_spawned_output(spawned);
 
     let _ = tokio::time::timeout(tokio::time::Duration::from_millis(500), output_rx.recv())
@@ -770,6 +827,140 @@ async fn pipe_terminate_aborts_detached_readers() -> anyhow::Result<()> {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pipe_terminate_reaps_child() -> anyhow::Result<()> {
+    let env_map: HashMap<String, String> = std::env::vars().collect();
+    let command = if cfg!(windows) {
+        "ping -n 60 127.0.0.1 > NUL"
+    } else {
+        "sleep 60"
+    };
+    let (program, args) = shell_command(command);
+    let spawned = spawn_pipe_process(&program, &args, Path::new("."), &env_map, &None, &[]).await?;
+    let (session, _output_rx, exit_rx) = combine_spawned_output(spawned);
+
+    session.terminate();
+
+    let exit_code = tokio::time::timeout(tokio::time::Duration::from_secs(5), exit_rx)
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for terminated child to be reaped"))?
+        .map_err(|_| anyhow::anyhow!("child waiter was aborted before reaping"))?;
+    assert_eq!(session.exit_code(), Some(exit_code));
+    assert!(session.has_exited());
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pipe_drop_reaps_child() -> anyhow::Result<()> {
+    let env_map: HashMap<String, String> = std::env::vars().collect();
+    let command = if cfg!(windows) {
+        "ping -n 60 127.0.0.1 > NUL"
+    } else {
+        "sleep 60"
+    };
+    let (program, args) = shell_command(command);
+    let spawned = spawn_pipe_process(&program, &args, Path::new("."), &env_map, &None, &[]).await?;
+    let (session, _output_rx, exit_rx) = combine_spawned_output(spawned);
+
+    drop(session);
+
+    tokio::time::timeout(tokio::time::Duration::from_secs(5), exit_rx)
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for dropped child to be reaped"))?
+        .map_err(|_| anyhow::anyhow!("child waiter was aborted before reaping"))?;
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn pty_terminate_reaps_child_when_waiter_is_queued() -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()?;
+    let (blocker_started_tx, blocker_started_rx) = std::sync::mpsc::channel();
+    let (release_blocker_tx, release_blocker_rx) = std::sync::mpsc::channel();
+    // Keep the PTY's blocking child waiter queued until after termination.
+    runtime.spawn_blocking(move || {
+        let _ = blocker_started_tx.send(());
+        let _ = release_blocker_rx.recv_timeout(std::time::Duration::from_secs(5));
+    });
+    blocker_started_rx.recv_timeout(std::time::Duration::from_secs(2))?;
+
+    let pid_file = std::env::temp_dir().join(format!(
+        "codex-pty-reap-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    ));
+    runtime.block_on(async {
+        let mut env_map: HashMap<String, String> = std::env::vars().collect();
+        env_map.insert(
+            "CODEX_PTY_TEST_PID_FILE".to_string(),
+            pid_file.display().to_string(),
+        );
+        let (program, args) =
+            shell_command("printf '%s' \"$$\" > \"$CODEX_PTY_TEST_PID_FILE\"; sleep 60");
+        let spawned = spawn_pty_process(
+            &program,
+            &args,
+            Path::new("."),
+            &env_map,
+            &None,
+            TerminalSize::default(),
+            &[],
+        )
+        .await?;
+        let (session, _output_rx, exit_rx) = combine_spawned_output(spawned);
+
+        let child_pid = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&pid_file)
+                    && let Ok(pid) = pid.parse::<libc::pid_t>()
+                {
+                    return pid;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for the PTY child PID"))?;
+        std::fs::remove_file(&pid_file)?;
+
+        session.terminate();
+        drop(session);
+        release_blocker_tx.send(())?;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), exit_rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting for the PTY child waiter"))?;
+
+        // A returned PID proves an exited child was still an unreaped zombie.
+        let wait_result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let result =
+                    unsafe { libc::waitpid(child_pid, std::ptr::null_mut(), libc::WNOHANG) };
+                if result != 0 {
+                    return result;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for the PTY child to exit"))?;
+        let wait_error = std::io::Error::last_os_error();
+        assert_eq!(
+            wait_result, -1,
+            "PTY child {child_pid} remained an unreaped zombie"
+        );
+        assert_eq!(wait_error.raw_os_error(), Some(libc::ECHILD));
+
+        Ok(())
+    })
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pty_terminate_kills_background_children_in_same_process_group() -> anyhow::Result<()> {
@@ -784,9 +975,10 @@ async fn pty_terminate_kills_background_children_in_same_process_group() -> anyh
         &env_map,
         &None,
         TerminalSize::default(),
+        &[],
     )
     .await?;
-    let (session, mut output_rx, _exit_rx) = combine_spawned_output(spawned);
+    let (session, mut output_rx, exit_rx) = combine_spawned_output(spawned);
 
     let bg_pid = match wait_for_marker_pid(&mut output_rx, marker, /*timeout_ms*/ 2_000).await {
         Ok(pid) => pid,
@@ -801,6 +993,12 @@ async fn pty_terminate_kills_background_children_in_same_process_group() -> anyh
     );
 
     session.terminate();
+
+    tokio::time::timeout(tokio::time::Duration::from_secs(3), exit_rx)
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for terminated PTY child to be reaped"))?
+        .map_err(|_| anyhow::anyhow!("PTY child waiter was aborted before reaping"))?;
+    assert!(session.has_exited());
 
     let exited = wait_for_process_exit(bg_pid, /*timeout_ms*/ 3_000).await?;
     if !exited {
@@ -838,7 +1036,7 @@ async fn pty_spawn_can_preserve_inherited_fds() -> anyhow::Result<()> {
     );
 
     let script = "printf __preserved__ >\"/dev/fd/$PRESERVED_FD\"";
-    let spawned = spawn_process_with_inherited_fds(
+    let spawned = spawn_pty_process(
         "/bin/sh",
         &["-c".to_string(), script.to_string()],
         Path::new("."),
@@ -890,7 +1088,7 @@ async fn pty_preserving_inherited_fds_keeps_python_repl_running() -> anyhow::Res
         preserved_fd.as_raw_fd().to_string(),
     );
 
-    let spawned = spawn_process_with_inherited_fds(
+    let spawned = spawn_pty_process(
         &python,
         &[],
         Path::new("."),
@@ -956,7 +1154,7 @@ async fn pty_spawn_with_inherited_fds_reports_exec_failures() -> anyhow::Result<
     let write_end = unsafe { std::fs::File::from_raw_fd(fds[1]) };
 
     let env_map: HashMap<String, String> = std::env::vars().collect();
-    let spawn_result = spawn_process_with_inherited_fds(
+    let spawn_result = spawn_pty_process(
         "/definitely/missing/command",
         &[],
         Path::new("."),
@@ -1005,7 +1203,7 @@ async fn pty_spawn_with_inherited_fds_supports_resize() -> anyhow::Result<()> {
 
     let env_map: HashMap<String, String> = std::env::vars().collect();
     let script = "stty -echo; printf 'start:%s\\n' \"$(stty size)\"; IFS= read _line; printf 'after:%s\\n' \"$(stty size)\"";
-    let spawned = spawn_process_with_inherited_fds(
+    let spawned = spawn_pty_process(
         "/bin/sh",
         &["-c".to_string(), script.to_string()],
         Path::new("."),
@@ -1076,7 +1274,7 @@ async fn pipe_spawn_no_stdin_can_preserve_inherited_fds() -> anyhow::Result<()> 
     );
 
     let script = "printf __pipe_preserved__ >\"/dev/fd/$PRESERVED_FD\"";
-    let spawned = spawn_process_no_stdin_with_inherited_fds(
+    let spawned = spawn_pipe_process_no_stdin(
         "/bin/sh",
         &["-c".to_string(), script.to_string()],
         Path::new("."),

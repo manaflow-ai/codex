@@ -2,6 +2,8 @@ use super::*;
 use codex_config::types::WindowsToml;
 use codex_features::Features;
 use codex_features::FeaturesToml;
+use codex_network_proxy::NetworkProxyConfig;
+use codex_protocol::models::PermissionProfile;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
 
@@ -79,29 +81,6 @@ fn legacy_mode_supports_alias_key() {
 }
 
 #[test]
-fn resolve_windows_sandbox_mode_prefers_profile_windows() {
-    let cfg = ConfigToml {
-        windows: Some(WindowsToml {
-            sandbox: Some(WindowsSandboxModeToml::Unelevated),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-    let profile = ConfigProfile {
-        windows: Some(WindowsToml {
-            sandbox: Some(WindowsSandboxModeToml::Elevated),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-
-    assert_eq!(
-        resolve_windows_sandbox_mode(&cfg, &profile),
-        Some(WindowsSandboxModeToml::Elevated)
-    );
-}
-
-#[test]
 fn resolve_windows_sandbox_mode_falls_back_to_legacy_keys() {
     let mut entries = BTreeMap::new();
     entries.insert(
@@ -114,61 +93,15 @@ fn resolve_windows_sandbox_mode_falls_back_to_legacy_keys() {
     };
 
     assert_eq!(
-        resolve_windows_sandbox_mode(&cfg, &ConfigProfile::default()),
+        resolve_windows_sandbox_mode(&cfg),
         Some(WindowsSandboxModeToml::Unelevated)
     );
 }
 
 #[test]
-fn resolve_windows_sandbox_mode_profile_legacy_false_blocks_top_level_legacy_true() {
-    let mut profile_entries = BTreeMap::new();
-    profile_entries.insert(
-        "experimental_windows_sandbox".to_string(),
-        /*value*/ false,
-    );
-    let profile = ConfigProfile {
-        features: Some(FeaturesToml::from(profile_entries)),
-        ..Default::default()
-    };
-
-    let mut cfg_entries = BTreeMap::new();
-    cfg_entries.insert(
-        "experimental_windows_sandbox".to_string(),
-        /*value*/ true,
-    );
-    let cfg = ConfigToml {
-        features: Some(FeaturesToml::from(cfg_entries)),
-        ..Default::default()
-    };
-
-    assert_eq!(resolve_windows_sandbox_mode(&cfg, &profile), None);
-}
-
-#[test]
-fn resolve_windows_sandbox_private_desktop_prefers_profile_windows() {
-    let cfg = ConfigToml {
-        windows: Some(WindowsToml {
-            sandbox: Some(WindowsSandboxModeToml::Unelevated),
-            sandbox_private_desktop: Some(false),
-        }),
-        ..Default::default()
-    };
-    let profile = ConfigProfile {
-        windows: Some(WindowsToml {
-            sandbox: Some(WindowsSandboxModeToml::Elevated),
-            sandbox_private_desktop: Some(true),
-        }),
-        ..Default::default()
-    };
-
-    assert!(resolve_windows_sandbox_private_desktop(&cfg, &profile));
-}
-
-#[test]
 fn resolve_windows_sandbox_private_desktop_defaults_to_true() {
     assert!(resolve_windows_sandbox_private_desktop(
-        &ConfigToml::default(),
-        &ConfigProfile::default()
+        &ConfigToml::default()
     ));
 }
 
@@ -182,8 +115,46 @@ fn resolve_windows_sandbox_private_desktop_respects_explicit_cfg_value() {
         ..Default::default()
     };
 
-    assert!(!resolve_windows_sandbox_private_desktop(
-        &cfg,
-        &ConfigProfile::default()
-    ));
+    assert!(!resolve_windows_sandbox_private_desktop(&cfg));
+}
+
+#[test]
+fn provisioning_settings_omit_the_disabled_socks_proxy() {
+    let config = NetworkProxyConfig {
+        enabled: true,
+        proxy_url: "http://127.0.0.1:43128".to_string(),
+        enable_socks5: false,
+        socks_url: "socks5h://127.0.0.1:48081".to_string(),
+        allow_local_binding: true,
+        ..Default::default()
+    };
+    let spec = crate::config::NetworkProxySpec::from_config_and_constraints(
+        config,
+        /*requirements*/ None,
+        &PermissionProfile::workspace_write(),
+    )
+    .expect("managed proxy config should resolve");
+
+    assert_eq!(
+        provisioning_settings(Some(&spec)).expect("provisioning settings should resolve"),
+        codex_windows_sandbox::WindowsSandboxProvisioningSettings {
+            proxy_ports: vec![43128],
+            allow_local_binding: true,
+        }
+    );
+}
+
+#[test]
+fn provisioning_settings_are_empty_when_managed_network_is_disabled() {
+    let spec = crate::config::NetworkProxySpec::from_config_and_constraints(
+        NetworkProxyConfig::default(),
+        /*requirements*/ None,
+        &PermissionProfile::workspace_write(),
+    )
+    .expect("managed proxy config should resolve");
+
+    assert_eq!(
+        provisioning_settings(Some(&spec)).expect("provisioning settings should resolve"),
+        codex_windows_sandbox::WindowsSandboxProvisioningSettings::default()
+    );
 }

@@ -1,23 +1,16 @@
+use crate::error_subtype::http_status_sub_error_type;
 use crate::remote::RemotePluginServiceConfig;
+use codex_http_client::RouteAwareRequestError;
 use codex_login::CodexAuth;
-use codex_login::default_client::build_reqwest_client;
 use codex_protocol::protocol::Product;
+use http::Method;
+use http::StatusCode;
 use serde::Deserialize;
 use std::time::Duration;
 use url::Url;
 
-const DEFAULT_REMOTE_MARKETPLACE_NAME: &str = "openai-curated";
-const REMOTE_PLUGIN_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const REMOTE_FEATURED_PLUGIN_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_PLUGIN_MUTATION_TIMEOUT: Duration = Duration::from_secs(30);
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct RemotePluginStatusSummary {
-    pub name: String,
-    #[serde(default = "default_remote_marketplace_name")]
-    pub marketplace_name: String,
-    pub enabled: bool,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -49,13 +42,13 @@ pub enum RemotePluginMutationError {
     Request {
         url: String,
         #[source]
-        source: reqwest::Error,
+        source: RouteAwareRequestError,
     },
 
     #[error("remote plugin mutation failed with status {status} from {url}: {body}")]
     UnexpectedStatus {
         url: String,
-        status: reqwest::StatusCode,
+        status: StatusCode,
         body: String,
     },
 
@@ -81,77 +74,50 @@ pub enum RemotePluginMutationError {
     },
 }
 
+impl RemotePluginMutationError {
+    pub(crate) fn sub_error_type(&self) -> Option<String> {
+        match self {
+            Self::UnexpectedStatus { status, .. } => {
+                Some(http_status_sub_error_type(*status).to_string())
+            }
+            Self::AuthRequired
+            | Self::UnsupportedAuthMode
+            | Self::AuthToken(_)
+            | Self::InvalidBaseUrl(_)
+            | Self::InvalidBaseUrlPath
+            | Self::Request { .. }
+            | Self::Decode { .. }
+            | Self::UnexpectedPluginId { .. }
+            | Self::UnexpectedEnabledState { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RemotePluginFetchError {
-    #[error("chatgpt authentication required to sync remote plugins")]
-    AuthRequired,
+    #[error("invalid chatgpt base url for remote featured plugin request: {0}")]
+    InvalidBaseUrl(#[source] url::ParseError),
 
-    #[error(
-        "chatgpt authentication required to sync remote plugins; api key auth is not supported"
-    )]
-    UnsupportedAuthMode,
-
-    #[error("failed to read auth token for remote plugin sync: {0}")]
-    AuthToken(#[source] std::io::Error),
-
-    #[error("failed to send remote plugin sync request to {url}: {source}")]
+    #[error("failed to send remote featured plugin request to {url}: {source}")]
     Request {
         url: String,
         #[source]
-        source: reqwest::Error,
+        source: RouteAwareRequestError,
     },
 
-    #[error("remote plugin sync request to {url} failed with status {status}: {body}")]
+    #[error("remote featured plugin request to {url} failed with status {status}: {body}")]
     UnexpectedStatus {
         url: String,
-        status: reqwest::StatusCode,
+        status: StatusCode,
         body: String,
     },
 
-    #[error("failed to parse remote plugin sync response from {url}: {source}")]
+    #[error("failed to parse remote featured plugin response from {url}: {source}")]
     Decode {
         url: String,
         #[source]
         source: serde_json::Error,
     },
-}
-
-pub async fn fetch_remote_plugin_status(
-    config: &RemotePluginServiceConfig,
-    auth: Option<&CodexAuth>,
-) -> Result<Vec<RemotePluginStatusSummary>, RemotePluginFetchError> {
-    let Some(auth) = auth else {
-        return Err(RemotePluginFetchError::AuthRequired);
-    };
-    if !auth.uses_codex_backend() {
-        return Err(RemotePluginFetchError::UnsupportedAuthMode);
-    }
-
-    let base_url = config.chatgpt_base_url.trim_end_matches('/');
-    let url = format!("{base_url}/plugins/list");
-    let client = build_reqwest_client();
-    let request = client
-        .get(&url)
-        .timeout(REMOTE_PLUGIN_FETCH_TIMEOUT)
-        .headers(codex_model_provider::auth_provider_from_auth(auth).to_auth_headers());
-
-    let response = request
-        .send()
-        .await
-        .map_err(|source| RemotePluginFetchError::Request {
-            url: url.clone(),
-            source,
-        })?;
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(RemotePluginFetchError::UnexpectedStatus { url, status, body });
-    }
-
-    serde_json::from_str(&body).map_err(|source| RemotePluginFetchError::Decode {
-        url: url.clone(),
-        source,
-    })
 }
 
 pub async fn fetch_remote_featured_plugin_ids(
@@ -160,14 +126,15 @@ pub async fn fetch_remote_featured_plugin_ids(
     product: Option<Product>,
 ) -> Result<Vec<String>, RemotePluginFetchError> {
     let base_url = config.chatgpt_base_url.trim_end_matches('/');
-    let url = format!("{base_url}/plugins/featured");
-    let client = build_reqwest_client();
-    let mut request = client
-        .get(&url)
-        .query(&[(
-            "platform",
-            product.unwrap_or(Product::Codex).to_app_platform(),
-        )])
+    let mut url = Url::parse(&format!("{base_url}/plugins/featured"))
+        .map_err(RemotePluginFetchError::InvalidBaseUrl)?;
+    url.query_pairs_mut().append_pair(
+        "platform",
+        product.unwrap_or(Product::Codex).to_app_platform(),
+    );
+    let url = url.to_string();
+    let mut request = config
+        .http_request(Method::GET, &url)
         .timeout(REMOTE_FEATURED_PLUGIN_FETCH_TIMEOUT);
 
     if let Some(auth) = auth.filter(|auth| auth.uses_codex_backend()) {
@@ -224,10 +191,6 @@ fn ensure_codex_backend_auth(
     Ok(auth)
 }
 
-fn default_remote_marketplace_name() -> String {
-    DEFAULT_REMOTE_MARKETPLACE_NAME.to_string()
-}
-
 async fn post_remote_plugin_mutation(
     config: &RemotePluginServiceConfig,
     auth: Option<&CodexAuth>,
@@ -236,9 +199,8 @@ async fn post_remote_plugin_mutation(
 ) -> Result<RemotePluginMutationResponse, RemotePluginMutationError> {
     let auth = ensure_codex_backend_auth(auth)?;
     let url = remote_plugin_mutation_url(config, plugin_id, action)?;
-    let client = build_reqwest_client();
-    let request = client
-        .post(url.clone())
+    let request = config
+        .http_request(Method::POST, &url)
         .timeout(REMOTE_PLUGIN_MUTATION_TIMEOUT)
         .headers(codex_model_provider::auth_provider_from_auth(auth).to_auth_headers());
 

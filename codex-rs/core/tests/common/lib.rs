@@ -1,4 +1,4 @@
-#![expect(clippy::expect_used)]
+#![allow(clippy::expect_used)]
 
 use anyhow::Context as _;
 use anyhow::ensure;
@@ -8,28 +8,43 @@ use ctor::ctor;
 use std::sync::OnceLock;
 use tempfile::TempDir;
 
-use codex_config::CloudRequirementsLoader;
-use codex_config::ConfigRequirementsToml;
-use codex_config::NetworkRequirementsToml;
+use codex_config::CloudConfigBundleLoader;
+use codex_config::LoaderOverrides;
+use codex_config::test_support::CloudConfigBundleFixture;
 use codex_core::CodexThread;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
+pub use codex_core::test_support::TestCodexResponsesRequestKind;
+pub use codex_core::test_support::responses_metadata;
 use codex_utils_absolute_path::AbsolutePathBuf;
 pub use codex_utils_absolute_path::test_support::PathBufExt;
 pub use codex_utils_absolute_path::test_support::PathExt;
 use regex_lite::Regex;
+use std::path::Path;
 use std::path::PathBuf;
 
 pub mod apps_test_server;
 pub mod context_snapshot;
+pub mod hooks;
 pub mod process;
 pub mod responses;
 pub mod streaming_sse;
 pub mod test_codex;
 pub mod test_codex_exec;
+mod test_environment;
 pub mod tracing;
 pub mod zsh_fork;
+
+pub(crate) use test_environment::TestEnvironment;
+pub use test_environment::TestTargetOs;
+pub use test_environment::is_remote_test_environment;
+#[doc(hidden)]
+pub use test_environment::is_wine_exec_test_environment;
+#[doc(hidden)]
+pub use test_environment::test_docker_container_name;
+pub(crate) use test_environment::test_environment;
+pub use test_environment::test_target_os;
 
 static TEST_ARG0_PATH_ENTRY: OnceLock<Option<Arg0PathEntryGuard>> = OnceLock::new();
 
@@ -66,12 +81,10 @@ fn configure_insta_workspace_root_for_snapshot_tests() {
 
 #[track_caller]
 pub fn assert_regex_match<'s>(pattern: &str, actual: &'s str) -> regex_lite::Captures<'s> {
-    let regex = Regex::new(pattern).unwrap_or_else(|err| {
-        panic!("failed to compile regex {pattern:?}: {err}");
-    });
+    let regex = Regex::new(pattern).expect("failed to compile regex");
     regex
         .captures(actual)
-        .unwrap_or_else(|| panic!("regex {pattern:?} did not match {actual:?}"))
+        .expect("regex did not match actual value")
 }
 
 pub fn test_path_buf_with_windows(unix_path: &str, windows_path: Option<&str>) -> PathBuf {
@@ -107,6 +120,20 @@ pub fn test_absolute_path_with_windows(
 
 pub fn test_absolute_path(unix_path: &str) -> AbsolutePathBuf {
     test_absolute_path_with_windows(unix_path, /*windows_path*/ None)
+}
+
+#[cfg(unix)]
+#[allow(clippy::expect_used)]
+pub fn create_directory_symlink(source: &Path, link: &Path) {
+    std::os::unix::fs::symlink(source, link).expect("create directory symlink");
+}
+
+#[cfg(windows)]
+#[allow(clippy::expect_used)]
+pub fn create_directory_symlink(source: &Path, link: &Path) {
+    // Running this test locally may require Windows Developer Mode or an elevated process.
+    std::os::windows::fs::symlink_dir(source, link)
+        .expect("create directory symlink; enable Developer Mode or run the test elevated");
 }
 
 pub trait TempDirExt {
@@ -167,39 +194,37 @@ pub fn fetch_dotslash_file(
 /// temporary directory. Using a per-test directory keeps tests hermetic and
 /// avoids clobbering a developer’s real `~/.codex`.
 pub async fn load_default_config_for_test(codex_home: &TempDir) -> Config {
-    load_default_config_for_test_with_cloud_requirements(
+    load_default_config_for_test_with_cloud_config_bundle(
         codex_home,
-        CloudRequirementsLoader::default(),
+        CloudConfigBundleLoader::default(),
     )
     .await
 }
 
-/// Returns a default `Config` with test-provided cloud requirements applied
+/// Returns a default `Config` with test-provided cloud bundle requirements applied.
 /// during config construction.
-pub async fn load_default_config_for_test_with_cloud_requirements(
+pub async fn load_default_config_for_test_with_cloud_config_bundle(
     codex_home: &TempDir,
-    cloud_requirements: CloudRequirementsLoader,
+    cloud_config_bundle: CloudConfigBundleLoader,
 ) -> Config {
     ConfigBuilder::default()
+        .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
         .codex_home(codex_home.path().to_path_buf())
         .harness_overrides(default_test_overrides())
-        .cloud_requirements(cloud_requirements)
+        .cloud_config_bundle(cloud_config_bundle)
         .build()
         .await
         .expect("defaults for test should always succeed")
 }
 
-pub fn managed_network_requirements_loader() -> CloudRequirementsLoader {
-    CloudRequirementsLoader::new(async {
-        Ok(Some(ConfigRequirementsToml {
-            network: Some(NetworkRequirementsToml {
-                enabled: Some(true),
-                allow_local_binding: Some(true),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }))
-    })
+pub fn managed_network_requirements_loader() -> CloudConfigBundleLoader {
+    CloudConfigBundleFixture::loader_with_enterprise_requirement(
+        r#"
+[experimental_network]
+enabled = true
+allow_local_binding = true
+"#,
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -234,54 +259,6 @@ pub fn find_codex_linux_sandbox_exe() -> Result<PathBuf, CargoBinError> {
     codex_utils_cargo_bin::cargo_bin("codex-linux-sandbox")
 }
 
-/// Builds an SSE stream body from a JSON fixture.
-///
-/// The fixture must contain an array of objects where each object represents a
-/// single SSE event with at least a `type` field matching the `event:` value.
-/// Additional fields become the JSON payload for the `data:` line. An object
-/// with only a `type` field results in an event with no `data:` section. This
-/// makes it trivial to extend the fixtures as OpenAI adds new event kinds or
-/// fields.
-pub fn load_sse_fixture(path: impl AsRef<std::path::Path>) -> String {
-    let events: Vec<serde_json::Value> =
-        serde_json::from_reader(std::fs::File::open(path).expect("read fixture"))
-            .expect("parse JSON fixture");
-    events
-        .into_iter()
-        .map(|e| {
-            let kind = e
-                .get("type")
-                .and_then(|v| v.as_str())
-                .expect("fixture event missing type");
-            if e.as_object().map(|o| o.len() == 1).unwrap_or(false) {
-                format!("event: {kind}\n\n")
-            } else {
-                format!("event: {kind}\ndata: {e}\n\n")
-            }
-        })
-        .collect()
-}
-
-pub fn load_sse_fixture_with_id_from_str(raw: &str, id: &str) -> String {
-    let replaced = raw.replace("__ID__", id);
-    let events: Vec<serde_json::Value> =
-        serde_json::from_str(&replaced).expect("parse JSON fixture");
-    events
-        .into_iter()
-        .map(|e| {
-            let kind = e
-                .get("type")
-                .and_then(|v| v.as_str())
-                .expect("fixture event missing type");
-            if e.as_object().map(|o| o.len() == 1).unwrap_or(false) {
-                format!("event: {kind}\n\n")
-            } else {
-                format!("event: {kind}\ndata: {e}\n\n")
-            }
-        })
-        .collect()
-}
-
 pub async fn wait_for_event<F>(
     codex: &CodexThread,
     predicate: F,
@@ -291,6 +268,64 @@ where
 {
     use tokio::time::Duration;
     wait_for_event_with_timeout(codex, predicate, Duration::from_secs(1)).await
+}
+
+/// Waits for a configured MCP server to finish startup and requires it to be ready.
+pub async fn wait_for_mcp_server(codex: &CodexThread, server_name: &str) -> anyhow::Result<()> {
+    use codex_protocol::protocol::EventMsg;
+
+    // Wait for the startup summary regardless of outcome, then interpret the
+    // requested server's ready, failed, or cancelled entry below.
+    let summary = loop {
+        let event = codex
+            .next_event()
+            .await
+            .expect("stream ended unexpectedly while waiting for MCP startup");
+        if let EventMsg::McpStartupComplete(summary) = event.msg {
+            break summary;
+        }
+    };
+    if let Some(failure) = summary
+        .failed
+        .iter()
+        .find(|failure| failure.server == server_name)
+    {
+        let error = &failure.error;
+        anyhow::bail!("MCP server {server_name} failed to start: {error}");
+    }
+    if summary.cancelled.iter().any(|server| server == server_name) {
+        anyhow::bail!("MCP server {server_name} startup was cancelled");
+    }
+    assert!(
+        summary.ready.iter().any(|server| server == server_name),
+        "expected MCP server {server_name} to be ready; startup summary: {summary:?}"
+    );
+    Ok(())
+}
+
+pub async fn submit_thread_settings(
+    codex: &CodexThread,
+    thread_settings: codex_protocol::protocol::ThreadSettingsOverrides,
+) -> anyhow::Result<()> {
+    use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::Op;
+    use tokio::time::Duration;
+    use tokio::time::timeout;
+
+    let submission_id = codex.submit(Op::ThreadSettings { thread_settings }).await?;
+    loop {
+        let ev = timeout(Duration::from_secs(10), codex.next_event())
+            .await
+            .expect("timeout waiting for thread settings update")
+            .expect("stream ended unexpectedly");
+        if ev.id == submission_id {
+            match ev.msg {
+                EventMsg::ThreadSettingsApplied(_) => return Ok(()),
+                EventMsg::Error(err) => panic!("thread settings update failed: {}", err.message),
+                other => panic!("unexpected thread settings update event: {other:?}"),
+            }
+        }
+    }
 }
 
 pub async fn wait_for_event_match<T, F>(codex: &CodexThread, matcher: F) -> T
@@ -329,33 +364,6 @@ pub fn sandbox_env_var() -> &'static str {
 
 pub fn sandbox_network_env_var() -> &'static str {
     codex_core::spawn::CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR
-}
-
-const REMOTE_ENV_ENV_VAR: &str = "CODEX_TEST_REMOTE_ENV";
-
-pub fn remote_env_env_var() -> &'static str {
-    REMOTE_ENV_ENV_VAR
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RemoteEnvConfig {
-    pub container_name: String,
-}
-
-pub fn get_remote_test_env() -> Option<RemoteEnvConfig> {
-    if std::env::var_os(REMOTE_ENV_ENV_VAR).is_none() {
-        eprintln!("Skipping test because {REMOTE_ENV_ENV_VAR} is not set.");
-        return None;
-    }
-
-    let container_name = std::env::var(REMOTE_ENV_ENV_VAR)
-        .unwrap_or_else(|_| panic!("{REMOTE_ENV_ENV_VAR} must be set"));
-    assert!(
-        !container_name.trim().is_empty(),
-        "{REMOTE_ENV_ENV_VAR} must not be empty"
-    );
-
-    Some(RemoteEnvConfig { container_name })
 }
 
 pub fn format_with_current_shell(command: &str) -> Vec<String> {
@@ -571,27 +579,94 @@ macro_rules! skip_if_no_network {
     }};
 }
 
+// Exported so the public skip macros can expand in downstream test crates.
 #[macro_export]
-macro_rules! skip_if_remote {
-    ($reason:expr $(,)?) => {{
-        if ::std::env::var_os($crate::remote_env_env_var()).is_some() {
-            eprintln!(
-                "Skipping test under {}: {}",
-                $crate::remote_env_env_var(),
-                $reason
-            );
+#[doc(hidden)]
+macro_rules! skip_if_test_condition {
+    ($condition:expr, $environment:expr, $reason:expr $(,)?) => {{
+        if $condition {
+            eprintln!("Skipping test in {}: {}", $environment, $reason);
             return;
         }
     }};
-    ($return_value:expr, $reason:expr $(,)?) => {{
-        if ::std::env::var_os($crate::remote_env_env_var()).is_some() {
-            eprintln!(
-                "Skipping test under {}: {}",
-                $crate::remote_env_env_var(),
-                $reason
-            );
+    ($return_value:expr, $condition:expr, $environment:expr, $reason:expr $(,)?) => {{
+        if $condition {
+            eprintln!("Skipping test in {}: {}", $environment, $reason);
             return $return_value;
         }
+    }};
+}
+
+#[macro_export]
+macro_rules! skip_if_remote {
+    ($reason:expr $(,)?) => {{
+        $crate::skip_if_test_condition!(
+            $crate::is_remote_test_environment(),
+            "a remote test environment",
+            $reason,
+        );
+    }};
+    ($return_value:expr, $reason:expr $(,)?) => {{
+        $crate::skip_if_test_condition!(
+            $return_value,
+            $crate::is_remote_test_environment(),
+            "a remote test environment",
+            $reason,
+        );
+    }};
+}
+
+#[macro_export]
+macro_rules! skip_if_no_remote_env {
+    () => {{
+        if !$crate::is_remote_test_environment() {
+            eprintln!("Skipping test because it requires a remote test environment.");
+            return;
+        }
+    }};
+    ($return_value:expr $(,)?) => {{
+        if !$crate::is_remote_test_environment() {
+            eprintln!("Skipping test because it requires a remote test environment.");
+            return $return_value;
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! skip_if_wine_exec {
+    ($reason:expr $(,)?) => {{
+        $crate::skip_if_test_condition!(
+            $crate::is_wine_exec_test_environment(),
+            "the Wine-exec test environment",
+            $reason,
+        );
+    }};
+    ($return_value:expr, $reason:expr $(,)?) => {{
+        $crate::skip_if_test_condition!(
+            $return_value,
+            $crate::is_wine_exec_test_environment(),
+            "the Wine-exec test environment",
+            $reason,
+        );
+    }};
+}
+
+#[macro_export]
+macro_rules! skip_if_target_windows {
+    ($reason:expr $(,)?) => {{
+        $crate::skip_if_test_condition!(
+            $crate::test_target_os() == $crate::TestTargetOs::Windows,
+            "a Windows target environment",
+            $reason,
+        );
+    }};
+    ($return_value:expr, $reason:expr $(,)?) => {{
+        $crate::skip_if_test_condition!(
+            $return_value,
+            $crate::test_target_os() == $crate::TestTargetOs::Windows,
+            "a Windows target environment",
+            $reason,
+        );
     }};
 }
 
@@ -632,7 +707,7 @@ macro_rules! codex_linux_sandbox_exe_or_skip {
 }
 
 #[macro_export]
-macro_rules! skip_if_windows {
+macro_rules! skip_if_host_windows {
     ($return_value:expr $(,)?) => {{
         if cfg!(target_os = "windows") {
             println!("Skipping test because it cannot execute on Windows.");

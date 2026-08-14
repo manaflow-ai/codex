@@ -23,7 +23,7 @@ These are entities exit on the codex backend. The intent of this section is to e
 3. `Task`
    - A `Task` is `Codex` executing work in response to user input.
    - `Session` has at most one `Task` running at a time.
-   - Receiving `Op::UserTurn` starts a `Task` (`Op::UserInput` is legacy)
+   - Receiving user turn input starts a `Task`
    - Consists of a series of `Turn`s
    - The `Task` executes to until:
      - The `Model` completes the task and there is no output to feed into an additional `Turn`
@@ -54,6 +54,7 @@ Since only 1 `Task` can be run at a time, for parallel tasks it is recommended t
   - These are messages sent on the `SQ` (UI -> `Codex`)
   - Has an string ID provided by the UI, referred to as `sub_id`
   - `Op` refers to the enum of all possible `Submission` payloads
+  - In the current codebase these are primarily in-process Rust types rather than a stable serde wire contract
     - This enum is `non_exhaustive`; variants can be added at future dates
 - `Event`
   - These are messages sent on the `EQ` (`Codex` -> UI)
@@ -66,14 +67,9 @@ For complete documentation of the `Op` and `EventMsg` variants, refer to [protoc
 
 - `Op`
   - `Op::UserTurn` – Any input from the user to kick off a `Turn`, including full per-turn context such as cwd, model, sandbox, approval policy, and optional `approvals_reviewer`
-  - `Op::UserInput` – Legacy form of user input
   - `Op::Interrupt` – Interrupts a running turn
   - `Op::ExecApproval` – Approve or deny code execution
   - `Op::UserInputAnswer` – Provide answers for a `request_user_input` tool call
-  - `Op::ListSkills` – Request skills for one or more cwd values (optionally `force_reload`)
-  - `Op::UserTurn` and `Op::OverrideTurnContext` accept an optional `personality` override that updates the model’s communication style
-
-Valid `personality` values are `friendly`, `pragmatic`, and `none`. When `none` is selected, the personality placeholder is replaced with an empty string.
 
 - `EventMsg`
   - `EventMsg::AgentMessage` – Messages from the `Model`
@@ -86,7 +82,6 @@ Valid `personality` values are `friendly`, `pragmatic`, and `none`. When `none` 
   - `EventMsg::Error` – A turn stopped with an error
   - `EventMsg::Warning` – A non-fatal warning that the client should surface to the user
   - `EventMsg::TurnComplete` – Contains a `response_id` bookmark for last `response_id` executed by the turn. This can be used to continue the turn at a later point in time, perhaps with additional user input.
-  - `EventMsg::ListSkillsResponse` – Response payload with per-cwd skill entries (`cwd`, `skills`, `errors`)
 
 ### UserInput items
 
@@ -105,7 +100,7 @@ The `response_id` returned from each turn matches the OpenAI `response_id` store
 
 Can operate over any transport that supports bi-directional streaming. - cross-thread channels - IPC channels - stdin/stdout - TCP - HTTP2 - gRPC
 
-Non-framed transports, such as stdin/stdout and TCP, should use newline-delimited JSON in sending messages.
+Events still serialize cleanly to newline-delimited JSON for non-framed transports, such as stdin/stdout and TCP. Submission payloads should be treated as implementation details unless a specific transport owns an explicit adapter.
 
 ## Example Flows
 

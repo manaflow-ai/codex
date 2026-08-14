@@ -7,6 +7,7 @@ version.workspace = true
 [lib]
 name = "codex_protocol"
 path = "src/lib.rs"
+doctest = false
 
 [lints]
 workspace = true
@@ -15,19 +16,20 @@ workspace = true
 chardetng = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 codex-async-utils = { workspace = true }
-codex-execpolicy = { workspace = true }
+codex-extension-items = { workspace = true }
+codex-http-client = { workspace = true }
 codex-network-proxy = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
 codex-utils-image = { workspace = true }
+codex-utils-path-uri = { workspace = true }
 codex-utils-string = { workspace = true }
-codex-utils-template = { workspace = true }
 encoding_rs = { workspace = true }
 globset = { workspace = true }
+http = { workspace = true }
 icu_decimal = { workspace = true }
 icu_locale_core = { workspace = true }
 icu_provider = { workspace = true, features = ["sync"] }
 quick-xml = { workspace = true, features = ["serialize"] }
-reqwest = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -52,12 +54,12 @@ seccompiler = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
-http = { workspace = true }
+codex-execpolicy = { workspace = true }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }
 
 [package.metadata.cargo-shear]
 # Required because:
 # `icu_provider`: contains a required `sync` feature for `icu_decimal`
-# `strum`: as strum_macros in non-nightly builds
+# `strum`: is referenced by generated `EnumIter` derive implementations
 ignored = ["icu_provider", "strum"]

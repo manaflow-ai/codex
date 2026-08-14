@@ -19,7 +19,6 @@
         {
           "enum": [
             "untrusted",
-            "on-failure",
             "on-request",
             "never"
           ],
@@ -64,87 +63,158 @@
         }
       ]
     },
-    "DynamicToolSpec": {
-      "properties": {
-        "deferLoading": {
-          "type": "boolean"
-        },
-        "description": {
-          "type": "string"
-        },
-        "inputSchema": true,
-        "name": {
-          "type": "string"
-        },
-        "namespace": {
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "description",
-        "inputSchema",
-        "name"
-      ],
-      "type": "object"
-    },
-    "PermissionProfileModificationParams": {
+    "CapabilityRootLocation": {
+      "description": "Location used to resolve a selected capability root.",
       "oneOf": [
         {
-          "description": "Additional concrete directory that should be writable.",
+          "description": "A path owned by an execution environment.",
           "properties": {
+            "environmentId": {
+              "type": "string"
+            },
             "path": {
-              "$ref": "#/definitions/AbsolutePathBuf"
+              "description": "Absolute path for the root in the selected environment.",
+              "type": "string"
             },
             "type": {
               "enum": [
-                "additionalWritableRoot"
+                "environment"
               ],
-              "title": "AdditionalWritableRootPermissionProfileModificationParamsType",
+              "title": "EnvironmentCapabilityRootLocationType",
               "type": "string"
             }
           },
           "required": [
+            "environmentId",
             "path",
             "type"
           ],
-          "title": "AdditionalWritableRootPermissionProfileModificationParams",
+          "title": "EnvironmentCapabilityRootLocation",
           "type": "object"
         }
       ]
     },
-    "PermissionProfileSelectionParams": {
+    "DynamicToolNamespaceTool": {
       "oneOf": [
         {
-          "description": "Select a named built-in or user-defined profile and optionally apply bounded modifications that Codex knows how to validate.",
           "properties": {
-            "id": {
+            "deferLoading": {
+              "type": "boolean"
+            },
+            "description": {
               "type": "string"
             },
-            "modifications": {
-              "items": {
-                "$ref": "#/definitions/PermissionProfileModificationParams"
-              },
-              "type": [
-                "array",
-                "null"
-              ]
+            "inputSchema": true,
+            "name": {
+              "type": "string"
             },
             "type": {
               "enum": [
-                "profile"
+                "function"
               ],
-              "title": "ProfilePermissionProfileSelectionParamsType",
+              "title": "FunctionDynamicToolNamespaceToolType",
               "type": "string"
             }
           },
           "required": [
-            "id",
+            "description",
+            "inputSchema",
+            "name",
             "type"
           ],
-          "title": "ProfilePermissionProfileSelectionParams",
+          "title": "FunctionDynamicToolNamespaceTool",
+          "type": "object"
+        }
+      ]
+    },
+    "DynamicToolSpec": {
+      "oneOf": [
+        {
+          "properties": {
+            "deferLoading": {
+              "type": "boolean"
+            },
+            "description": {
+              "type": "string"
+            },
+            "inputSchema": true,
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "function"
+              ],
+              "title": "FunctionDynamicToolSpecType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "description",
+            "inputSchema",
+            "name",
+            "type"
+          ],
+          "title": "FunctionDynamicToolSpec",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "description": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "tools": {
+              "items": {
+                "$ref": "#/definitions/DynamicToolNamespaceTool"
+              },
+              "type": "array"
+            },
+            "type": {
+              "enum": [
+                "namespace"
+              ],
+              "title": "NamespaceDynamicToolSpecType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "description",
+            "name",
+            "tools",
+            "type"
+          ],
+          "title": "NamespaceDynamicToolSpec",
+          "type": "object"
+        }
+      ]
+    },
+    "LegacyAppPathString": {
+      "type": "string"
+    },
+    "MultiAgentMode": {
+      "description": "Controls the effective multi-agent delegation instructions for a turn. `custom` means the configured mode hint defines the policy instead of a built-in policy.",
+      "oneOf": [
+        {
+          "enum": [
+            "explicitRequestOnly",
+            "proactive"
+          ],
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "custom": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "custom"
+          ],
+          "title": "CustomMultiAgentMode",
           "type": "object"
         }
       ]
@@ -165,11 +235,36 @@
       ],
       "type": "string"
     },
-    "ServiceTier": {
-      "enum": [
-        "fast",
-        "flex"
+    "SelectedCapabilityRoot": {
+      "description": "A user-selected root that can expose one or more runtime capabilities.",
+      "properties": {
+        "id": {
+          "description": "Stable identifier supplied by the capability selection platform.",
+          "type": "string"
+        },
+        "location": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/CapabilityRootLocation"
+            }
+          ],
+          "description": "Where the selected root can be resolved."
+        }
+      },
+      "required": [
+        "id",
+        "location"
       ],
+      "type": "object"
+    },
+    "ThreadHistoryMode": {
+      "enum": [
+        "legacy",
+        "paginated"
+      ],
+      "type": "string"
+    },
+    "ThreadSource": {
       "type": "string"
     },
     "ThreadStartSource": {
@@ -182,10 +277,20 @@
     "TurnEnvironmentParams": {
       "properties": {
         "cwd": {
-          "$ref": "#/definitions/AbsolutePathBuf"
+          "$ref": "#/definitions/LegacyAppPathString"
         },
         "environmentId": {
           "type": "string"
+        },
+        "runtimeWorkspaceRoots": {
+          "description": "Environment-native runtime workspace roots. Omitted defaults to `cwd`.",
+          "items": {
+            "$ref": "#/definitions/LegacyAppPathString"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
         }
       },
       "required": [
@@ -287,20 +392,9 @@
       ]
     },
     "serviceTier": {
-      "anyOf": [
-        {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ServiceTier"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        {
-          "type": "null"
-        }
+      "type": [
+        "string",
+        "null"
       ]
     },
     "sessionStartSource": {
@@ -312,6 +406,17 @@
           "type": "null"
         }
       ]
+    },
+    "threadSource": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ThreadSource"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Optional client-supplied analytics source classification for this thread."
     }
   },
   "title": "ThreadStartParams",

@@ -28,7 +28,7 @@ pub fn normalize_additional_permissions(
             let glob_scan_max_depth = file_system.glob_scan_max_depth;
             for entry in file_system.entries {
                 if matches!(&entry.path, FileSystemPath::GlobPattern { .. })
-                    && entry.access != FileSystemAccessMode::None
+                    && entry.access != FileSystemAccessMode::Deny
                 {
                     return Err(
                         "glob file system permissions only support deny-read entries".to_string(),
@@ -49,6 +49,7 @@ pub fn normalize_additional_permissions(
                 let normalized_entry = FileSystemSandboxEntry {
                     path,
                     access: entry.access,
+                    missing_path_behavior: entry.missing_path_behavior,
                 };
                 if !entries.contains(&normalized_entry) {
                     entries.push(normalized_entry);
@@ -221,7 +222,7 @@ fn effective_glob_scan_depth(
     entries
         .iter()
         .any(|entry| {
-            entry.access == FileSystemAccessMode::None
+            entry.access == FileSystemAccessMode::Deny
                 && matches!(&entry.path, FileSystemPath::GlobPattern { .. })
         })
         .then_some(match depth {
@@ -243,7 +244,14 @@ fn granted_file_system_entry_within_request(
     granted_entry: &FileSystemSandboxEntry,
     cwd: &Path,
 ) -> bool {
-    if !granted_entry.access.can_read() {
+    if !granted_entry.access.can_read()
+        || matches!(
+            &granted_entry.path,
+            FileSystemPath::Special {
+                value: FileSystemSpecialPath::SlashTmp,
+            } if !cfg!(unix)
+        )
+    {
         return false;
     }
 
@@ -273,7 +281,7 @@ fn retain_constraining_deny_entries(
     let mut retained_entries = Vec::new();
     for entry in source_entries
         .iter()
-        .filter(|entry| entry.access == FileSystemAccessMode::None)
+        .filter(|entry| entry.access == FileSystemAccessMode::Deny)
     {
         if !deny_entry_constrains_accepted_grant(entry, accepted_entries, cwd) {
             continue;
@@ -340,7 +348,7 @@ fn access_covers(requested: FileSystemAccessMode, granted: FileSystemAccessMode)
     match granted {
         FileSystemAccessMode::Read => requested.can_read(),
         FileSystemAccessMode::Write => requested.can_write(),
-        FileSystemAccessMode::None => false,
+        FileSystemAccessMode::Deny => false,
     }
 }
 
@@ -353,8 +361,9 @@ fn materialize_cwd_dependent_entry(
             value: FileSystemSpecialPath::ProjectRoots { .. },
         } => resolve_permission_path(&entry.path, cwd)
             .map(|path| FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path },
+                path: path.into(),
                 access: entry.access,
+                missing_path_behavior: entry.missing_path_behavior,
             })
             .unwrap_or_else(|| entry.clone()),
         FileSystemPath::GlobPattern { pattern } => FileSystemSandboxEntry {
@@ -364,6 +373,7 @@ fn materialize_cwd_dependent_entry(
                     .into_owned(),
             },
             access: entry.access,
+            missing_path_behavior: entry.missing_path_behavior,
         },
         FileSystemPath::Path { .. } | FileSystemPath::Special { .. } => entry.clone(),
     }
@@ -395,10 +405,14 @@ fn resolve_permission_path(path: &FileSystemPath, cwd: &Path) -> Option<Absolute
                     AbsolutePathBuf::from_absolute_path(PathBuf::from(tmpdir)).ok()
                 }
             }
-            FileSystemSpecialPath::SlashTmp => AbsolutePathBuf::from_absolute_path("/tmp")
-                .ok()
-                .filter(|path| path.as_path().is_dir()),
-            FileSystemSpecialPath::Minimal | FileSystemSpecialPath::Unknown { .. } => None,
+            FileSystemSpecialPath::SlashTmp if cfg!(unix) => {
+                AbsolutePathBuf::from_absolute_path("/tmp")
+                    .ok()
+                    .filter(|path| path.as_path().is_dir())
+            }
+            FileSystemSpecialPath::SlashTmp
+            | FileSystemSpecialPath::Minimal
+            | FileSystemSpecialPath::Unknown { .. } => None,
         },
     }
 }

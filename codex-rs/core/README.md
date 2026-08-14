@@ -2,6 +2,20 @@
 
 This crate implements the business logic for Codex. It is designed to be used by the various Codex UIs written in Rust.
 
+## Wine-exec integration tests
+
+On x86-64 Linux, run the shared suite against the Windows exec server with
+`bazel test //codex-rs/core:core-all-wine-exec-test`.
+
+Local execution targets the host OS, Docker targets Linux, and Wine exec targets
+Windows. Choose the skip macro by what the test depends on:
+
+- `skip_if_target_windows!`: Windows target behavior.
+- `skip_if_host_windows!`: Windows host constraints.
+- `skip_if_remote!`: Local-only test behavior.
+- `skip_if_no_remote_env!`: Remote-only test behavior.
+- `skip_if_wine_exec!`: Wine-specific runner debt.
+
 ## Dependencies
 
 Note that `codex-core` makes some assumptions about certain helper utilities being available in the environment. Currently, this support matrix is:
@@ -22,7 +36,7 @@ Seatbelt also keeps the legacy default preferences read access
 
 ### Linux
 
-Expects the binary containing `codex-core` to run the equivalent of `codex sandbox linux` (legacy alias: `codex debug landlock`) when `arg0` is `codex-linux-sandbox`. See the `codex-arg0` crate for details.
+Expects the binary containing `codex-core` to run the equivalent of `codex sandbox` when `arg0` is `codex-linux-sandbox`. See the `codex-arg0` crate for details.
 
 Legacy `SandboxPolicy` / `sandbox_mode` configs are still supported on Linux.
 They can continue to use the legacy Landlock path when the split filesystem
@@ -39,14 +53,14 @@ The Linux sandbox helper prefers the first `bwrap` found on `PATH` outside the
 current working directory whenever it is available. If `bwrap` is present but
 too old to support `--argv0`, the helper keeps using system bubblewrap and
 switches to a no-`--argv0` compatibility path for the inner re-exec. If
-`bwrap` is missing, it falls back to the vendored bubblewrap path compiled into
-the binary and Codex surfaces a startup warning through its normal notification
-path instead of printing directly from the sandbox helper. Codex also surfaces
-a startup warning when bubblewrap cannot create user namespaces. WSL2 uses the
-normal Linux bubblewrap path. WSL1 is not supported for bubblewrap sandboxing
-because it cannot create the required user namespaces, so Codex rejects
-sandboxed shell commands that would enter the bubblewrap path before invoking
-`bwrap`.
+`bwrap` is missing, it falls back to the bundled `codex-resources/bwrap`
+binary shipped with Codex and Codex surfaces a startup warning through its
+normal notification path instead of printing directly from the sandbox helper.
+Codex also surfaces a startup warning when bubblewrap cannot create user
+namespaces. WSL2 uses the normal Linux bubblewrap path. WSL1 is not supported
+for bubblewrap sandboxing because it cannot create the required user
+namespaces, so Codex rejects sandboxed shell commands that would enter the
+bubblewrap path before invoking `bwrap`.
 
 ### Windows
 

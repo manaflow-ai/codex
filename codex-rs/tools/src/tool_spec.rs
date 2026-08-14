@@ -2,18 +2,18 @@ use crate::FreeformTool;
 use crate::JsonSchema;
 use crate::LoadableToolSpec;
 use crate::ResponsesApiNamespace;
+use crate::ResponsesApiNamespaceTool;
 use crate::ResponsesApiTool;
-use codex_protocol::config_types::WebSearchConfig;
+use crate::default_namespace_description;
+use codex_protocol::DEFAULT_FUNCTION_NAMESPACE;
 use codex_protocol::config_types::WebSearchContextSize;
 use codex_protocol::config_types::WebSearchFilters as ConfigWebSearchFilters;
-use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::config_types::WebSearchUserLocation as ConfigWebSearchUserLocation;
 use codex_protocol::config_types::WebSearchUserLocationType;
-use codex_protocol::openai_models::WebSearchToolType;
 use serde::Serialize;
 use serde_json::Value;
-
-const WEB_SEARCH_TEXT_AND_IMAGE_CONTENT_TYPES: [&str; 2] = ["text", "image"];
+use serde_json::value::RawValue;
+use std::sync::Arc;
 
 /// When serialized as JSON, this produces a valid "Tool" in the OpenAI
 /// Responses API.
@@ -30,20 +30,18 @@ pub enum ToolSpec {
         description: String,
         parameters: JsonSchema,
     },
-    #[serde(rename = "local_shell")]
-    LocalShell {},
-    #[serde(rename = "image_generation")]
-    ImageGeneration { output_format: String },
     // TODO: Understand why we get an error on web_search although the API docs
     // say it's supported.
     // https://platform.openai.com/docs/guides/tools-web-search?api-mode=responses#:~:text=%7B%20type%3A%20%22web_search%22%20%7D%2C
-    // The `external_web_access` field determines whether the web search is over
-    // cached or live content.
+    // `external_web_access` distinguishes cached from live-capable search, while
+    // `indexed_web_access` restricts live fetches to indexed URLs.
     // https://platform.openai.com/docs/guides/tools-web-search#live-internet-access
     #[serde(rename = "web_search")]
     WebSearch {
         #[serde(skip_serializing_if = "Option::is_none")]
         external_web_access: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        indexed_web_access: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         filters: Option<ResponsesApiWebSearchFilters>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -63,8 +61,6 @@ impl ToolSpec {
             ToolSpec::Function(tool) => tool.name.as_str(),
             ToolSpec::Namespace(namespace) => namespace.name.as_str(),
             ToolSpec::ToolSearch { .. } => "tool_search",
-            ToolSpec::LocalShell {} => "local_shell",
-            ToolSpec::ImageGeneration { .. } => "image_generation",
             ToolSpec::WebSearch { .. } => "web_search",
             ToolSpec::Freeform(tool) => tool.name.as_str(),
         }
@@ -77,73 +73,6 @@ impl From<LoadableToolSpec> for ToolSpec {
             LoadableToolSpec::Function(tool) => ToolSpec::Function(tool),
             LoadableToolSpec::Namespace(namespace) => ToolSpec::Namespace(namespace),
         }
-    }
-}
-
-pub fn create_local_shell_tool() -> ToolSpec {
-    ToolSpec::LocalShell {}
-}
-
-pub fn create_image_generation_tool(output_format: &str) -> ToolSpec {
-    ToolSpec::ImageGeneration {
-        output_format: output_format.to_string(),
-    }
-}
-
-pub struct WebSearchToolOptions<'a> {
-    pub web_search_mode: Option<WebSearchMode>,
-    pub web_search_config: Option<&'a WebSearchConfig>,
-    pub web_search_tool_type: WebSearchToolType,
-}
-
-pub fn create_web_search_tool(options: WebSearchToolOptions<'_>) -> Option<ToolSpec> {
-    let external_web_access = match options.web_search_mode {
-        Some(WebSearchMode::Cached) => Some(false),
-        Some(WebSearchMode::Live) => Some(true),
-        Some(WebSearchMode::Disabled) | None => None,
-    }?;
-
-    let search_content_types = match options.web_search_tool_type {
-        WebSearchToolType::Text => None,
-        WebSearchToolType::TextAndImage => Some(
-            WEB_SEARCH_TEXT_AND_IMAGE_CONTENT_TYPES
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-        ),
-    };
-
-    Some(ToolSpec::WebSearch {
-        external_web_access: Some(external_web_access),
-        filters: options
-            .web_search_config
-            .and_then(|config| config.filters.clone().map(Into::into)),
-        user_location: options
-            .web_search_config
-            .and_then(|config| config.user_location.clone().map(Into::into)),
-        search_context_size: options
-            .web_search_config
-            .and_then(|config| config.search_context_size),
-        search_content_types,
-    })
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ConfiguredToolSpec {
-    pub spec: ToolSpec,
-    pub supports_parallel_tool_calls: bool,
-}
-
-impl ConfiguredToolSpec {
-    pub fn new(spec: ToolSpec, supports_parallel_tool_calls: bool) -> Self {
-        Self {
-            spec,
-            supports_parallel_tool_calls,
-        }
-    }
-
-    pub fn name(&self) -> &str {
-        self.spec.name()
     }
 }
 
@@ -161,6 +90,62 @@ pub fn create_tools_json_for_responses_api(
     }
 
     Ok(tools_json)
+}
+
+pub fn create_tools_json_for_responses_lite(
+    tools: &[ToolSpec],
+) -> Result<Vec<Value>, serde_json::Error> {
+    let mut functions = ResponsesApiNamespace {
+        name: DEFAULT_FUNCTION_NAMESPACE.to_string(),
+        description: default_namespace_description(DEFAULT_FUNCTION_NAMESPACE),
+        tools: Vec::new(),
+    };
+    let mut functions_index = None;
+    let mut tools_json = Vec::new();
+
+    for tool in tools {
+        match tool {
+            ToolSpec::Function(tool) => {
+                functions
+                    .tools
+                    .push(ResponsesApiNamespaceTool::Function(tool.clone()));
+            }
+            ToolSpec::Freeform(tool) => {
+                functions
+                    .tools
+                    .push(ResponsesApiNamespaceTool::Custom(tool.clone()));
+            }
+            ToolSpec::Namespace(namespace) if namespace.name == DEFAULT_FUNCTION_NAMESPACE => {
+                if !namespace.description.trim().is_empty() {
+                    functions.description = namespace.description.clone();
+                }
+                functions.tools.extend(namespace.tools.clone());
+            }
+            tool => {
+                tools_json.push(serde_json::to_value(tool)?);
+                continue;
+            }
+        }
+        functions_index.get_or_insert(tools_json.len());
+    }
+
+    if let Some(functions_index) = functions_index
+        && !functions.tools.is_empty()
+    {
+        tools_json.insert(
+            functions_index,
+            serde_json::to_value(ToolSpec::Namespace(functions))?,
+        );
+    }
+
+    Ok(tools_json)
+}
+
+/// Returns raw JSON that can be embedded directly in a Responses API request.
+pub fn create_tools_raw_json_for_responses_api(
+    tools: &[ToolSpec],
+) -> Result<Arc<RawValue>, serde_json::Error> {
+    serde_json::value::to_raw_value(tools).map(Arc::from)
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]

@@ -1,6 +1,10 @@
 #![cfg(not(target_os = "windows"))]
 
 use anyhow::Ok;
+use codex_core::TurnInputRequest;
+use codex_features::Feature;
+use codex_history::RolloutItem;
+use codex_history::RolloutLine;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
@@ -12,14 +16,14 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ItemStartedEvent;
-use codex_protocol::protocol::Op;
+use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::ByteRange;
 use codex_protocol::user_input::TextElement;
 use codex_protocol::user_input::UserInput;
-use codex_utils_absolute_path::AbsolutePathBuf;
+use core_test_support::PathBufExt;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
-use core_test_support::responses::ev_image_generation_call;
 use core_test_support::responses::ev_message_item_added;
 use core_test_support::responses::ev_output_text_delta;
 use core_test_support::responses::ev_reasoning_item;
@@ -34,65 +38,33 @@ use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
+use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
 use pretty_assertions::assert_eq;
-use std::path::Path;
-use std::path::PathBuf;
 
 fn disabled_plan_turn(
     text: &str,
-    model: String,
+    _model: String,
     collaboration_mode: CollaborationMode,
-) -> anyhow::Result<Op> {
-    let cwd = std::env::current_dir()?;
+) -> anyhow::Result<TurnInputRequest> {
+    let cwd = std::env::current_dir()?.abs();
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(PermissionProfile::Disabled, cwd.as_path());
-    Ok(Op::UserTurn {
-        environments: None,
-        items: vec![UserInput::Text {
-            text: text.into(),
-            text_elements: Vec::new(),
-        }],
-        final_output_json_schema: None,
-        cwd,
-        approval_policy: AskForApproval::Never,
-        approvals_reviewer: None,
-        sandbox_policy,
+    Ok(TurnInputRequest::user_input(vec![UserInput::Text {
+        text: text.into(),
+        text_elements: Vec::new(),
+    }])
+    .with_thread_settings(ThreadSettingsOverrides {
+        environments: Some(local_selections(cwd)),
+        approval_policy: Some(AskForApproval::Never),
+        sandbox_policy: Some(sandbox_policy),
         permission_profile,
-        model,
-        effort: None,
-        summary: None,
-        service_tier: None,
         collaboration_mode: Some(collaboration_mode),
-        personality: None,
-    })
-}
-
-fn image_generation_artifact_path(codex_home: &Path, session_id: &str, call_id: &str) -> PathBuf {
-    fn sanitize(value: &str) -> String {
-        let mut sanitized: String = value
-            .chars()
-            .map(|ch| {
-                if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                    ch
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        if sanitized.is_empty() {
-            sanitized = "generated_image".to_string();
-        }
-        sanitized
-    }
-
-    codex_home
-        .join("generated_images")
-        .join(sanitize(session_id))
-        .join(format!("{}.png", sanitize(call_id)))
+        ..Default::default()
+    }))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -116,12 +88,7 @@ async fn user_message_item_is_emitted() -> anyhow::Result<()> {
     };
 
     codex
-        .submit(Op::UserInput {
-            environments: None,
-            items: vec![expected_input.clone()],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![expected_input.clone()]))
         .await?;
 
     let started_item = wait_for_event_match(&codex, |ev| match ev {
@@ -171,15 +138,10 @@ async fn assistant_message_item_is_emitted() -> anyhow::Result<()> {
     mount_sse_once(&server, first_response).await;
 
     codex
-        .submit(Op::UserInput {
-            environments: None,
-            items: vec![UserInput::Text {
-                text: "please summarize results".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "please summarize results".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
 
     let started = wait_for_event_match(&codex, |ev| match ev {
@@ -231,15 +193,10 @@ async fn reasoning_item_is_emitted() -> anyhow::Result<()> {
     mount_sse_once(&server, first_response).await;
 
     codex
-        .submit(Op::UserInput {
-            environments: None,
-            items: vec![UserInput::Text {
-                text: "explain your reasoning".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "explain your reasoning".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
 
     let started = wait_for_event_match(&codex, |ev| match ev {
@@ -273,12 +230,74 @@ async fn reasoning_item_is_emitted() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_streamed_reasoning_id_is_reused_for_completion() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let TestCodex { codex, .. } = test_codex().build_with_auto_env(&server).await?;
+
+    let mut reasoning_added = ev_reasoning_item_added("unused", &[]);
+    reasoning_added["item"]
+        .as_object_mut()
+        .expect("reasoning item")
+        .remove("id");
+    let mut reasoning_done = ev_reasoning_item("unused", &["Consider inputs"], &[]);
+    reasoning_done["item"]
+        .as_object_mut()
+        .expect("reasoning item")
+        .remove("id");
+    let response_mock = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            reasoning_added,
+            reasoning_done,
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+
+    codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "explain your reasoning".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+
+    let started_id = wait_for_event_match(&codex, |ev| match ev {
+        EventMsg::ItemStarted(ItemStartedEvent {
+            item: TurnItem::Reasoning(item),
+            ..
+        }) => Some(item.id.clone()),
+        _ => None,
+    })
+    .await;
+    let completed_id = wait_for_event_match(&codex, |ev| match ev {
+        EventMsg::ItemCompleted(ItemCompletedEvent {
+            item: TurnItem::Reasoning(item),
+            ..
+        }) => Some(item.id.clone()),
+        _ => None,
+    })
+    .await;
+
+    assert!(started_id.starts_with("rs_"));
+    assert_eq!(started_id, completed_id);
+    response_mock.single_request();
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn web_search_item_is_emitted() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
 
-    let TestCodex { codex, .. } = test_codex().build(&server).await?;
+    let TestCodex { codex, .. } = test_codex()
+        .with_history_mode(ThreadHistoryMode::Paginated)
+        .build(&server)
+        .await?;
 
     let web_search_added = ev_web_search_call_added_partial("web-search-1", "in_progress");
     let web_search_done = ev_web_search_call_done("web-search-1", "completed", "weather seattle");
@@ -292,17 +311,21 @@ async fn web_search_item_is_emitted() -> anyhow::Result<()> {
     mount_sse_once(&server, first_response).await;
 
     codex
-        .submit(Op::UserInput {
-            environments: None,
-            items: vec![UserInput::Text {
-                text: "find the weather".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "find the weather".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
 
+    let started = wait_for_event_match(&codex, |ev| match ev {
+        EventMsg::ItemStarted(ItemStartedEvent {
+            item: TurnItem::WebSearch(item),
+            started_at_ms,
+            ..
+        }) => Some((item.clone(), *started_at_ms)),
+        _ => None,
+    })
+    .await;
     let begin = wait_for_event_match(&codex, |ev| match ev {
         EventMsg::WebSearchBegin(event) => Some(event.clone()),
         _ => None,
@@ -311,146 +334,46 @@ async fn web_search_item_is_emitted() -> anyhow::Result<()> {
     let completed = wait_for_event_match(&codex, |ev| match ev {
         EventMsg::ItemCompleted(ItemCompletedEvent {
             item: TurnItem::WebSearch(item),
+            started_at_ms,
+            completed_at_ms,
             ..
-        }) => Some(item.clone()),
+        }) => Some((item.clone(), *started_at_ms, *completed_at_ms)),
         _ => None,
     })
     .await;
 
     assert_eq!(begin.call_id, "web-search-1");
-    assert_eq!(completed.id, begin.call_id);
+    assert_eq!(started.0.id, begin.call_id);
+    assert!(started.1 > 0);
+    assert_eq!(completed.0.id, begin.call_id);
+    assert_eq!(completed.1, Some(started.1));
+    assert!(completed.2 > 0);
     assert_eq!(
-        completed.action,
+        completed.0.action,
         WebSearchAction::Search {
             query: Some("weather seattle".to_string()),
             queries: None,
         }
     );
 
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn image_generation_call_event_is_emitted() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_mock_server().await;
-
-    let TestCodex {
-        codex,
-        config,
-        session_configured,
-        ..
-    } = test_codex().build(&server).await?;
-    let call_id = "ig_image_saved_to_temp_dir_default";
-    let expected_saved_path = image_generation_artifact_path(
-        config.codex_home.as_path(),
-        &session_configured.session_id.to_string(),
-        call_id,
-    );
-    let _ = std::fs::remove_file(&expected_saved_path);
-
-    let first_response = sse(vec![
-        ev_response_created("resp-1"),
-        ev_image_generation_call(call_id, "completed", "A tiny blue square", "Zm9v"),
-        ev_completed("resp-1"),
-    ]);
-    mount_sse_once(&server, first_response).await;
-
-    codex
-        .submit(Op::UserInput {
-            environments: None,
-            items: vec![UserInput::Text {
-                text: "generate a tiny blue square".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
+    codex.flush_rollout().await?;
+    let rollout_path = codex.rollout_path().expect("paginated rollout path");
+    let rollout = std::fs::read_to_string(rollout_path)?;
+    let persisted_completion = rollout
+        .lines()
+        .map(serde_json::from_str::<RolloutLine>)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .find_map(|line| match line.item {
+            RolloutItem::EventMsg(EventMsg::ItemCompleted(event))
+                if matches!(&event.item, TurnItem::WebSearch(item) if item.id == begin.call_id) =>
+            {
+                Some(event)
+            }
+            _ => None,
         })
-        .await?;
-
-    let begin = wait_for_event_match(&codex, |ev| match ev {
-        EventMsg::ImageGenerationBegin(event) => Some(event.clone()),
-        _ => None,
-    })
-    .await;
-    let end = wait_for_event_match(&codex, |ev| match ev {
-        EventMsg::ImageGenerationEnd(event) => Some(event.clone()),
-        _ => None,
-    })
-    .await;
-
-    assert_eq!(begin.call_id, call_id);
-    assert_eq!(end.call_id, call_id);
-    assert_eq!(end.status, "completed");
-    assert_eq!(end.revised_prompt, Some("A tiny blue square".to_string()));
-    assert_eq!(end.result, "Zm9v");
-    assert_eq!(
-        end.saved_path.as_ref().map(AbsolutePathBuf::as_path),
-        Some(expected_saved_path.as_path())
-    );
-    assert_eq!(std::fs::read(&expected_saved_path)?, b"foo");
-    let _ = std::fs::remove_file(&expected_saved_path);
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn image_generation_call_event_is_emitted_when_image_save_fails() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_mock_server().await;
-
-    let TestCodex {
-        codex,
-        config,
-        session_configured,
-        ..
-    } = test_codex().build(&server).await?;
-    let expected_saved_path = image_generation_artifact_path(
-        config.codex_home.as_path(),
-        &session_configured.session_id.to_string(),
-        "ig_invalid",
-    );
-    let _ = std::fs::remove_file(&expected_saved_path);
-
-    let first_response = sse(vec![
-        ev_response_created("resp-1"),
-        ev_image_generation_call("ig_invalid", "completed", "broken payload", "_-8"),
-        ev_completed("resp-1"),
-    ]);
-    mount_sse_once(&server, first_response).await;
-
-    codex
-        .submit(Op::UserInput {
-            environments: None,
-            items: vec![UserInput::Text {
-                text: "generate an image".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-        })
-        .await?;
-
-    let begin = wait_for_event_match(&codex, |ev| match ev {
-        EventMsg::ImageGenerationBegin(event) => Some(event.clone()),
-        _ => None,
-    })
-    .await;
-    let end = wait_for_event_match(&codex, |ev| match ev {
-        EventMsg::ImageGenerationEnd(event) => Some(event.clone()),
-        _ => None,
-    })
-    .await;
-
-    assert_eq!(begin.call_id, "ig_invalid");
-    assert_eq!(end.call_id, "ig_invalid");
-    assert_eq!(end.status, "completed");
-    assert_eq!(end.revised_prompt, Some("broken payload".to_string()));
-    assert_eq!(end.result, "_-8");
-    assert_eq!(end.saved_path, None);
-    assert!(!expected_saved_path.exists());
+        .expect("persisted web search completion");
+    assert_eq!(persisted_completion.started_at_ms, Some(started.1));
 
     Ok(())
 }
@@ -477,15 +400,10 @@ async fn agent_message_content_delta_has_item_metadata() -> anyhow::Result<()> {
     mount_sse_once(&server, stream).await;
 
     codex
-        .submit(Op::UserInput {
-            environments: None,
-            items: vec![UserInput::Text {
-                text: "please stream text".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "please stream text".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
 
     let (started_turn_id, started_item) = wait_for_event_match(&codex, |ev| match ev {
@@ -512,8 +430,8 @@ async fn agent_message_content_delta_has_item_metadata() -> anyhow::Result<()> {
     })
     .await;
 
-    let session_id = session_configured.session_id.to_string();
-    assert_eq!(delta_event.thread_id, session_id);
+    let thread_id = session_configured.thread_id.to_string();
+    assert_eq!(delta_event.thread_id, thread_id);
     assert_eq!(delta_event.turn_id, started_turn_id);
     assert_eq!(delta_event.item_id, started_item.id);
     assert_eq!(delta_event.delta, "streamed response");
@@ -555,7 +473,7 @@ async fn plan_mode_emits_plan_item_from_proposed_plan_block() -> anyhow::Result<
     };
 
     codex
-        .submit(disabled_plan_turn(
+        .start_or_steer_turn(disabled_plan_turn(
             "please plan",
             session_configured.model.clone(),
             collaboration_mode,
@@ -579,7 +497,7 @@ async fn plan_mode_emits_plan_item_from_proposed_plan_block() -> anyhow::Result<
 
     assert_eq!(
         plan_delta.thread_id,
-        session_configured.session_id.to_string()
+        session_configured.thread_id.to_string()
     );
     assert_eq!(plan_delta.delta, "- Step 1\n- Step 2\n");
     assert_eq!(plan_completed.text, "- Step 1\n- Step 2\n");
@@ -620,7 +538,7 @@ async fn plan_mode_strips_plan_from_agent_messages() -> anyhow::Result<()> {
     };
 
     codex
-        .submit(disabled_plan_turn(
+        .start_or_steer_turn(disabled_plan_turn(
             "please plan",
             session_configured.model.clone(),
             collaboration_mode,
@@ -717,7 +635,7 @@ async fn plan_mode_streaming_citations_are_stripped_across_added_deltas_and_done
     };
 
     codex
-        .submit(disabled_plan_turn(
+        .start_or_steer_turn(disabled_plan_turn(
             "please plan with citations",
             session_configured.model.clone(),
             collaboration_mode,
@@ -892,7 +810,7 @@ async fn plan_mode_streaming_proposed_plan_tag_split_across_added_and_delta_is_p
     };
 
     codex
-        .submit(disabled_plan_turn(
+        .start_or_steer_turn(disabled_plan_turn(
             "please plan",
             session_configured.model.clone(),
             collaboration_mode,
@@ -994,7 +912,7 @@ async fn plan_mode_handles_missing_plan_close_tag() -> anyhow::Result<()> {
     };
 
     codex
-        .submit(disabled_plan_turn(
+        .start_or_steer_turn(disabled_plan_turn(
             "please plan",
             session_configured.model.clone(),
             collaboration_mode,
@@ -1060,15 +978,10 @@ async fn reasoning_content_delta_has_item_metadata() -> anyhow::Result<()> {
     mount_sse_once(&server, stream).await;
 
     codex
-        .submit(Op::UserInput {
-            environments: None,
-            items: vec![UserInput::Text {
-                text: "reason through it".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "reason through it".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
 
     let reasoning_item = wait_for_event_match(&codex, |ev| match ev {
@@ -1088,6 +1001,92 @@ async fn reasoning_content_delta_has_item_metadata() -> anyhow::Result<()> {
     assert_eq!(delta_event.item_id, reasoning_item.id);
     assert_eq!(delta_event.delta, "step one");
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sequential_cutoff_renders_done_summaries_for_active_reasoning_item() -> anyhow::Result<()>
+{
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+
+    let TestCodex { codex, .. } = test_codex()
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::ConcurrentReasoningSummaries)
+                .expect("test config should allow feature update");
+        })
+        .build(&server)
+        .await?;
+    let summary_done = |item_id: &str, summary_index: i64, text: &str| {
+        serde_json::json!({
+            "type": "response.reasoning_summary_text.done",
+            "item_id": item_id,
+            "summary_index": summary_index,
+            "text": text,
+        })
+    };
+    mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_reasoning_item_added("reasoning-1", &[""]),
+            // Sequential cutoff renders atomic done events, not partial legacy events.
+            ev_reasoning_summary_text_delta("partial"),
+            summary_done("reasoning-1", 0, "step one"),
+            summary_done("reasoning-1", 1, "step two"),
+            ev_reasoning_item("reasoning-1", &["step one", "step two"], &[]),
+            ev_message_item_added("message-1", ""),
+            // Drop a stale completion rather than attaching it to the active message.
+            summary_done("reasoning-1", 2, "late step"),
+            ev_output_text_delta("Done"),
+            ev_assistant_message("message-1", "Done"),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+
+    codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "reason through it".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+
+    let reasoning_item = wait_for_event_match(&codex, |ev| match ev {
+        EventMsg::ItemStarted(ItemStartedEvent {
+            item: TurnItem::Reasoning(item),
+            ..
+        }) => Some(item.clone()),
+        _ => None,
+    })
+    .await;
+
+    let mut summary_deltas = Vec::new();
+    let mut summary_sections = Vec::new();
+    loop {
+        match wait_for_event(&codex, |_| true).await {
+            EventMsg::ReasoningContentDelta(event) => {
+                summary_deltas.push((event.item_id, event.delta, event.summary_index));
+            }
+            EventMsg::AgentReasoningSectionBreak(event) => {
+                summary_sections.push((event.item_id, event.summary_index));
+            }
+            EventMsg::TurnComplete(_) => break,
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        summary_deltas,
+        vec![
+            (reasoning_item.id.clone(), "step one".to_string(), 0),
+            (reasoning_item.id, "step two".to_string(), 1),
+        ]
+    );
+    assert_eq!(summary_sections, vec![("reasoning-1".to_string(), 1)]);
     Ok(())
 }
 
@@ -1114,15 +1113,10 @@ async fn reasoning_raw_content_delta_respects_flag() -> anyhow::Result<()> {
     mount_sse_once(&server, stream).await;
 
     codex
-        .submit(Op::UserInput {
-            environments: None,
-            items: vec![UserInput::Text {
-                text: "show raw reasoning".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "show raw reasoning".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
 
     let reasoning_item = wait_for_event_match(&codex, |ev| match ev {

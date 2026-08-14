@@ -12,11 +12,14 @@ use crate::sync_rollout_summaries_from_memories;
 use crate::workspace::memory_workspace_diff;
 use crate::workspace::prepare_memory_workspace;
 use crate::workspace::reset_memory_workspace_baseline;
+use crate::workspace::validate_consolidation_artifacts;
 use crate::workspace::write_workspace_diff;
 use codex_config::Constrained;
 use codex_core::config::Config;
 use codex_features::Feature;
+use codex_model_provider::ModelProvider;
 use codex_protocol::ThreadId;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::SandboxPolicy;
@@ -42,7 +45,11 @@ struct Counters {
 
 /// Runs memory phase 2 (aka consolidation) in strict order. The method represents the linear
 /// flow of the consolidation phase.
-pub async fn run(context: Arc<MemoryStartupContext>, config: Arc<Config>) {
+pub async fn run(
+    context: Arc<MemoryStartupContext>,
+    config: Arc<Config>,
+    parent_permission_profile: PermissionProfile,
+) {
     let phase_two_e2e_timer = context.start_timer(MEMORY_PHASE_TWO_E2E_MS);
 
     let Some(db) = context.state_db() else {
@@ -76,7 +83,11 @@ pub async fn run(context: Arc<MemoryStartupContext>, config: Arc<Config>) {
     }
 
     // 3. Build the locked-down config used by the consolidation agent.
-    let Some(agent_config) = agent::get_config(config.as_ref()) else {
+    let Some(agent_config) = agent::get_config(
+        config.as_ref(),
+        parent_permission_profile,
+        context.provider(),
+    ) else {
         // If we can't get the config, we can't consolidate.
         tracing::error!("failed to get agent config");
         job::failed(
@@ -91,6 +102,7 @@ pub async fn run(context: Arc<MemoryStartupContext>, config: Arc<Config>) {
 
     // 4. Load current DB-backed Phase 2 inputs.
     let raw_memories = match db
+        .memories()
         .get_phase2_input_selection(max_raw_memories, max_unused_days)
         .await
     {
@@ -138,7 +150,7 @@ pub async fn run(context: Arc<MemoryStartupContext>, config: Arc<Config>) {
             return;
         }
     };
-    if !workspace_diff.has_changes() {
+    if !workspace_diff.has_changes() && validate_consolidation_artifacts(&root).await.is_ok() {
         tracing::error!("Phase 2 no changes");
         // We check only after sync of the file system.
         job::succeed(
@@ -217,6 +229,7 @@ mod job {
         db: &StateRuntime,
     ) -> Result<Claim, &'static str> {
         let claim = db
+            .memories()
             .try_claim_global_phase2_job(context.thread_id(), crate::stage_two::JOB_LEASE_SECONDS)
             .await
             .map_err(|e| {
@@ -255,15 +268,17 @@ mod job {
     ) {
         context.counter(MEMORY_PHASE_TWO_JOBS, /*inc*/ 1, &[("status", reason)]);
         if matches!(
-            db.mark_global_phase2_job_failed(
-                &claim.token,
-                reason,
-                crate::stage_two::JOB_RETRY_DELAY_SECONDS,
-            )
-            .await,
+            db.memories()
+                .mark_global_phase2_job_failed(
+                    &claim.token,
+                    reason,
+                    crate::stage_two::JOB_RETRY_DELAY_SECONDS,
+                )
+                .await,
             Ok(false)
         ) {
             let _ = db
+                .memories()
                 .mark_global_phase2_job_failed_if_unowned(
                     &claim.token,
                     reason,
@@ -282,7 +297,8 @@ mod job {
         reason: &'static str,
     ) -> bool {
         context.counter(MEMORY_PHASE_TWO_JOBS, /*inc*/ 1, &[("status", reason)]);
-        db.mark_global_phase2_job_succeeded(&claim.token, completion_watermark, selected_outputs)
+        db.memories()
+            .mark_global_phase2_job_succeeded(&claim.token, completion_watermark, selected_outputs)
             .await
             .unwrap_or(false)
     }
@@ -292,7 +308,11 @@ mod agent {
     use super::*;
     use tracing::warn;
 
-    pub(super) fn get_config(config: &Config) -> Option<Config> {
+    pub(super) fn get_config(
+        config: &Config,
+        parent_permission_profile: PermissionProfile,
+        provider: &dyn ModelProvider,
+    ) -> Option<Config> {
         let root = memory_root(&config.codex_home);
         let mut agent_config = config.clone();
 
@@ -306,7 +326,6 @@ mod agent {
         // Approval policy
         agent_config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
         // Consolidation runs as an internal worker and must not recursively delegate.
-        let _ = agent_config.features.disable(Feature::SpawnCsv);
         let _ = agent_config.features.disable(Feature::Collab);
         let _ = agent_config.features.disable(Feature::MemoryTool);
         let _ = agent_config.features.disable(Feature::Apps);
@@ -315,26 +334,32 @@ mod agent {
             .features
             .disable(Feature::SkillMcpDependencyInstall);
 
-        // Sandbox policy
-        let writable_roots = vec![root];
-        // The consolidation agent only needs local memory-root write access and no network.
-        let consolidation_sandbox_policy = SandboxPolicy::WorkspaceWrite {
-            writable_roots,
-            network_access: false,
-            exclude_tmpdir_env_var: true,
-            exclude_slash_tmp: true,
-        };
-        agent_config
-            .permissions
-            .set_legacy_sandbox_policy(consolidation_sandbox_policy, agent_config.cwd.as_path())
-            .ok()?;
+        // Preserve the parent's explicit choice to skip Codex-managed sandboxing.
+        match parent_permission_profile {
+            PermissionProfile::Disabled => agent_config
+                .permissions
+                .set_permission_profile(PermissionProfile::Disabled),
+            PermissionProfile::External { network } => agent_config
+                .permissions
+                .set_permission_profile(PermissionProfile::External { network }),
+            PermissionProfile::Managed { .. } => {
+                // The consolidation agent only needs local memory-root write access and no network.
+                agent_config.set_legacy_sandbox_policy(SandboxPolicy::WorkspaceWrite {
+                    writable_roots: vec![root],
+                    network_access: false,
+                    exclude_tmpdir_env_var: true,
+                    exclude_slash_tmp: true,
+                })
+            }
+        }
+        .ok()?;
 
         agent_config.model = Some(
             config
                 .memories
                 .consolidation_model
                 .clone()
-                .unwrap_or(crate::stage_two::MODEL.to_string()),
+                .unwrap_or_else(|| provider.memory_consolidation_preferred_model().to_string()),
         );
         agent_config.model_reasoning_effort = Some(crate::stage_two::REASONING_EFFORT);
 
@@ -372,16 +397,44 @@ mod agent {
             let final_status =
                 loop_agent(db.clone(), claim.token.clone(), thread_id, &thread).await;
 
-            if matches!(final_status, AgentStatus::Completed(_)) {
-                if let Some(token_usage) = thread
+            let agent_completed = matches!(final_status, AgentStatus::Completed(_));
+            if agent_completed
+                && let Some(token_usage) = thread
                     .token_usage_info()
                     .await
                     .map(|info| info.total_token_usage)
-                {
-                    emit_token_usage_metrics(context.as_ref(), &token_usage);
+            {
+                emit_token_usage_metrics(context.as_ref(), &token_usage);
+            }
+
+            if let Err(err) = context
+                .shutdown_consolidation_agent(SpawnedConsolidationAgent { thread_id, thread })
+                .await
+            {
+                warn!("failed to auto-close global memory consolidation agent {thread_id}: {err}");
+                // Keep the existing lease until it expires so another worker cannot race a
+                // consolidation agent whose shutdown has not completed.
+                return;
+            }
+
+            let artifacts_valid = if agent_completed {
+                match validate_consolidation_artifacts(&memory_root).await {
+                    Ok(()) => true,
+                    Err(err) => {
+                        tracing::error!("memory consolidation artifacts are invalid: {err}");
+                        job::failed(context.as_ref(), &db, &claim, "failed_invalid_artifacts")
+                            .await;
+                        false
+                    }
                 }
+            } else {
+                false
+            };
+
+            if agent_completed && artifacts_valid {
                 // Do not reset the workspace baseline if we lost the lock.
                 let still_owns_lock = match db
+                    .memories()
                     .heartbeat_global_phase2_job(
                         &claim.token,
                         crate::stage_two::JOB_LEASE_SECONDS,
@@ -424,21 +477,9 @@ mod agent {
                         );
                     }
                 }
-            } else {
+            } else if !agent_completed {
                 job::failed(context.as_ref(), &db, &claim, "failed_agent").await;
             }
-
-            let cleanup_context = Arc::clone(&context);
-            tokio::spawn(async move {
-                if let Err(err) = cleanup_context
-                    .shutdown_consolidation_agent(SpawnedConsolidationAgent { thread_id, thread })
-                    .await
-                {
-                    warn!(
-                        "failed to auto-close global memory consolidation agent {thread_id}: {err}"
-                    );
-                }
-            });
         });
     }
 
@@ -479,6 +520,7 @@ mod agent {
                 }
                 _ = heartbeat_interval.tick() => {
                     match db
+                        .memories()
                         .heartbeat_global_phase2_job(
                             &token,
                             crate::stage_two::JOB_LEASE_SECONDS,
@@ -508,6 +550,13 @@ mod agent {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "phase2_sandbox_tests.rs"]
+mod sandbox_tests;
+#[cfg(test)]
+#[path = "phase2_workspace_roots_tests.rs"]
+mod workspace_roots_tests;
 
 pub(super) fn get_watermark(
     claimed_watermark: i64,
@@ -555,6 +604,11 @@ fn emit_token_usage_metrics(context: &MemoryStartupContext, token_usage: &TokenU
         MEMORY_PHASE_TWO_TOKEN_USAGE,
         token_usage.cached_input(),
         &[("token_type", "cached_input")],
+    );
+    context.histogram(
+        MEMORY_PHASE_TWO_TOKEN_USAGE,
+        token_usage.cache_write_input_tokens.max(0),
+        &[("token_type", "cache_write_input")],
     );
     context.histogram(
         MEMORY_PHASE_TWO_TOKEN_USAGE,

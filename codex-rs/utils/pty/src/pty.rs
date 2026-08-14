@@ -30,10 +30,13 @@ use tokio::task::JoinHandle;
 
 use crate::process::ChildTerminator;
 use crate::process::ProcessHandle;
+use crate::process::ProcessSignal;
 use crate::process::PtyHandles;
 use crate::process::PtyMasterHandle;
 use crate::process::SpawnedProcess;
 use crate::process::TerminalSize;
+#[cfg(unix)]
+use crate::process::exit_code_from_status;
 
 /// Returns true when ConPTY support is available (Windows only).
 #[cfg(windows)]
@@ -54,6 +57,19 @@ struct PtyChildTerminator {
 }
 
 impl ChildTerminator for PtyChildTerminator {
+    fn signal(&mut self, signal: ProcessSignal) -> std::io::Result<()> {
+        match signal {
+            ProcessSignal::Interrupt => {
+                #[cfg(unix)]
+                if let Some(process_group_id) = self.process_group_id {
+                    return crate::process_group::interrupt_process_group(process_group_id);
+                }
+
+                Err(crate::process::unsupported_signal(signal))
+            }
+        }
+    }
+
     fn kill(&mut self) -> std::io::Result<()> {
         #[cfg(unix)]
         if let Some(process_group_id) = self.process_group_id {
@@ -81,6 +97,14 @@ struct RawPidTerminator {
 
 #[cfg(unix)]
 impl ChildTerminator for RawPidTerminator {
+    fn signal(&mut self, signal: ProcessSignal) -> std::io::Result<()> {
+        match signal {
+            ProcessSignal::Interrupt => {
+                crate::process_group::interrupt_process_group(self.process_group_id)
+            }
+        }
+    }
+
     fn kill(&mut self) -> std::io::Result<()> {
         crate::process_group::kill_process_group(self.process_group_id)
     }
@@ -98,21 +122,9 @@ fn platform_native_pty_system() -> Box<dyn portable_pty::PtySystem + Send> {
     }
 }
 
-/// Spawn a process attached to a PTY, returning handles for stdin, split output, and exit.
+/// Spawn a process attached to a PTY, preserving selected inherited file
+/// descriptors across exec on Unix.
 pub async fn spawn_process(
-    program: &str,
-    args: &[String],
-    cwd: &Path,
-    env: &HashMap<String, String>,
-    arg0: &Option<String>,
-    size: TerminalSize,
-) -> Result<SpawnedProcess> {
-    spawn_process_with_inherited_fds(program, args, cwd, env, arg0, size, &[]).await
-}
-
-/// Spawn a process attached to a PTY, preserving any inherited file
-/// descriptors listed in `inherited_fds` across exec on Unix.
-pub async fn spawn_process_with_inherited_fds(
     program: &str,
     args: &[String],
     cwd: &Path,
@@ -193,7 +205,11 @@ async fn spawn_process_portable(
     let writer_handle: JoinHandle<()> = tokio::spawn({
         let writer = Arc::clone(&writer);
         async move {
+            #[cfg(windows)]
+            let mut windows_input = crate::WindowsTtyInputNormalizer::default();
             while let Some(bytes) = writer_rx.recv().await {
+                #[cfg(windows)]
+                let bytes = windows_input.normalize(&bytes);
                 let mut guard = writer.lock().await;
                 use std::io::Write;
                 let _ = guard.write_all(&bytes);
@@ -368,7 +384,7 @@ async fn spawn_process_preserving_fds(
     let wait_exit_code = Arc::clone(&exit_code);
     let wait_handle: JoinHandle<()> = tokio::task::spawn_blocking(move || {
         let code = match child.wait() {
-            Ok(status) => status.code().unwrap_or(-1),
+            Ok(status) => exit_code_from_status(status),
             Err(_) => -1,
         };
         wait_exit_status.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -451,7 +467,78 @@ fn set_cloexec(fd: RawFd) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
+// macOS needs a fork-safe sweep because recvmsg cannot set close-on-exec.
+#[cfg(target_os = "macos")]
+pub fn close_inherited_fds_except(preserved_fds: &[RawFd]) {
+    let mut descriptors = [libc::proc_fdinfo {
+        proc_fd: 0,
+        proc_fdtype: 0,
+    }; 1024];
+    // SAFETY: proc_pidinfo writes descriptor records into the stack buffer.
+    let bytes = unsafe {
+        libc::proc_pidinfo(
+            libc::getpid(),
+            libc::PROC_PIDLISTFDS,
+            /*arg*/ 0,
+            descriptors.as_mut_ptr().cast(),
+            std::mem::size_of_val(&descriptors) as libc::c_int,
+        )
+    };
+    let close_inheritable = |fd| {
+        if fd <= libc::STDERR_FILENO || preserved_fds.contains(&fd) {
+            return;
+        }
+        // std::process keeps a CLOEXEC pipe open until exec to report spawn errors.
+        // SAFETY: fcntl and close only operate on a descriptor owned by this process.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+                libc::close(fd);
+            }
+        }
+    };
+    if bytes > 0 && (bytes as usize) < std::mem::size_of_val(&descriptors) {
+        let count = bytes as usize / std::mem::size_of::<libc::proc_fdinfo>();
+        for descriptor in descriptors.iter().take(count) {
+            close_inheritable(descriptor.proc_fd);
+        }
+        return;
+    }
+
+    // SAFETY: proc_pidinfo accepts a null buffer when its size is zero.
+    let descriptor_table_bytes = unsafe {
+        libc::proc_pidinfo(
+            libc::getpid(),
+            libc::PROC_PIDLISTFDS,
+            /*arg*/ 0,
+            std::ptr::null_mut(),
+            /*buffersize*/ 0,
+        )
+    };
+    if descriptor_table_bytes > 0 {
+        let upper_bound =
+            descriptor_table_bytes as usize / std::mem::size_of::<libc::proc_fdinfo>();
+        for fd in libc::STDERR_FILENO + 1..upper_bound as RawFd {
+            close_inheritable(fd);
+        }
+        return;
+    }
+
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes into the stack-owned resource-limit structure.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } == 0 {
+        let upper_bound = limit.rlim_cur.min(RawFd::MAX as _) as RawFd;
+        for fd in libc::STDERR_FILENO + 1..upper_bound {
+            close_inheritable(fd);
+        }
+    }
+}
+
+// Other Unix platforms keep their existing fd cleanup.
+#[cfg(all(unix, not(target_os = "macos")))]
 pub(crate) fn close_inherited_fds_except(preserved_fds: &[RawFd]) {
     if let Ok(dir) = std::fs::read_dir("/dev/fd") {
         let mut fds = Vec::new();

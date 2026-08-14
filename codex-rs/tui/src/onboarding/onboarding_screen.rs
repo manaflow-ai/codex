@@ -32,10 +32,10 @@ use codex_protocol::config_types::ForcedLoginMethod;
 
 use crate::LoginStatus;
 use crate::app_server_session::AppServerSession;
+use crate::config_update::format_config_error;
+use crate::config_update::write_trusted_project;
 use crate::key_hint::KeyBindingListExt;
 use crate::legacy_core::config::Config;
-#[cfg(target_os = "windows")]
-use crate::legacy_core::windows_sandbox::WindowsSandboxLevelExt;
 use crate::onboarding::auth::AuthModeWidget;
 use crate::onboarding::auth::SignInOption;
 use crate::onboarding::auth::SignInState;
@@ -89,7 +89,7 @@ pub(crate) struct OnboardingScreenArgs {
 }
 
 pub(crate) struct OnboardingResult {
-    pub directory_trust_decision: Option<TrustDirectorySelection>,
+    pub directory_trust_persisted: bool,
     pub should_exit: bool,
 }
 
@@ -111,8 +111,7 @@ impl OnboardingScreen {
             config,
         } = args;
         let cwd = config.cwd.to_path_buf();
-        let codex_home = config.codex_home.to_path_buf();
-        let forced_login_method = config.forced_login_method;
+        let auth_config = config.auth_config();
         let mut steps: Vec<Step> = Vec::new();
         steps.push(Step::Welcome(WelcomeWidget::new(
             !matches!(login_status, LoginStatus::NotAuthenticated),
@@ -120,10 +119,12 @@ impl OnboardingScreen {
             config.animations,
         )));
         if show_login_screen {
-            let highlighted_mode = match forced_login_method {
-                Some(ForcedLoginMethod::Api) => SignInOption::ApiKey,
-                _ => SignInOption::ChatGpt,
-            };
+            let highlighted_mode =
+                if auth_config.is_login_method_allowed(ForcedLoginMethod::Chatgpt) {
+                    SignInOption::ChatGpt
+                } else {
+                    SignInOption::ApiKey
+                };
             if let Some(app_server_request_handle) = app_server_request_handle {
                 steps.push(Step::Auth(AuthModeWidget {
                     request_frame: tui.frame_requester(),
@@ -132,7 +133,7 @@ impl OnboardingScreen {
                     sign_in_state: Arc::new(RwLock::new(SignInState::PickMode)),
                     login_status,
                     app_server_request_handle,
-                    forced_login_method,
+                    auth_config,
                     animations_enabled: config.animations,
                     animations_suppressed: std::cell::Cell::new(false),
                 }));
@@ -142,7 +143,7 @@ impl OnboardingScreen {
         }
         #[cfg(target_os = "windows")]
         let show_windows_create_sandbox_hint =
-            WindowsSandboxLevel::from_config(&config) == WindowsSandboxLevel::Disabled;
+            crate::windows_sandbox::level_from_config(&config) == WindowsSandboxLevel::Disabled;
         #[cfg(not(target_os = "windows"))]
         let show_windows_create_sandbox_hint = false;
         let highlighted = TrustDirectorySelection::Trust;
@@ -154,7 +155,6 @@ impl OnboardingScreen {
             steps.push(Step::TrustDirectory(TrustDirectoryWidget {
                 cwd,
                 trust_target,
-                codex_home,
                 show_windows_create_sandbox_hint,
                 should_quit: false,
                 selection: None,
@@ -221,19 +221,6 @@ impl OnboardingScreen {
                 .steps
                 .iter()
                 .any(|step| matches!(step.get_step_state(), StepState::InProgress))
-    }
-
-    pub fn directory_trust_decision(&self) -> Option<TrustDirectorySelection> {
-        self.steps
-            .iter()
-            .find_map(|step| {
-                if let Step::TrustDirectory(TrustDirectoryWidget { selection, .. }) = step {
-                    Some(*selection)
-                } else {
-                    None
-                }
-            })
-            .flatten()
     }
 
     pub fn should_exit(&self) -> bool {
@@ -493,7 +480,9 @@ pub(crate) async fn run_onboarding_app(
 ) -> Result<OnboardingResult> {
     use tokio_stream::StreamExt;
 
+    let app_server_request_handle = args.app_server_request_handle.clone();
     let mut onboarding_screen = OnboardingScreen::new(tui, args).await;
+    let mut directory_trust_persisted = false;
     // One-time guard to fully clear the screen after ChatGPT login success message is shown
     let mut did_full_clear_after_success = false;
 
@@ -508,14 +497,22 @@ pub(crate) async fn run_onboarding_app(
         tokio::select! {
             event = tui_events.next() => {
                 if let Some(event) = event {
+                    tui.screen_size_for_event(&event)?;
                     match event {
                         TuiEvent::Key(key_event) => {
                             onboarding_screen.handle_key_event(key_event);
+                            if !directory_trust_persisted {
+                                directory_trust_persisted = persist_selected_trust(
+                                    &mut onboarding_screen,
+                                    app_server_request_handle.clone(),
+                                )
+                                .await;
+                            }
                         }
                         TuiEvent::Paste(text) => {
                             onboarding_screen.handle_paste(text);
                         }
-                        TuiEvent::Draw | TuiEvent::Resize => {
+                        TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) => {
                             if !did_full_clear_after_success
                                 && onboarding_screen.steps.iter().any(|step| {
                                     if let Step::Auth(w) = step {
@@ -562,7 +559,7 @@ pub(crate) async fn run_onboarding_app(
                 if let Some(event) = event {
                     match event {
                         AppServerEvent::ServerNotification(notification) => {
-                            onboarding_screen.handle_app_server_notification(notification);
+                            onboarding_screen.handle_app_server_notification(*notification);
                         }
                         AppServerEvent::Disconnected { message } => {
                             return Err(color_eyre::eyre::eyre!(message));
@@ -575,18 +572,74 @@ pub(crate) async fn run_onboarding_app(
         }
     }
     Ok(OnboardingResult {
-        directory_trust_decision: onboarding_screen.directory_trust_decision(),
+        directory_trust_persisted,
         should_exit: onboarding_screen.should_exit(),
     })
+}
+
+async fn persist_selected_trust(
+    onboarding_screen: &mut OnboardingScreen,
+    request_handle: Option<AppServerRequestHandle>,
+) -> bool {
+    let Some((trust_step_index, trust_target)) = onboarding_screen
+        .steps
+        .iter()
+        .enumerate()
+        .find_map(|(index, step)| {
+            if let Step::TrustDirectory(widget) = step
+                && widget.selection == Some(TrustDirectorySelection::Trust)
+            {
+                return Some((index, widget.trust_target.clone()));
+            }
+            None
+        })
+    else {
+        return false;
+    };
+
+    let result = match request_handle {
+        Some(request_handle) => write_trusted_project(request_handle, &trust_target)
+            .await
+            .map(|_| ()),
+        None => Err(color_eyre::eyre::eyre!("app server unavailable")),
+    };
+
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            let error = format_config_error(&error);
+            tracing::error!(
+                "failed to persist trusted project state for {}: {error}",
+                trust_target.display()
+            );
+            if let Step::TrustDirectory(widget) = &mut onboarding_screen.steps[trust_step_index] {
+                widget.selection = None;
+                widget.error = Some(format!(
+                    "Failed to set trust for {}: {error}",
+                    trust_target.display()
+                ));
+            }
+            false
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::ApiKeyEntryContext;
+    use super::OnboardingScreen;
+    use super::Step;
+    use super::StepStateProvider;
+    use super::persist_selected_trust;
     use super::suppress_quit_while_typing_api_key;
+    use crate::onboarding::trust_directory::TrustDirectorySelection;
+    use crate::onboarding::trust_directory::TrustDirectoryWidget;
+    use crate::tui::FrameRequester;
     use crossterm::event::KeyCode;
     use crossterm::event::KeyEvent;
     use crossterm::event::KeyModifiers;
+    use pretty_assertions::assert_eq;
+    use std::path::PathBuf;
 
     #[test]
     fn suppresses_printable_quit_key_during_api_key_entry() {
@@ -634,5 +687,39 @@ mod tests {
             },
         );
         assert!(!suppressed);
+    }
+
+    #[tokio::test]
+    async fn trust_persistence_failure_keeps_trust_step_in_progress() {
+        let mut onboarding_screen = OnboardingScreen {
+            request_frame: FrameRequester::test_dummy(),
+            steps: vec![Step::TrustDirectory(TrustDirectoryWidget {
+                cwd: PathBuf::from("/workspace/project"),
+                trust_target: PathBuf::from("/workspace/project"),
+                show_windows_create_sandbox_hint: false,
+                should_quit: false,
+                selection: Some(TrustDirectorySelection::Trust),
+                highlighted: TrustDirectorySelection::Trust,
+                error: None,
+            })],
+            is_done: false,
+            should_exit: false,
+        };
+
+        let persisted =
+            persist_selected_trust(&mut onboarding_screen, /*request_handle*/ None).await;
+
+        assert!(!persisted);
+        let Step::TrustDirectory(widget) = &onboarding_screen.steps[0] else {
+            panic!("trust step should remain present");
+        };
+        assert_eq!(widget.selection, None);
+        assert_eq!(widget.get_step_state(), super::StepState::InProgress);
+        assert!(
+            widget
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("app server unavailable"))
+        );
     }
 }

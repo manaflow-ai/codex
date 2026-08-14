@@ -23,3 +23,9 @@ tracing-subscriber = { workspace = true }
 tungstenite = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
+
+[lib]
+doctest = false
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

@@ -13,9 +13,9 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::TokenUsage;
 use codex_rollout::INTERACTIVE_SESSION_SOURCES;
+use codex_rollout::RolloutItem;
 use codex_rollout::should_persist_response_item_for_memories;
 use codex_secrets::redact_secrets;
 use futures::StreamExt;
@@ -112,6 +112,7 @@ pub async fn prune(context: &MemoryStartupContext, config: &Config) {
     if let Some(db) = context.state_db() {
         let max_unused_days = config.memories.max_unused_days;
         match db
+            .memories()
             .prune_stage1_outputs_for_retention(max_unused_days, crate::stage_one::PRUNE_BATCH_SIZE)
             .await
         {
@@ -124,7 +125,7 @@ pub async fn prune(context: &MemoryStartupContext, config: &Config) {
             }
             Err(err) => {
                 warn!(
-                    "state db prune_stage1_outputs_for_retention failed during memories startup: {err}"
+                    "memories db prune_stage1_outputs_for_retention failed during memories startup: {err}"
                 );
             }
         }
@@ -161,6 +162,7 @@ async fn claim_startup_jobs(
         .collect::<Vec<_>>();
 
     match state_db
+        .memories()
         .claim_stage1_jobs_for_startup(
             context.thread_id(),
             codex_state::Stage1StartupClaimParams {
@@ -176,7 +178,9 @@ async fn claim_startup_jobs(
     {
         Ok(claims) => Some(claims),
         Err(err) => {
-            warn!("state db claim_stage1_jobs_for_startup failed during memories startup: {err}");
+            warn!(
+                "memories db claim_stage1_jobs_for_startup failed during memories startup: {err}"
+            );
             None
         }
     }
@@ -186,11 +190,12 @@ async fn build_request_context(
     context: &MemoryStartupContext,
     config: &Config,
 ) -> StageOneRequestContext {
-    let model_name = config
-        .memories
-        .extract_model
-        .clone()
-        .unwrap_or(crate::stage_one::MODEL.to_string());
+    let model_name = config.memories.extract_model.clone().unwrap_or_else(|| {
+        context
+            .provider()
+            .memory_extraction_preferred_model()
+            .to_string()
+    });
     context
         .stage_one_request_context(config, &model_name, crate::stage_one::REASONING_EFFORT)
         .await
@@ -202,7 +207,7 @@ async fn run_jobs(
     claimed_candidates: Vec<codex_state::Stage1JobClaim>,
     stage_one_context: StageOneRequestContext,
 ) -> Vec<JobResult> {
-    futures::stream::iter(claimed_candidates.into_iter())
+    futures::stream::iter(claimed_candidates)
         .map(|claim| {
             let context = Arc::clone(&context);
             let config = Arc::clone(&config);
@@ -298,9 +303,11 @@ mod job {
                 )?,
             }],
             phase: None,
+            internal_chat_message_metadata_passthrough: None,
         }];
         prompt.base_instructions = BaseInstructions {
             text: crate::stage_one::PROMPT.to_string(),
+            provenance: None,
         };
         prompt.output_schema = Some(output_schema());
         prompt.output_schema_strict = true;
@@ -329,6 +336,7 @@ mod job {
             tracing::warn!("Phase 1 job failed for thread {thread_id}: {reason}");
             if let Some(state_db) = context.state_db() {
                 let _ = state_db
+                    .memories()
                     .mark_stage1_job_failed(
                         thread_id,
                         ownership_token,
@@ -349,6 +357,7 @@ mod job {
             };
 
             if state_db
+                .memories()
                 .mark_stage1_job_succeeded_no_output(thread_id, ownership_token)
                 .await
                 .unwrap_or(false)
@@ -373,6 +382,7 @@ mod job {
             };
 
             if state_db
+                .memories()
                 .mark_stage1_job_succeeded(
                     thread_id,
                     ownership_token,
@@ -397,12 +407,18 @@ mod job {
     ) -> codex_protocol::error::Result<String> {
         let filtered = items
             .iter()
-            .filter_map(|item| {
-                if let RolloutItem::ResponseItem(item) = item {
-                    sanitize_response_item_for_memories(item)
-                } else {
-                    None
+            .filter_map(|item| match item {
+                RolloutItem::ResponseItem(item) => sanitize_response_item_for_memories(&item.item),
+                RolloutItem::InterAgentCommunication(communication) => {
+                    Some(communication.to_model_input_item())
                 }
+                RolloutItem::SessionMeta(_)
+                | RolloutItem::InterAgentCommunicationMetadata { .. }
+                | RolloutItem::Compacted(_)
+                | RolloutItem::TurnContext(_)
+                | RolloutItem::WorldState(_)
+                | RolloutItem::SecurityRiskScore(_)
+                | RolloutItem::EventMsg(_) => None,
             })
             .collect::<Vec<_>>();
         let serialized = serde_json::to_string(&filtered).map_err(|err| {
@@ -417,6 +433,7 @@ mod job {
             role,
             content,
             phase,
+            internal_chat_message_metadata_passthrough: metadata,
         } = item
         else {
             return should_persist_response_item_for_memories(item).then(|| item.clone());
@@ -444,6 +461,7 @@ mod job {
             role: role.clone(),
             content,
             phase: phase.clone(),
+            internal_chat_message_metadata_passthrough: metadata.clone(),
         })
     }
 
@@ -452,7 +470,7 @@ mod job {
             return false;
         };
 
-        matches_marked_fragment(text, "# AGENTS.md instructions for ", "</INSTRUCTIONS>")
+        matches_marked_fragment(text, "# AGENTS.md instructions", "</INSTRUCTIONS>")
             || matches_marked_fragment(text, "<skill>", "</skill>")
     }
 
@@ -477,6 +495,10 @@ mod job {
             let cases = [
                 (
                     "# AGENTS.md instructions for /tmp\n\n<INSTRUCTIONS>\nbody\n</INSTRUCTIONS>",
+                    true,
+                ),
+                (
+                    "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nbody\n</INSTRUCTIONS>",
                     true,
                 ),
                 (
@@ -630,6 +652,11 @@ fn emit_metrics(context: &StageOneRequestContext, counts: &Stats) {
         );
         context.histogram(
             MEMORY_PHASE_ONE_TOKEN_USAGE,
+            token_usage.cache_write_input_tokens.max(0),
+            &[("token_type", "cache_write_input")],
+        );
+        context.histogram(
+            MEMORY_PHASE_ONE_TOKEN_USAGE,
             token_usage.output_tokens.max(0),
             &[("token_type", "output")],
         );
@@ -644,6 +671,9 @@ fn emit_metrics(context: &StageOneRequestContext, counts: &Stats) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_protocol::AgentPath;
+    use codex_protocol::protocol::InterAgentCommunication;
+    use codex_protocol::security_risk::SecurityRiskScore;
     use pretty_assertions::assert_eq;
 
     #[test]
@@ -658,11 +688,16 @@ mod tests {
                             .to_string(),
                 },
                 ContentItem::InputText {
+                    text: "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nbody\n</INSTRUCTIONS>"
+                        .to_string(),
+                },
+                ContentItem::InputText {
                     text: "<environment_context>\n<cwd>/tmp</cwd>\n</environment_context>"
                         .to_string(),
                 },
             ],
             phase: None,
+            internal_chat_message_metadata_passthrough: None,
         };
         let skill_message = ResponseItem::Message {
             id: None,
@@ -673,6 +708,7 @@ mod tests {
                         .to_string(),
             }],
             phase: None,
+            internal_chat_message_metadata_passthrough: None,
         };
         let subagent_message = ResponseItem::Message {
             id: None,
@@ -682,12 +718,17 @@ mod tests {
                     .to_string(),
             }],
             phase: None,
+            internal_chat_message_metadata_passthrough: None,
         };
 
         let serialized = job::serialize_filtered_rollout_response_items(&[
-            RolloutItem::ResponseItem(mixed_contextual_message),
-            RolloutItem::ResponseItem(skill_message),
-            RolloutItem::ResponseItem(subagent_message.clone()),
+            RolloutItem::ResponseItem(mixed_contextual_message.into()),
+            RolloutItem::ResponseItem(skill_message.into()),
+            RolloutItem::SecurityRiskScore(SecurityRiskScore {
+                category: "action_risk".to_string(),
+                score: 0.92,
+            }),
+            RolloutItem::ResponseItem(subagent_message.clone().into()),
         ])
         .expect("serialize");
         let parsed: Vec<ResponseItem> = serde_json::from_str(&serialized).expect("parse");
@@ -703,6 +744,7 @@ mod tests {
                             .to_string(),
                     }],
                     phase: None,
+                    internal_chat_message_metadata_passthrough: None,
                 },
                 subagent_message,
             ]
@@ -714,6 +756,7 @@ mod tests {
         let serialized =
             job::serialize_filtered_rollout_response_items(&[RolloutItem::ResponseItem(
                 ResponseItem::FunctionCallOutput {
+                    id: None,
                     call_id: "call_123".to_string(),
                     output: codex_protocol::models::FunctionCallOutputPayload {
                         body: codex_protocol::models::FunctionCallOutputBody::Text(
@@ -721,12 +764,66 @@ mod tests {
                         ),
                         success: Some(true),
                     },
-                },
+                    internal_chat_message_metadata_passthrough: None,
+                }
+                .into(),
             )])
             .expect("serialize");
 
         assert!(!serialized.contains("sk-abcdefghijklmnopqrstuvwxyz123456"));
         assert!(serialized.contains("[REDACTED_SECRET]"));
+    }
+
+    #[test]
+    fn serializes_inter_agent_communications_for_memory() {
+        let plaintext = InterAgentCommunication::new(
+            AgentPath::root().join("worker").expect("worker path"),
+            AgentPath::root(),
+            Vec::new(),
+            "child done".to_string(),
+            /*trigger_turn*/ false,
+        );
+        let encrypted = InterAgentCommunication::new_encrypted(
+            AgentPath::root(),
+            AgentPath::root().join("worker").expect("worker path"),
+            Vec::new(),
+            "encrypted payload".to_string(),
+            /*trigger_turn*/ true,
+        );
+        let expected = vec![
+            plaintext.to_model_input_item(),
+            encrypted.to_model_input_item(),
+        ];
+
+        let serialized = job::serialize_filtered_rollout_response_items(&[
+            RolloutItem::InterAgentCommunication(plaintext),
+            RolloutItem::InterAgentCommunication(encrypted),
+        ])
+        .expect("serialize");
+        let parsed: Vec<ResponseItem> = serde_json::from_str(&serialized).expect("parse");
+
+        assert_eq!(parsed, expected);
+    }
+
+    #[test]
+    fn serializes_agent_message_response_items_for_memory() {
+        let communication = InterAgentCommunication::new(
+            AgentPath::root(),
+            AgentPath::root().join("worker").expect("agent path"),
+            Vec::new(),
+            "delegated task".to_string(),
+            /*trigger_turn*/ true,
+        );
+        let response_item = communication.to_model_input_item();
+
+        let serialized = job::serialize_filtered_rollout_response_items(&[
+            RolloutItem::InterAgentCommunicationMetadata { trigger_turn: true },
+            RolloutItem::ResponseItem(response_item.clone().into()),
+        ])
+        .expect("serialize");
+        let parsed: Vec<ResponseItem> = serde_json::from_str(&serialized).expect("parse");
+
+        assert_eq!(parsed, vec![response_item]);
     }
 
     #[test]
@@ -737,9 +834,11 @@ mod tests {
                 token_usage: Some(TokenUsage {
                     input_tokens: 10,
                     cached_input_tokens: 2,
+                    cache_write_input_tokens: 0,
                     output_tokens: 3,
                     reasoning_output_tokens: 1,
                     total_tokens: 13,
+                    codex_rollout_budget_units: None,
                 }),
             },
             JobResult {
@@ -747,9 +846,11 @@ mod tests {
                 token_usage: Some(TokenUsage {
                     input_tokens: 7,
                     cached_input_tokens: 1,
+                    cache_write_input_tokens: 0,
                     output_tokens: 2,
                     reasoning_output_tokens: 0,
                     total_tokens: 9,
+                    codex_rollout_budget_units: None,
                 }),
             },
             JobResult {
@@ -767,9 +868,11 @@ mod tests {
             Some(TokenUsage {
                 input_tokens: 17,
                 cached_input_tokens: 3,
+                cache_write_input_tokens: 0,
                 output_tokens: 5,
                 reasoning_output_tokens: 1,
                 total_tokens: 22,
+                codex_rollout_budget_units: None,
             })
         );
     }

@@ -1,7 +1,6 @@
 use crate::config::Config;
 pub use codex_rollout::ARCHIVED_SESSIONS_SUBDIR;
 pub use codex_rollout::Cursor;
-pub use codex_rollout::EventPersistenceMode;
 pub use codex_rollout::INTERACTIVE_SESSION_SOURCES;
 pub use codex_rollout::RolloutRecorder;
 pub use codex_rollout::RolloutRecorderParams;
@@ -29,8 +28,8 @@ impl codex_rollout::RolloutConfigView for Config {
         self.codex_home.as_path()
     }
 
-    fn sqlite_home(&self) -> &std::path::Path {
-        self.sqlite_home.as_path()
+    fn sqlite_config(&self) -> &codex_state::SqliteConfig {
+        self.sqlite_config()
     }
 
     fn cwd(&self) -> &std::path::Path {
@@ -50,6 +49,7 @@ pub(crate) mod list {
     pub use codex_rollout::find_thread_path_by_id_str;
 }
 
+#[cfg(test)]
 pub(crate) mod recorder {
     pub use codex_rollout::RolloutRecorder;
 }

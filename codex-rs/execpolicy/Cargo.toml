@@ -8,6 +8,7 @@ description = "Codex exec policy: prefix-based Starlark rules for command decisi
 [lib]
 name = "codex_execpolicy"
 path = "src/lib.rs"
+doctest = false
 
 [[bin]]
 name = "codex-execpolicy"
@@ -25,8 +26,9 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 shlex = { workspace = true }
 starlark = { workspace = true }
+tempfile = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt"] }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
-tempfile = { workspace = true }

@@ -1,8 +1,11 @@
 use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
-use async_trait::async_trait;
+use codex_network_proxy::NetworkPolicyDecider;
+use codex_sandboxing::SandboxType;
 use tokio::sync::broadcast;
 use tokio::sync::watch;
 
@@ -10,11 +13,29 @@ use crate::ExecServerError;
 use crate::ProcessId;
 use crate::protocol::ExecParams;
 use crate::protocol::ProcessOutputChunk;
+use crate::protocol::ProcessSandboxType;
+use crate::protocol::ProcessSignal;
 use crate::protocol::ReadResponse;
 use crate::protocol::WriteResponse;
 
 pub struct StartedExecProcess {
     pub process: Arc<dyn ExecProcess>,
+    /// `None` means the exec-server peer did not report its sandbox type.
+    pub sandbox_type: Option<SandboxType>,
+}
+
+pub(crate) fn sandbox_type_from_protocol(
+    sandbox_type: Option<ProcessSandboxType>,
+) -> Option<SandboxType> {
+    match sandbox_type {
+        None => None,
+        Some(ProcessSandboxType::None) => Some(SandboxType::None),
+        Some(ProcessSandboxType::MacosSeatbelt) => Some(SandboxType::MacosSeatbelt),
+        Some(ProcessSandboxType::LinuxSeccomp) => Some(SandboxType::LinuxSeccomp),
+        Some(ProcessSandboxType::WindowsRestrictedToken) => {
+            Some(SandboxType::WindowsRestrictedToken)
+        }
+    }
 }
 
 /// Pushed process events for consumers that want to follow process output as it
@@ -24,12 +45,18 @@ pub struct StartedExecProcess {
 /// stdout, stderr, or pty bytes. `Exited` reports the process exit status, while
 /// `Closed` means all output streams have ended and no more output events will
 /// arrive. `Failed` is used when the process session cannot continue, for
-/// example because the remote executor connection disconnected.
+/// example because the remote environment connection disconnected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecProcessEvent {
     Output(ProcessOutputChunk),
-    Exited { seq: u64, exit_code: i32 },
-    Closed { seq: u64 },
+    Exited {
+        seq: u64,
+        exit_code: i32,
+        sandbox_denied: Option<bool>,
+    },
+    Closed {
+        seq: u64,
+    },
     Failed(String),
 }
 
@@ -123,21 +150,28 @@ impl ExecProcessEventLog {
         let live_rx = self.inner.live_tx.subscribe();
         let replay = history.events.iter().cloned().collect();
 
-        ExecProcessEventReceiver { replay, live_rx }
+        ExecProcessEventReceiver {
+            replay,
+            live_rx,
+            _keepalive: None,
+        }
     }
 }
 
 pub struct ExecProcessEventReceiver {
     replay: VecDeque<ExecProcessEvent>,
     live_rx: broadcast::Receiver<ExecProcessEvent>,
+    _keepalive: Option<broadcast::Sender<ExecProcessEvent>>,
 }
 
 impl ExecProcessEventReceiver {
+    /// Returns a receiver that remains open without yielding events.
     pub fn empty() -> Self {
-        let (_live_tx, live_rx) = broadcast::channel(1);
+        let (live_tx, live_rx) = broadcast::channel(1);
         Self {
             replay: VecDeque::new(),
             live_rx,
+            _keepalive: Some(live_tx),
         }
     }
 
@@ -161,7 +195,6 @@ impl ExecProcessEventReceiver {
 /// `read` is the request/response API for callers that want to page through
 /// buffered output, while `subscribe_events` is the streaming API for callers
 /// that want output and lifecycle changes delivered as they happen.
-#[async_trait]
 pub trait ExecProcess: Send + Sync {
     fn process_id(&self) -> &ProcessId;
 
@@ -169,22 +202,42 @@ pub trait ExecProcess: Send + Sync {
 
     fn subscribe_events(&self) -> ExecProcessEventReceiver;
 
-    async fn read(
+    fn read(
         &self,
         after_seq: Option<u64>,
         max_bytes: Option<usize>,
         wait_ms: Option<u64>,
-    ) -> Result<ReadResponse, ExecServerError>;
+    ) -> ExecProcessFuture<'_, ReadResponse>;
 
-    async fn write(&self, chunk: Vec<u8>) -> Result<WriteResponse, ExecServerError>;
+    fn write(&self, chunk: Vec<u8>) -> ExecProcessFuture<'_, WriteResponse>;
 
-    async fn terminate(&self) -> Result<(), ExecServerError>;
+    fn signal(&self, signal: ProcessSignal) -> ExecProcessFuture<'_, ()>;
+
+    fn terminate(&self) -> ExecProcessFuture<'_, ()>;
 }
 
-#[async_trait]
+pub type ExecProcessFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, ExecServerError>> + Send + 'a>>;
+
 pub trait ExecBackend: Send + Sync {
-    async fn start(&self, params: ExecParams) -> Result<StartedExecProcess, ExecServerError>;
+    fn start(&self, params: ExecParams) -> ExecBackendFuture<'_>;
+
+    /// Starts a process with an authoritative controller-side policy decider.
+    fn start_with_network_policy_decider(
+        &self,
+        _params: ExecParams,
+        _decider: Arc<dyn NetworkPolicyDecider>,
+    ) -> ExecBackendFuture<'_> {
+        Box::pin(async {
+            Err(ExecServerError::Protocol(
+                "exec backend does not support remote network policy decisions".to_string(),
+            ))
+        })
+    }
 }
+
+pub type ExecBackendFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<StartedExecProcess, ExecServerError>> + Send + 'a>>;
 
 #[cfg(test)]
 mod tests {
@@ -194,8 +247,20 @@ mod tests {
 
     use super::ExecProcessEvent;
     use super::ExecProcessEventLog;
+    use super::ExecProcessEventReceiver;
     use crate::protocol::ExecOutputStream;
     use crate::protocol::ProcessOutputChunk;
+
+    #[tokio::test]
+    async fn empty_event_receiver_stays_open() {
+        let mut events = ExecProcessEventReceiver::empty();
+
+        assert!(
+            timeout(Duration::from_millis(10), events.recv())
+                .await
+                .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn event_history_replay_is_bounded_by_retained_bytes() {
@@ -209,6 +274,7 @@ mod tests {
         log.publish(ExecProcessEvent::Exited {
             seq: 2,
             exit_code: 0,
+            sandbox_denied: Some(false),
         });
         log.publish(ExecProcessEvent::Closed { seq: 3 });
 
@@ -230,6 +296,7 @@ mod tests {
                 ExecProcessEvent::Exited {
                     seq: 2,
                     exit_code: 0,
+                    sandbox_denied: Some(false),
                 },
                 ExecProcessEvent::Closed { seq: 3 },
             ]

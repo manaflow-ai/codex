@@ -7,16 +7,17 @@
 use serde::Serialize;
 use std::time::Duration;
 
-use codex_app_server_protocol::AuthMode as ApiAuthMode;
-use codex_client::CodexHttpClient;
+use codex_http_client::HttpClient;
+use codex_protocol::auth::AuthMode;
 
-use super::manager::CLIENT_ID;
 use super::manager::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
 use super::manager::REVOKE_TOKEN_URL;
 use super::manager::REVOKE_TOKEN_URL_OVERRIDE_ENV_VAR;
+use super::manager::oauth_client_id;
 use super::storage::AuthDotJson;
 use super::util::try_parse_error_message;
-use crate::default_client::create_client;
+use crate::default_client::create_default_auth_client;
+use crate::outbound_proxy::AuthRouteConfig;
 use crate::token_data::TokenData;
 
 const REVOKE_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -35,10 +36,10 @@ impl RevokeTokenKind {
         }
     }
 
-    fn client_id(self) -> Option<&'static str> {
+    fn client_id(self) -> Option<String> {
         match self {
             Self::Access => None,
-            Self::Refresh => Some(CLIENT_ID),
+            Self::Refresh => Some(oauth_client_id()),
         }
     }
 }
@@ -48,61 +49,53 @@ struct RevokeTokenRequest<'a> {
     token: &'a str,
     token_type_hint: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    client_id: Option<&'static str>,
+    client_id: Option<String>,
 }
 
 pub(super) async fn revoke_auth_tokens(
     auth_dot_json: Option<&AuthDotJson>,
+    auth_route_config: &AuthRouteConfig,
 ) -> Result<(), std::io::Error> {
-    let Some(tokens) = auth_dot_json.and_then(managed_chatgpt_tokens) else {
+    let Some((token, kind)) = auth_dot_json.and_then(revocable_token) else {
         return Ok(());
     };
 
-    let client = create_client();
     let endpoint = revoke_token_endpoint();
+    let client = create_default_auth_client(&endpoint, auth_route_config)?;
+    revoke_oauth_token(&client, endpoint.as_str(), token, kind, REVOKE_HTTP_TIMEOUT).await
+}
+
+fn revocable_token(auth_dot_json: &AuthDotJson) -> Option<(&str, RevokeTokenKind)> {
+    let tokens = managed_chatgpt_tokens(auth_dot_json)?;
     if !tokens.refresh_token.is_empty() {
-        revoke_oauth_token(
-            &client,
-            endpoint.as_str(),
-            tokens.refresh_token.as_str(),
-            RevokeTokenKind::Refresh,
-            REVOKE_HTTP_TIMEOUT,
-        )
-        .await
+        Some((tokens.refresh_token.as_str(), RevokeTokenKind::Refresh))
     } else if !tokens.access_token.is_empty() {
-        revoke_oauth_token(
-            &client,
-            endpoint.as_str(),
-            tokens.access_token.as_str(),
-            RevokeTokenKind::Access,
-            REVOKE_HTTP_TIMEOUT,
-        )
-        .await
+        Some((tokens.access_token.as_str(), RevokeTokenKind::Access))
     } else {
-        Ok(())
+        None
     }
 }
 
 fn managed_chatgpt_tokens(auth_dot_json: &AuthDotJson) -> Option<&TokenData> {
-    if resolved_auth_mode(auth_dot_json) == ApiAuthMode::Chatgpt {
+    if resolved_auth_mode(auth_dot_json) == AuthMode::Chatgpt {
         auth_dot_json.tokens.as_ref()
     } else {
         None
     }
 }
 
-fn resolved_auth_mode(auth_dot_json: &AuthDotJson) -> ApiAuthMode {
+fn resolved_auth_mode(auth_dot_json: &AuthDotJson) -> AuthMode {
     if let Some(mode) = auth_dot_json.auth_mode {
         return mode;
     }
     if auth_dot_json.openai_api_key.is_some() {
-        return ApiAuthMode::ApiKey;
+        return AuthMode::ApiKey;
     }
-    ApiAuthMode::Chatgpt
+    AuthMode::Chatgpt
 }
 
 async fn revoke_oauth_token(
-    client: &CodexHttpClient,
+    client: &HttpClient,
     endpoint: &str,
     token: &str,
     kind: RevokeTokenKind,
@@ -162,6 +155,9 @@ fn derive_revoke_token_endpoint(refresh_endpoint: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_http_client::ClientRouteClass;
+    use codex_http_client::HttpClientFactory;
+    use codex_http_client::OutboundProxyPolicy;
     use core_test_support::skip_if_no_network;
     use wiremock::Mock;
     use wiremock::MockServer;
@@ -188,8 +184,10 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = CodexHttpClient::new(reqwest::Client::new());
         let endpoint = format!("{}/oauth/revoke", server.uri());
+        let client = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault)
+            .build_client(&endpoint, ClientRouteClass::Auth)
+            .expect("test HTTP client should build");
         let error = revoke_oauth_token(
             &client,
             endpoint.as_str(),
@@ -202,8 +200,8 @@ mod tests {
 
         let reqwest_error = error
             .get_ref()
-            .and_then(|error| error.downcast_ref::<reqwest::Error>())
-            .expect("timeout error should preserve reqwest error");
+            .and_then(|error| error.downcast_ref::<codex_http_client::HttpError>())
+            .expect("timeout error should preserve HTTP client error");
         assert!(reqwest_error.is_timeout());
     }
 }

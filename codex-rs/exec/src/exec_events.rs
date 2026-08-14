@@ -63,6 +63,9 @@ pub struct Usage {
     pub input_tokens: i64,
     /// The number of cached input tokens used during the turn.
     pub cached_input_tokens: i64,
+    /// The number of input tokens written to the prompt cache during the turn.
+    #[serde(default)]
+    pub cache_write_input_tokens: i64,
     /// The number of output tokens used during the turn.
     pub output_tokens: i64,
     /// The number of reasoning output tokens used during the turn.
@@ -266,6 +269,9 @@ pub struct McpToolCallItemResult {
     // representations). Using `JsonValue` keeps the payload wire-shaped and
     // easy to export.
     pub content: Vec<JsonValue>,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub meta: Option<JsonValue>,
     pub structured_content: Option<JsonValue>,
 }
 

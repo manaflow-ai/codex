@@ -1,17 +1,33 @@
 use super::augment_tool_spec_for_code_mode;
-use super::create_code_mode_tool;
-use super::create_wait_tool;
+use super::code_mode_name_for_tool_name;
 use super::tool_spec_to_code_mode_tool_definition;
 use crate::AdditionalProperties;
 use crate::FreeformTool;
 use crate::FreeformToolFormat;
 use crate::JsonSchema;
+use crate::ResponsesApiNamespace;
+use crate::ResponsesApiNamespaceTool;
 use crate::ResponsesApiTool;
 use crate::ToolName;
 use crate::ToolSpec;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::collections::BTreeMap;
+
+#[test]
+fn code_mode_tool_names_do_not_prefix_the_default_namespace() {
+    for tool_name in [
+        ToolName::plain("apply_patch"),
+        ToolName::namespaced("functions", "apply_patch"),
+    ] {
+        assert_eq!(code_mode_name_for_tool_name(&tool_name), "apply_patch");
+    }
+
+    assert_eq!(
+        code_mode_name_for_tool_name(&ToolName::namespaced("editor", "apply_patch")),
+        "editor__apply_patch"
+    );
+}
 
 #[test]
 fn augment_tool_spec_for_code_mode_augments_function_tools() {
@@ -73,6 +89,7 @@ fn augment_tool_spec_for_code_mode_preserves_exec_tool_description() {
         augment_tool_spec_for_code_mode(ToolSpec::Freeform(FreeformTool {
             name: codex_code_mode::PUBLIC_TOOL_NAME.to_string(),
             description: "Run code".to_string(),
+            defer_loading: None,
             format: FreeformToolFormat {
                 r#type: "grammar".to_string(),
                 syntax: "lark".to_string(),
@@ -82,6 +99,7 @@ fn augment_tool_spec_for_code_mode_preserves_exec_tool_description() {
         ToolSpec::Freeform(FreeformTool {
             name: codex_code_mode::PUBLIC_TOOL_NAME.to_string(),
             description: "Run code".to_string(),
+            defer_loading: None,
             format: FreeformToolFormat {
                 r#type: "grammar".to_string(),
                 syntax: "lark".to_string(),
@@ -96,6 +114,7 @@ fn tool_spec_to_code_mode_tool_definition_returns_augmented_nested_tools() {
     let spec = ToolSpec::Freeform(FreeformTool {
         name: "apply_patch".to_string(),
         description: "Apply a patch".to_string(),
+        defer_loading: None,
         format: FreeformToolFormat {
             r#type: "grammar".to_string(),
             syntax: "lark".to_string(),
@@ -123,6 +142,42 @@ declare const tools: { apply_patch(input: string): Promise<unknown>; };
 }
 
 #[test]
+fn tool_spec_to_code_mode_tool_definition_supports_namespaced_custom_tools() {
+    let spec = ToolSpec::Namespace(ResponsesApiNamespace {
+        name: "editor".to_string(),
+        description: "Editing tools".to_string(),
+        tools: vec![ResponsesApiNamespaceTool::Custom(FreeformTool {
+            name: "apply_patch".to_string(),
+            description: "Apply a patch".to_string(),
+            defer_loading: None,
+            format: FreeformToolFormat {
+                r#type: "grammar".to_string(),
+                syntax: "lark".to_string(),
+                definition: "start: \"patch\"".to_string(),
+            },
+        })],
+    });
+
+    assert_eq!(
+        tool_spec_to_code_mode_tool_definition(&spec),
+        Some(codex_code_mode::ToolDefinition {
+            name: "editor__apply_patch".to_string(),
+            tool_name: ToolName::namespaced("editor", "apply_patch"),
+            description: r#"Apply a patch
+
+exec tool declaration:
+```ts
+declare const tools: { editor__apply_patch(input: string): Promise<unknown>; };
+```"#
+                .to_string(),
+            kind: codex_code_mode::CodeModeToolKind::Freeform,
+            input_schema: None,
+            output_schema: None,
+        })
+    );
+}
+
+#[test]
 fn tool_spec_to_code_mode_tool_definition_skips_unsupported_variants() {
     assert_eq!(
         tool_spec_to_code_mode_tool_definition(&ToolSpec::ToolSearch {
@@ -135,93 +190,5 @@ fn tool_spec_to_code_mode_tool_definition_skips_unsupported_variants() {
             ),
         }),
         None
-    );
-}
-
-#[test]
-fn create_wait_tool_matches_expected_spec() {
-    assert_eq!(
-        create_wait_tool(),
-        ToolSpec::Function(ResponsesApiTool {
-            name: codex_code_mode::WAIT_TOOL_NAME.to_string(),
-            description: format!(
-                "Waits on a yielded `{}` cell and returns new output or completion.\n{}",
-                codex_code_mode::PUBLIC_TOOL_NAME,
-                codex_code_mode::build_wait_tool_description().trim()
-            ),
-            strict: false,
-            defer_loading: None,
-            parameters: JsonSchema::object(BTreeMap::from([
-                    (
-                        "cell_id".to_string(),
-                        JsonSchema::string(Some("Identifier of the running exec cell.".to_string()),),
-                    ),
-                    (
-                        "max_tokens".to_string(),
-                        JsonSchema::number(Some(
-                                "Maximum number of output tokens to return for this wait call."
-                                    .to_string(),
-                            ),),
-                    ),
-                    (
-                        "terminate".to_string(),
-                        JsonSchema::boolean(Some(
-                                "Whether to terminate the running exec cell.".to_string(),
-                            ),),
-                    ),
-                    (
-                        "yield_time_ms".to_string(),
-                        JsonSchema::number(Some(
-                                "How long to wait (in milliseconds) for more output before yielding again."
-                                    .to_string(),
-                            ),),
-                    ),
-                ]), Some(vec!["cell_id".to_string()]), Some(false.into())),
-            output_schema: None,
-        })
-    );
-}
-
-#[test]
-fn create_code_mode_tool_matches_expected_spec() {
-    let enabled_tools = vec![codex_code_mode::ToolDefinition {
-        name: "update_plan".to_string(),
-        tool_name: ToolName::plain("update_plan"),
-        description: "Update the plan".to_string(),
-        kind: codex_code_mode::CodeModeToolKind::Function,
-        input_schema: None,
-        output_schema: None,
-    }];
-
-    assert_eq!(
-        create_code_mode_tool(
-            &enabled_tools,
-            &BTreeMap::new(),
-            /*code_mode_only*/ true,
-            /*deferred_tools_available*/ false,
-        ),
-        ToolSpec::Freeform(FreeformTool {
-            name: codex_code_mode::PUBLIC_TOOL_NAME.to_string(),
-            description: codex_code_mode::build_exec_tool_description(
-                &enabled_tools,
-                &BTreeMap::new(),
-                /*code_mode_only*/ true,
-                /*deferred_tools_available*/ false
-            ),
-            format: FreeformToolFormat {
-                r#type: "grammar".to_string(),
-                syntax: "lark".to_string(),
-                definition: r#"
-start: pragma_source | plain_source
-pragma_source: PRAGMA_LINE NEWLINE SOURCE
-plain_source: SOURCE
-
-PRAGMA_LINE: /[ \t]*\/\/ @exec:[^\r\n]*/
-NEWLINE: /\r?\n/
-SOURCE: /[\s\S]+/
-"#
-                .to_string(),
-            },
-        })
     );
 }

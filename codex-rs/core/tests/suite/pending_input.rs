@@ -1,13 +1,28 @@
+use core_test_support::test_codex::local_selections;
 use std::sync::Arc;
 
 use codex_core::CodexThread;
+use codex_core::StartIfIdleSubmission;
+use codex_core::TurnInput;
+use codex_core::TurnInputRequest;
+use codex_core::TurnInputSubmission;
+use codex_core::config::CurrentTimeReminderConfig;
+use codex_extension_items::ExtensionItem;
+use codex_extension_items::sleep::SleepItem;
+use codex_features::Feature;
+use codex_history::RolloutItem;
+use codex_history::RolloutLine;
 use codex_protocol::AgentPath;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::Settings;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use core_test_support::context_snapshot;
 use core_test_support::context_snapshot::ContextSnapshotOptions;
@@ -15,6 +30,7 @@ use core_test_support::responses;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_completed_with_tokens;
 use core_test_support::responses::ev_function_call;
+use core_test_support::responses::ev_function_call_with_namespace;
 use core_test_support::responses::ev_message_item_added;
 use core_test_support::responses::ev_output_text_delta;
 use core_test_support::responses::ev_reasoning_item;
@@ -32,6 +48,146 @@ use serde_json::Value;
 use serde_json::from_slice;
 use serde_json::json;
 use tokio::sync::oneshot;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_user_input_reaches_the_first_model_request() -> anyhow::Result<()> {
+    assert_idle_user_input_reaches_the_first_model_request(ModeKind::Default).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_user_input_reaches_the_first_model_request_in_plan_mode() -> anyhow::Result<()> {
+    assert_idle_user_input_reaches_the_first_model_request(ModeKind::Plan).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_response_items_include_pending_mailbox_in_first_request() -> anyhow::Result<()> {
+    let server = responses::start_mock_server().await;
+    let response = responses::mount_sse_once(
+        &server,
+        responses::sse(vec![
+            ev_response_created("idle-response-items"),
+            ev_completed("idle-response-items"),
+        ]),
+    )
+    .await;
+    let test = test_codex().build_with_auto_env(&server).await?;
+
+    submit_queue_only_agent_mail(test.codex.as_ref(), "pending mailbox input").await;
+    let submission = test
+        .codex
+        .start_turn_if_idle(TurnInputRequest::new(TurnInput::ResponseItem(
+            responses::user_message_item("automatic response item"),
+        )))
+        .await?;
+    assert!(matches!(submission, StartIfIdleSubmission::Started { .. }));
+    wait_for_turn_complete(test.codex.as_ref()).await;
+
+    let request = response.single_request();
+    let request_body = request.body_json();
+    responses::assert_root_turn(&request_body, /*expected*/ None)?;
+    responses::assert_parent_turn(&request_body, /*expected*/ None)?;
+    let user_messages = request.message_input_texts("user");
+    assert!(
+        user_messages
+            .iter()
+            .any(|message| message == "automatic response item")
+    );
+    assert!(
+        request
+            .inputs_of_type("agent_message")
+            .iter()
+            .any(|message| {
+                message["author"] == "/root/worker"
+                    && message["recipient"] == "/root"
+                    && message["content"].as_array().is_some_and(|content| {
+                        content.iter().any(|item| {
+                            item["type"] == "input_text" && item["text"] == "pending mailbox input"
+                        })
+                    })
+            })
+    );
+
+    Ok(())
+}
+
+async fn assert_idle_user_input_reaches_the_first_model_request(
+    mode: ModeKind,
+) -> anyhow::Result<()> {
+    let server = responses::start_mock_server().await;
+    let response = responses::mount_sse_once(
+        &server,
+        responses::sse(vec![
+            ev_response_created("idle-user-input"),
+            ev_completed("idle-user-input"),
+        ]),
+    )
+    .await;
+    let test = test_codex().build_with_auto_env(&server).await?;
+
+    if mode == ModeKind::Plan {
+        core_test_support::submit_thread_settings(
+            test.codex.as_ref(),
+            ThreadSettingsOverrides {
+                collaboration_mode: Some(CollaborationMode {
+                    mode,
+                    settings: Settings {
+                        model: test.session_configured.model.clone(),
+                        reasoning_effort: None,
+                        developer_instructions: None,
+                    },
+                }),
+                ..Default::default()
+            },
+        )
+        .await?;
+    }
+
+    let expected_input = vec![UserInput::Text {
+        text: "queued user input reaches the first request".to_string(),
+        text_elements: Vec::new(),
+    }];
+    let submission = test
+        .codex
+        .start_turn_if_idle(TurnInputRequest::new(TurnInput::UserInput {
+            content: expected_input.clone(),
+            client_id: Some("queued-user-message".to_string()),
+        }))
+        .await?;
+    assert!(matches!(submission, StartIfIdleSubmission::Started { .. }));
+
+    let user_message = core_test_support::wait_for_event_match(test.codex.as_ref(), |event| {
+        let EventMsg::ItemCompleted(event) = event else {
+            return None;
+        };
+        let TurnItem::UserMessage(item) = &event.item else {
+            return None;
+        };
+        Some(item.clone())
+    })
+    .await;
+    assert_eq!(
+        Some("queued-user-message".to_string()),
+        user_message.client_id
+    );
+    assert_eq!(expected_input, user_message.content);
+    wait_for_turn_complete(test.codex.as_ref()).await;
+
+    let request = response.single_request();
+    let request_body = request.body_json();
+    let turn_id = request_body["client_metadata"]["turn_id"]
+        .as_str()
+        .expect("idle user turn id");
+    responses::assert_root_turn(&request_body, Some(turn_id))?;
+    assert!(
+        request
+            .message_input_texts("user")
+            .iter()
+            .any(|text| text == "queued user input reaches the first request"),
+        "the first Responses request should contain the queued user message"
+    );
+
+    Ok(())
+}
 
 fn ev_message_item_done(id: &str, text: &str) -> Value {
     serde_json::json!({
@@ -63,6 +219,34 @@ fn message_input_texts(body: &Value, role: &str) -> Vec<String> {
         .collect()
 }
 
+fn function_call_output_text<'a>(body: &'a Value, call_id: &str) -> Option<&'a str> {
+    body.get("input")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|item| {
+            item.get("type").and_then(Value::as_str) == Some("function_call_output")
+                && item.get("call_id").and_then(Value::as_str) == Some(call_id)
+        })?
+        .get("output")?
+        .as_str()
+}
+
+fn assert_interrupted_sleep_output(output: Option<&str>) {
+    let Some(output) = output else {
+        panic!("sleep output missing");
+    };
+    let Some(wall_time) = output
+        .strip_prefix("Wall time: ")
+        .and_then(|output| output.strip_suffix(" seconds\nSleep interrupted by new input."))
+    else {
+        panic!("sleep output should include wall time");
+    };
+    assert!(
+        wall_time.parse::<f64>().is_ok(),
+        "sleep wall time should be a number"
+    );
+}
+
 fn chunk(event: Value) -> StreamingSseChunk {
     StreamingSseChunk {
         gate: None,
@@ -89,72 +273,65 @@ async fn build_codex(server: &StreamingSseServer) -> Arc<CodexThread> {
         .with_model("gpt-5.4")
         .build_with_streaming_server(server)
         .await
-        .unwrap_or_else(|err| panic!("build streaming Codex test session: {err}"))
+        .expect("build streaming Codex test session")
         .codex
 }
 
 async fn submit_user_input(codex: &CodexThread, text: &str) {
     codex
-        .submit(Op::UserInput {
-            environments: None,
-            items: vec![UserInput::Text {
-                text: text.to_string(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: text.to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await
-        .unwrap_or_else(|err| panic!("submit user input: {err}"));
+        .expect("submit user input");
 }
 
 async fn submit_danger_full_access_user_turn(test: &TestCodex, text: &str) {
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(PermissionProfile::Disabled, test.config.cwd.as_path());
     test.codex
-        .submit(Op::UserTurn {
-            environments: None,
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: text.to_string(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            cwd: test.config.cwd.to_path_buf(),
-            approval_policy: AskForApproval::Never,
-            approvals_reviewer: None,
-            sandbox_policy,
-            permission_profile,
-            model: test.session_configured.model.clone(),
-            effort: None,
-            summary: None,
-            service_tier: None,
-            collaboration_mode: None,
-            personality: None,
-        })
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
+                environments: Some(local_selections(test.config.cwd.clone())),
+                approval_policy: Some(AskForApproval::Never),
+                sandbox_policy: Some(sandbox_policy),
+                permission_profile,
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
+                        model: test.session_configured.model.clone(),
+                        reasoning_effort: None,
+                        developer_instructions: None,
+                    },
+                }),
+                ..Default::default()
+            }),
+        )
         .await
-        .unwrap_or_else(|err| panic!("submit user turn: {err}"));
+        .expect("submit user turn");
 }
 
 async fn steer_user_input(codex: &CodexThread, text: &str) {
-    codex
-        .steer_input(
-            vec![UserInput::Text {
-                text: text.to_string(),
-                text_elements: Vec::new(),
-            }],
-            /*expected_turn_id*/ None,
-            /*responsesapi_client_metadata*/ None,
-        )
+    let submission = codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: text.to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await
-        .unwrap_or_else(|err| panic!("steer user input: {err:?}"));
+        .expect("steer user input");
+    assert!(matches!(submission, TurnInputSubmission::Steered { .. }));
 }
 
-async fn submit_queue_only_agent_mail(codex: &CodexThread, text: &str) {
+async fn enqueue_queue_only_agent_mail(codex: &CodexThread, text: &str) {
     codex
         .submit(Op::InterAgentCommunication {
             communication: InterAgentCommunication::new(
-                AgentPath::try_from("/root/worker")
-                    .unwrap_or_else(|err| panic!("worker path should parse: {err}")),
+                AgentPath::try_from("/root/worker").expect("worker path should parse"),
                 AgentPath::root(),
                 Vec::new(),
                 text.to_string(),
@@ -162,13 +339,17 @@ async fn submit_queue_only_agent_mail(codex: &CodexThread, text: &str) {
             ),
         })
         .await
-        .unwrap_or_else(|err| panic!("submit queue-only agent mail: {err}"));
+        .expect("submit queue-only agent mail");
+}
+
+async fn submit_queue_only_agent_mail(codex: &CodexThread, text: &str) {
+    enqueue_queue_only_agent_mail(codex, text).await;
     codex
-        .submit(Op::ListMcpTools)
+        .submit(Op::RealtimeConversationListVoices)
         .await
-        .unwrap_or_else(|err| panic!("submit list-mcp-tools barrier: {err}"));
+        .expect("submit list-voices barrier");
     wait_for_event(codex, |event| {
-        matches!(event, EventMsg::McpListToolsResponse(_))
+        matches!(event, EventMsg::RealtimeConversationListVoicesResponse(_))
     })
     .await;
 }
@@ -197,20 +378,310 @@ async fn wait_for_turn_complete(codex: &CodexThread) {
     wait_for_event(codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
 }
 
+async fn wait_for_sleep_item_started(codex: &CodexThread, call_id: &str, duration_ms: u64) {
+    let event = wait_for_event(codex, |event| {
+        matches!(
+            event,
+            EventMsg::ItemStarted(started)
+                if matches!(
+                    &started.item,
+                    TurnItem::Extension(ExtensionItem::Sleep(item)) if item.id == call_id
+                )
+        )
+    })
+    .await;
+    let EventMsg::ItemStarted(started) = event else {
+        unreachable!("wait predicate only accepts item/started events");
+    };
+    let TurnItem::Extension(ExtensionItem::Sleep(item)) = started.item else {
+        unreachable!("wait predicate only accepts sleep items");
+    };
+    assert_eq!(
+        item,
+        SleepItem {
+            id: call_id.to_string(),
+            duration_ms,
+        }
+    );
+}
+
+async fn wait_for_sleep_item_completed(codex: &CodexThread, call_id: &str, duration_ms: u64) {
+    let event = wait_for_event(codex, |event| {
+        matches!(
+            event,
+            EventMsg::ItemCompleted(completed)
+                if matches!(
+                    &completed.item,
+                    TurnItem::Extension(ExtensionItem::Sleep(item)) if item.id == call_id
+                )
+        )
+    })
+    .await;
+    let EventMsg::ItemCompleted(completed) = event else {
+        unreachable!("wait predicate only accepts item/completed events");
+    };
+    let TurnItem::Extension(ExtensionItem::Sleep(item)) = completed.item else {
+        unreachable!("wait predicate only accepts sleep items");
+    };
+    assert_eq!(
+        item,
+        SleepItem {
+            id: call_id.to_string(),
+            duration_ms,
+        }
+    );
+}
+
+struct SleepingRootExtension;
+
+impl codex_extension_api::ThreadLifecycleContributor<codex_core::config::Config>
+    for SleepingRootExtension
+{
+    fn on_thread_start<'a>(
+        &'a self,
+        input: codex_extension_api::ThreadStartInput<'a, codex_core::config::Config>,
+    ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+        Box::pin(async move {
+            input.thread_store.insert(SleepItem {
+                id: "clock-wait-1".to_string(),
+                duration_ms: 60_000,
+            });
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queue_only_agent_mail_wakes_sleeping_root_and_persists_message() {
+    const CHILD_MESSAGE: &str = "worker completed";
+
+    let (server, _completions) =
+        start_streaming_sse_server(vec![response_completed_chunks("resp-1")]).await;
+    let mut extensions =
+        codex_extension_api::ExtensionRegistryBuilder::<codex_core::config::Config>::new();
+    extensions.thread_lifecycle_contributor(Arc::new(SleepingRootExtension));
+    let codex = test_codex()
+        .with_model("gpt-5.4")
+        .with_extensions(Arc::new(extensions.build()))
+        .build_with_streaming_server(&server)
+        .await
+        .expect("build Codex test session")
+        .codex;
+
+    enqueue_queue_only_agent_mail(&codex, CHILD_MESSAGE).await;
+    wait_for_turn_complete(&codex).await;
+
+    assert_eq!(server.requests().await.len(), 1);
+    let history = codex
+        .load_history(/*include_archived*/ true)
+        .await
+        .expect("load persisted thread history");
+    assert!(history.items.iter().any(|item| {
+        matches!(
+            item,
+            RolloutItem::ResponseItem(envelope)
+                if matches!(
+                    &envelope.item,
+                    codex_protocol::models::ResponseItem::AgentMessage { content, .. }
+                        if content.iter().any(|content| matches!(
+                            content,
+                            codex_protocol::models::AgentMessageInputContent::InputText { text }
+                                if text == CHILD_MESSAGE
+                        ))
+                )
+        )
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn steer_interrupts_wait_agent_and_is_sent_in_follow_up_request() {
+    const WAIT_CALL_ID: &str = "wait-call";
+    const INITIAL_PROMPT: &str = "wait for an agent";
+    const STEER_PROMPT: &str = "stop waiting and continue";
+    const MULTI_AGENT_V2_NAMESPACE: &str = "collaboration";
+
+    let first_chunks = vec![
+        chunk(ev_response_created("resp-1")),
+        chunk(ev_function_call_with_namespace(
+            WAIT_CALL_ID,
+            MULTI_AGENT_V2_NAMESPACE,
+            "wait_agent",
+            r#"{"timeout_ms":10000}"#,
+        )),
+        chunk(ev_completed("resp-1")),
+    ];
+    let (server, _completions) =
+        start_streaming_sse_server(vec![first_chunks, response_completed_chunks("resp-2")]).await;
+    let codex = test_codex()
+        .with_model("gpt-5.4")
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::MultiAgentV2)
+                .expect("test config should allow feature update");
+        })
+        .build_with_streaming_server(&server)
+        .await
+        .expect("build Codex test session")
+        .codex;
+
+    submit_user_input(&codex, INITIAL_PROMPT).await;
+    wait_for_event(&codex, |event| {
+        matches!(event, EventMsg::CollabWaitingBegin(_))
+    })
+    .await;
+
+    steer_user_input(&codex, STEER_PROMPT).await;
+    wait_for_turn_complete(&codex).await;
+
+    let requests = server.requests().await;
+    assert_eq!(requests.len(), 2);
+    let second: Value = from_slice(&requests[1]).expect("parse second request");
+    let relevant_user_input = message_input_texts(&second, "user")
+        .into_iter()
+        .filter(|text| text == INITIAL_PROMPT || text == STEER_PROMPT)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        relevant_user_input,
+        vec![INITIAL_PROMPT.to_string(), STEER_PROMPT.to_string()]
+    );
+    let wait_output = function_call_output_text(&second, WAIT_CALL_ID).expect("wait_agent output");
+    assert_eq!(
+        serde_json::from_str::<Value>(wait_output).expect("parse wait_agent output"),
+        json!({
+            "message": "Wait interrupted by new input.",
+            "timed_out": false,
+        })
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn any_new_input_interrupts_sleep() {
+    const FIRST_SLEEP_CALL_ID: &str = "sleep-call-1";
+    const SECOND_SLEEP_CALL_ID: &str = "sleep-call-2";
+    const SLEEP_DURATION_MS: u64 = 3_600_000;
+    const INITIAL_PROMPT: &str = "sleep for a while";
+    const STEER_PROMPT: &str = "stop sleeping and continue";
+    let sleep_arguments = json!({ "duration_ms": SLEEP_DURATION_MS }).to_string();
+
+    let first_chunks = vec![
+        chunk(ev_response_created("resp-1")),
+        chunk(ev_function_call_with_namespace(
+            FIRST_SLEEP_CALL_ID,
+            "clock",
+            "sleep",
+            &sleep_arguments,
+        )),
+        chunk(ev_completed("resp-1")),
+    ];
+    let second_chunks = vec![
+        chunk(ev_response_created("resp-2")),
+        chunk(ev_function_call_with_namespace(
+            SECOND_SLEEP_CALL_ID,
+            "clock",
+            "sleep",
+            &sleep_arguments,
+        )),
+        chunk(ev_completed("resp-2")),
+    ];
+    let (server, _completions) = start_streaming_sse_server(vec![
+        first_chunks,
+        second_chunks,
+        response_completed_chunks("resp-3"),
+    ])
+    .await;
+    let codex = test_codex()
+        .with_model("gpt-5.4")
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::CurrentTimeReminder)
+                .expect("test config should allow current-time reminders");
+            config.current_time_reminder = Some(CurrentTimeReminderConfig {
+                sleep_tool: true,
+                ..CurrentTimeReminderConfig::default()
+            });
+        })
+        .build_with_streaming_server(&server)
+        .await
+        .expect("build Codex test session")
+        .codex;
+
+    submit_user_input(&codex, INITIAL_PROMPT).await;
+    wait_for_sleep_item_started(&codex, FIRST_SLEEP_CALL_ID, SLEEP_DURATION_MS).await;
+
+    steer_user_input(&codex, STEER_PROMPT).await;
+    wait_for_sleep_item_completed(&codex, FIRST_SLEEP_CALL_ID, SLEEP_DURATION_MS).await;
+    wait_for_sleep_item_started(&codex, SECOND_SLEEP_CALL_ID, SLEEP_DURATION_MS).await;
+
+    submit_queue_only_agent_mail(&codex, "new mailbox input").await;
+    wait_for_sleep_item_completed(&codex, SECOND_SLEEP_CALL_ID, SLEEP_DURATION_MS).await;
+    wait_for_turn_complete(&codex).await;
+
+    let requests = server.requests().await;
+    assert_eq!(requests.len(), 3);
+    let second: Value = from_slice(&requests[1]).expect("parse second request");
+    let relevant_user_input = message_input_texts(&second, "user")
+        .into_iter()
+        .filter(|text| text == INITIAL_PROMPT || text == STEER_PROMPT)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        relevant_user_input,
+        vec![INITIAL_PROMPT.to_string(), STEER_PROMPT.to_string()]
+    );
+    assert_interrupted_sleep_output(function_call_output_text(&second, FIRST_SLEEP_CALL_ID));
+
+    let third: Value = from_slice(&requests[2]).expect("parse third request");
+    assert_interrupted_sleep_output(function_call_output_text(&third, SECOND_SLEEP_CALL_ID));
+
+    codex.submit(Op::Shutdown).await.expect("shutdown session");
+    wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
+
+    let rollout_path = codex.rollout_path().expect("rollout path");
+    let rollout = tokio::fs::read_to_string(rollout_path)
+        .await
+        .expect("read rollout");
+    let persisted_sleep_items = rollout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<RolloutLine>(line).ok())
+        .filter_map(|line| match line.item {
+            RolloutItem::EventMsg(EventMsg::ItemCompleted(event)) => match event.item {
+                TurnItem::Extension(ExtensionItem::Sleep(item)) => Some(item),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        persisted_sleep_items,
+        vec![
+            SleepItem {
+                id: FIRST_SLEEP_CALL_ID.to_string(),
+                duration_ms: SLEEP_DURATION_MS,
+            },
+            SleepItem {
+                id: SECOND_SLEEP_CALL_ID.to_string(),
+                duration_ms: SLEEP_DURATION_MS,
+            },
+        ]
+    );
+
+    server.shutdown().await;
+}
+
 fn assert_two_responses_input_snapshot(snapshot_name: &str, requests: &[Vec<u8>]) {
     assert_eq!(requests.len(), 2);
     let options = ContextSnapshotOptions::default().strip_capability_instructions();
-    let first: Value =
-        from_slice(&requests[0]).unwrap_or_else(|err| panic!("parse first request: {err}"));
-    let second: Value =
-        from_slice(&requests[1]).unwrap_or_else(|err| panic!("parse second request: {err}"));
+    let first: Value = from_slice(&requests[0]).expect("parse first request");
+    let second: Value = from_slice(&requests[1]).expect("parse second request");
     let first_items = first["input"]
         .as_array()
-        .unwrap_or_else(|| panic!("first request input"))
+        .expect("first request input")
         .clone();
     let second_items = second["input"]
         .as_array()
-        .unwrap_or_else(|| panic!("second request input"))
+        .expect("second request input")
         .clone();
     let snapshot = context_snapshot::format_labeled_items_snapshot(
         "/responses POST bodies (input only, redacted like other suite snapshots)",
@@ -277,15 +748,10 @@ async fn injected_user_input_triggers_follow_up_request_with_deltas() {
         .codex;
 
     codex
-        .submit(Op::UserInput {
-            environments: None,
-            items: vec![UserInput::Text {
-                text: "first prompt".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "first prompt".into(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .unwrap();
 
@@ -295,15 +761,10 @@ async fn injected_user_input_triggers_follow_up_request_with_deltas() {
     .await;
 
     codex
-        .submit(Op::UserInput {
-            environments: None,
-            items: vec![UserInput::Text {
-                text: "second prompt".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "second prompt".into(),
+            text_elements: Vec::new(),
+        }]))
         .await
         .unwrap();
 
@@ -438,6 +899,131 @@ async fn queued_inter_agent_mail_triggers_follow_up_after_commentary_message_ite
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_inter_agent_mail_does_not_restart_after_final_answer() {
+    let first_chunks = vec![
+        chunk(ev_response_created("resp-1")),
+        chunk(ev_message_item_added("msg-1", "")),
+        chunk(ev_output_text_delta("first answer")),
+        chunk(json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "role": "assistant",
+                "id": "msg-1",
+                "content": [{"type": "output_text", "text": "first answer"}],
+                "phase": "final_answer",
+            }
+        })),
+        chunk(ev_completed("resp-1")),
+    ];
+
+    let (server, _completions) = start_streaming_sse_server(vec![
+        first_chunks,
+        response_completed_chunks("unexpected-resp-2"),
+    ])
+    .await;
+    let codex = build_codex(&server).await;
+
+    submit_queue_only_agent_mail(&codex, "queued child update").await;
+    submit_user_input(&codex, "first prompt").await;
+    wait_for_turn_complete(&codex).await;
+
+    let mut requests = server.requests().await;
+    assert_eq!(requests.len(), 1);
+    let request: Value = from_slice(&requests[0]).expect("parse request");
+    assert!(
+        request["input"]
+            .as_array()
+            .expect("request input")
+            .iter()
+            .all(|item| item.get("type").and_then(Value::as_str) != Some("agent_message"))
+    );
+
+    submit_user_input(&codex, "second prompt").await;
+    wait_for_turn_complete(&codex).await;
+
+    requests = server.requests().await;
+    assert_eq!(requests.len(), 2);
+    let request: Value = from_slice(&requests[1]).expect("parse request");
+    let input = request["input"].as_array().expect("request input");
+    let agent_message = input
+        .iter()
+        .find(|item| item.get("type").and_then(Value::as_str) == Some("agent_message"))
+        .expect("queued child update should be included in the next turn");
+    assert_eq!(
+        agent_message["content"],
+        json!([{"type": "input_text", "text": "queued child update"}])
+    );
+    let user_input = message_input_texts(&request, "user")
+        .into_iter()
+        .filter(|text| text == "second prompt")
+        .collect::<Vec<_>>();
+    assert_eq!(user_input, vec!["second prompt"]);
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn injected_response_item_reopens_turn_after_final_answer() {
+    const INITIAL_PROMPT: &str = "first prompt";
+    const INJECTED_CONTEXT: &str = "late injected context";
+    let (gate_completed_tx, gate_completed_rx) = oneshot::channel();
+
+    let first_chunks = vec![
+        chunk(ev_response_created("resp-1")),
+        chunk(ev_message_item_added("msg-1", "")),
+        chunk(ev_output_text_delta("first answer")),
+        chunk(json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "role": "assistant",
+                "id": "msg-1",
+                "content": [{"type": "output_text", "text": "first answer"}],
+                "phase": "final_answer",
+            }
+        })),
+        // Keep the response open past an observable event so the answer boundary is established
+        // before the late context is injected.
+        chunk(ev_reasoning_item_added("reason-after-final", &["done"])),
+        gated_chunk(
+            gate_completed_rx,
+            vec![
+                ev_reasoning_item("reason-after-final", &["done"], &[]),
+                ev_completed("resp-1"),
+            ],
+        ),
+    ];
+    let (server, _completions) =
+        start_streaming_sse_server(vec![first_chunks, response_completed_chunks("resp-2")]).await;
+    let codex = build_codex(&server).await;
+
+    submit_user_input(&codex, INITIAL_PROMPT).await;
+    wait_for_reasoning_item_started(&codex).await;
+
+    assert!(
+        codex
+            .inject_if_running(vec![responses::user_message_item(INJECTED_CONTEXT)])
+            .await
+            .is_ok()
+    );
+    let _ = gate_completed_tx.send(());
+
+    wait_for_turn_complete(&codex).await;
+
+    let requests = server.requests().await;
+    assert_eq!(requests.len(), 2);
+    let second: Value = from_slice(&requests[1]).expect("parse second request");
+    let relevant_user_input = message_input_texts(&second, "user")
+        .into_iter()
+        .filter(|text| text == INITIAL_PROMPT || text == INJECTED_CONTEXT)
+        .collect::<Vec<_>>();
+    assert_eq!(relevant_user_input, vec![INITIAL_PROMPT, INJECTED_CONTEXT]);
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_input_does_not_preempt_after_reasoning_item() {
     let (gate_reasoning_done_tx, gate_reasoning_done_rx) = oneshot::channel();
 
@@ -546,7 +1132,7 @@ async fn steered_user_input_waits_for_model_continuation_after_mid_turn_compact(
         })
         .build_with_streaming_server(&server)
         .await
-        .unwrap_or_else(|err| panic!("build streaming Codex test session: {err}"))
+        .expect("build streaming Codex test session")
         .codex;
 
     submit_user_input(&codex, "first prompt").await;
@@ -558,10 +1144,8 @@ async fn steered_user_input_waits_for_model_continuation_after_mid_turn_compact(
     let requests = server.requests().await;
     assert_eq!(requests.len(), 4);
 
-    let post_compact_body: Value =
-        from_slice(&requests[2]).unwrap_or_else(|err| panic!("parse post-compact request: {err}"));
-    let steered_body: Value =
-        from_slice(&requests[3]).unwrap_or_else(|err| panic!("parse steered request: {err}"));
+    let post_compact_body: Value = from_slice(&requests[2]).expect("parse post-compact request");
+    let steered_body: Value = from_slice(&requests[3]).expect("parse steered request");
 
     let post_compact_user_texts = message_input_texts(&post_compact_body, "user");
     assert!(
@@ -633,7 +1217,7 @@ async fn steered_user_input_follows_compact_when_only_the_steer_needs_follow_up(
         })
         .build_with_streaming_server(&server)
         .await
-        .unwrap_or_else(|err| panic!("build streaming Codex test session: {err}"))
+        .expect("build streaming Codex test session")
         .codex;
 
     submit_user_input(&codex, "first prompt").await;
@@ -647,10 +1231,8 @@ async fn steered_user_input_follows_compact_when_only_the_steer_needs_follow_up(
     let requests = server.requests().await;
     assert_eq!(requests.len(), 3);
 
-    let compact_body: Value =
-        from_slice(&requests[1]).unwrap_or_else(|err| panic!("parse compact request: {err}"));
-    let steered_body: Value =
-        from_slice(&requests[2]).unwrap_or_else(|err| panic!("parse steered request: {err}"));
+    let compact_body: Value = from_slice(&requests[1]).expect("parse compact request");
+    let steered_body: Value = from_slice(&requests[2]).expect("parse steered request");
 
     let compact_user_texts = message_input_texts(&compact_body, "user");
     assert!(
@@ -752,7 +1334,7 @@ async fn steered_user_input_waits_when_tool_output_triggers_compact_before_next_
         })
         .build_with_streaming_server(&server)
         .await
-        .unwrap_or_else(|err| panic!("build streaming Codex test session: {err}"));
+        .expect("build streaming Codex test session");
     let codex = test.codex.clone();
 
     submit_danger_full_access_user_turn(&test, "first prompt").await;
@@ -765,12 +1347,9 @@ async fn steered_user_input_waits_when_tool_output_triggers_compact_before_next_
     let requests = server.requests().await;
     assert_eq!(requests.len(), 4);
 
-    let compact_body: Value =
-        from_slice(&requests[1]).unwrap_or_else(|err| panic!("parse compact request: {err}"));
-    let post_compact_body: Value =
-        from_slice(&requests[2]).unwrap_or_else(|err| panic!("parse post-compact request: {err}"));
-    let steered_body: Value =
-        from_slice(&requests[3]).unwrap_or_else(|err| panic!("parse steered request: {err}"));
+    let compact_body: Value = from_slice(&requests[1]).expect("parse compact request");
+    let post_compact_body: Value = from_slice(&requests[2]).expect("parse post-compact request");
+    let steered_body: Value = from_slice(&requests[3]).expect("parse steered request");
 
     let compact_user_texts = message_input_texts(&compact_body, "user");
     assert!(

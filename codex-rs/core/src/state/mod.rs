@@ -1,7 +1,13 @@
+mod additional_context;
+mod auto_compact_window;
 mod service;
 mod session;
 mod turn;
 
+pub(crate) use crate::tools::ExecutedToolCallRecorder;
+pub(crate) use additional_context::AdditionalContextStore;
+pub(crate) use auto_compact_window::AutoCompactWindowIds;
+pub(crate) use auto_compact_window::AutoCompactWindowSnapshot;
 pub(crate) use service::SessionServices;
 pub(crate) use session::SessionState;
 pub(crate) use turn::ActiveTurn;

@@ -20,6 +20,11 @@ It provides two lints:
 String and char literals are exempt because they are often already
 self-descriptive at the callsite.
 
+The sole non-self method argument is also exempt when the method name matches
+the resolved parameter name. For example, `.enabled(false)` is already
+self-descriptive when it resolves to `fn enabled(self, enabled: bool)`. An
+explicit argument comment is still checked for a mismatch.
+
 ## Behavior
 
 Given:
@@ -54,7 +59,7 @@ create_openai_url(None, 3);
 Install the required tooling once:
 
 ```bash
-cargo install cargo-dylint dylint-link
+cargo install --locked cargo-dylint dylint-link
 rustup toolchain install nightly-2025-09-18 \
   --component llvm-tools-preview \
   --component rustc-dev \

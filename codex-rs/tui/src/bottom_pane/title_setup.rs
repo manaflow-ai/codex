@@ -26,6 +26,7 @@ use crate::bottom_pane::multi_select_picker::MultiSelectItem;
 use crate::bottom_pane::multi_select_picker::MultiSelectPicker;
 use crate::bottom_pane::status_surface_preview::StatusSurfacePreviewData;
 use crate::bottom_pane::status_surface_preview::StatusSurfacePreviewItem;
+use crate::keymap::ListKeymap;
 use crate::render::renderable::Renderable;
 
 /// Available items that can be displayed in the terminal title.
@@ -59,9 +60,9 @@ pub(crate) enum TerminalTitleItem {
     /// Percentage of context window used.
     #[strum(to_string = "context-used", serialize = "context-usage")]
     ContextUsed,
-    /// Remaining usage on the 5-hour rate limit.
+    /// Remaining usage on the primary rate limit.
     FiveHourLimit,
-    /// Remaining usage on the weekly rate limit.
+    /// Remaining usage on the secondary rate limit.
     WeeklyLimit,
     /// Codex application version.
     CodexVersion,
@@ -71,7 +72,12 @@ pub(crate) enum TerminalTitleItem {
     TotalInputTokens,
     /// Total output tokens generated.
     TotalOutputTokens,
-    /// Full session UUID.
+    /// Estimated credits attributed directly to the current enterprise thread.
+    ThreadCredits,
+    /// Estimated dollar cost attributed directly to the current enterprise thread.
+    EstimatedThreadCost,
+    /// Full thread UUID.
+    #[strum(to_string = "thread-id", serialize = "session-id")]
     SessionId,
     /// Whether Fast mode is currently active.
     FastMode,
@@ -80,6 +86,8 @@ pub(crate) enum TerminalTitleItem {
     Model,
     /// Current model name with reasoning level.
     ModelWithReasoning,
+    /// Current reasoning level.
+    Reasoning,
     /// Latest checklist task progress from `update_plan` (if available).
     TaskProgress,
 }
@@ -96,7 +104,7 @@ impl TerminalTitleItem {
             TerminalTitleItem::Status => {
                 "Compact session run-state text (Ready, Working, Thinking)"
             }
-            TerminalTitleItem::Thread => "Current thread title (omitted when unavailable)",
+            TerminalTitleItem::Thread => "Current thread title, or thread identifier when unnamed",
             TerminalTitleItem::GitBranch => "Current Git branch (omitted when unavailable)",
             TerminalTitleItem::ContextRemaining => {
                 "Percentage of context window remaining (omitted when unknown)"
@@ -105,21 +113,28 @@ impl TerminalTitleItem {
                 "Percentage of context window used (omitted when unknown)"
             }
             TerminalTitleItem::FiveHourLimit => {
-                "Remaining usage on 5-hour usage limit (omitted when unavailable)"
+                "Remaining usage on the primary usage limit (omitted when unavailable)"
             }
             TerminalTitleItem::WeeklyLimit => {
-                "Remaining usage on weekly usage limit (omitted when unavailable)"
+                "Remaining usage on the secondary usage limit (omitted when unavailable)"
             }
             TerminalTitleItem::CodexVersion => "Codex application version",
             TerminalTitleItem::UsedTokens => "Total tokens used in session (omitted when zero)",
             TerminalTitleItem::TotalInputTokens => "Total input tokens used in session",
             TerminalTitleItem::TotalOutputTokens => "Total output tokens used in session",
+            TerminalTitleItem::ThreadCredits => {
+                "Estimated current-thread credits (Enterprise workspaces only; omitted when unavailable)"
+            }
+            TerminalTitleItem::EstimatedThreadCost => {
+                "Estimated current-thread cost (Enterprise workspaces only; omitted when unavailable)"
+            }
             TerminalTitleItem::SessionId => {
-                "Current session identifier (omitted until session starts)"
+                "Current thread identifier (omitted until thread starts)"
             }
             TerminalTitleItem::FastMode => "Whether Fast mode is currently active",
             TerminalTitleItem::Model => "Current model name",
             TerminalTitleItem::ModelWithReasoning => "Current model name with reasoning level",
+            TerminalTitleItem::Reasoning => "Current reasoning level",
             TerminalTitleItem::TaskProgress => {
                 "Latest task progress from update_plan (omitted until available)"
             }
@@ -145,12 +160,17 @@ impl TerminalTitleItem {
             TerminalTitleItem::TotalOutputTokens => {
                 Some(StatusSurfacePreviewItem::TotalOutputTokens)
             }
+            TerminalTitleItem::ThreadCredits => Some(StatusSurfacePreviewItem::ThreadCredits),
+            TerminalTitleItem::EstimatedThreadCost => {
+                Some(StatusSurfacePreviewItem::EstimatedThreadCost)
+            }
             TerminalTitleItem::SessionId => Some(StatusSurfacePreviewItem::SessionId),
             TerminalTitleItem::FastMode => Some(StatusSurfacePreviewItem::FastMode),
             TerminalTitleItem::Model => Some(StatusSurfacePreviewItem::Model),
             TerminalTitleItem::ModelWithReasoning => {
                 Some(StatusSurfacePreviewItem::ModelWithReasoning)
             }
+            TerminalTitleItem::Reasoning => Some(StatusSurfacePreviewItem::Reasoning),
             TerminalTitleItem::TaskProgress => Some(StatusSurfacePreviewItem::TaskProgress),
         }
     }
@@ -243,6 +263,7 @@ impl TerminalTitleSetupView {
         title_items: Option<&[String]>,
         preview_data: StatusSurfacePreviewData,
         app_event_tx: AppEventSender,
+        list_keymap: ListKeymap,
     ) -> Self {
         let selected_items = title_items
             .into_iter()
@@ -256,11 +277,13 @@ impl TerminalTitleSetupView {
             .collect::<std::collections::HashSet<_>>();
         let items = selected_items
             .into_iter()
-            .map(|item| Self::title_select_item(item, /*enabled*/ true))
+            .map(|item| Self::title_select_item(item, /*enabled*/ true, &preview_data))
             .chain(
                 TerminalTitleItem::iter()
                     .filter(|item| !selected_set.contains(item))
-                    .map(|item| Self::title_select_item(item, /*enabled*/ false)),
+                    .map(|item| {
+                        Self::title_select_item(item, /*enabled*/ false, &preview_data)
+                    }),
             )
             .collect();
 
@@ -270,10 +293,7 @@ impl TerminalTitleSetupView {
                 Some("Select which items to display in the terminal title.".to_string()),
                 app_event_tx,
             )
-            .instructions(vec![
-                "Use ↑↓ to navigate, ←→ to move, space to select, enter to confirm, esc to cancel."
-                    .into(),
-            ])
+            .list_keymap(list_keymap)
             .items(items)
             .enable_ordering()
             .on_preview(move |items| {
@@ -309,11 +329,28 @@ impl TerminalTitleSetupView {
         }
     }
 
-    fn title_select_item(item: TerminalTitleItem, enabled: bool) -> MultiSelectItem {
+    fn title_select_item(
+        item: TerminalTitleItem,
+        enabled: bool,
+        preview_data: &StatusSurfacePreviewData,
+    ) -> MultiSelectItem {
+        let default_name = item.to_string();
+        let default_description = item.description();
+        let (name, description) = match item.preview_item() {
+            Some(
+                preview_item @ (StatusSurfacePreviewItem::FiveHourLimit
+                | StatusSurfacePreviewItem::WeeklyLimit),
+            ) => (
+                preview_data.rate_limit_item_name(preview_item, &default_name),
+                preview_data.rate_limit_item_description(preview_item, default_description),
+            ),
+            _ => (default_name, default_description.to_string()),
+        };
+
         MultiSelectItem {
             id: item.to_string(),
-            name: item.to_string(),
-            description: Some(item.description().to_string()),
+            name,
+            description: Some(description),
             enabled,
             orderable: true,
             section_break_after: false,
@@ -322,6 +359,10 @@ impl TerminalTitleSetupView {
 }
 
 impl BottomPaneView for TerminalTitleSetupView {
+    fn keymap_contexts(&self) -> crate::keymap::KeymapContextSet {
+        crate::keymap::KeymapContextSet::new(crate::keymap::KeymapContext::List)
+    }
+
     fn handle_key_event(&mut self, key_event: crossterm::event::KeyEvent) {
         self.picker.handle_key_event(key_event);
     }
@@ -386,8 +427,12 @@ mod tests {
             "run-state".to_string(),
             "thread-title".to_string(),
         ];
-        let view =
-            TerminalTitleSetupView::new(Some(&selected), StatusSurfacePreviewData::default(), tx);
+        let view = TerminalTitleSetupView::new(
+            Some(&selected),
+            StatusSurfacePreviewData::default(),
+            tx,
+            crate::keymap::RuntimeKeymap::defaults().list,
+        );
         assert_snapshot!(
             "terminal_title_setup_basic",
             render_lines(&view, /*width*/ 84)
@@ -494,6 +539,26 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_is_selectable_id() {
+        assert_eq!(TerminalTitleItem::Reasoning.to_string(), "reasoning");
+        assert_eq!(
+            "reasoning".parse::<TerminalTitleItem>(),
+            Ok(TerminalTitleItem::Reasoning)
+        );
+    }
+
+    #[test]
+    fn thread_usage_items_are_independently_selectable() {
+        assert_eq!(
+            parse_terminal_title_items(["thread-credits", "estimated-thread-cost"].into_iter()),
+            Some(vec![
+                TerminalTitleItem::ThreadCredits,
+                TerminalTitleItem::EstimatedThreadCost,
+            ])
+        );
+    }
+
+    #[test]
     fn parse_terminal_title_items_accepts_kebab_case_variants() {
         let items = parse_terminal_title_items(
             [
@@ -507,11 +572,14 @@ mod tests {
                 "project-name",
                 "model",
                 "model-with-reasoning",
+                "reasoning",
                 "weekly-limit",
                 "codex-version",
                 "used-tokens",
                 "total-input-tokens",
                 "total-output-tokens",
+                "thread-credits",
+                "estimated-thread-cost",
                 "session-id",
                 "fast-mode",
             ]
@@ -530,11 +598,14 @@ mod tests {
                 TerminalTitleItem::Project,
                 TerminalTitleItem::Model,
                 TerminalTitleItem::ModelWithReasoning,
+                TerminalTitleItem::Reasoning,
                 TerminalTitleItem::WeeklyLimit,
                 TerminalTitleItem::CodexVersion,
                 TerminalTitleItem::UsedTokens,
                 TerminalTitleItem::TotalInputTokens,
                 TerminalTitleItem::TotalOutputTokens,
+                TerminalTitleItem::ThreadCredits,
+                TerminalTitleItem::EstimatedThreadCost,
                 TerminalTitleItem::SessionId,
                 TerminalTitleItem::FastMode,
             ])

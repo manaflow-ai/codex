@@ -1,13 +1,19 @@
+use std::sync::Arc;
+
 use codex_core::ForkSnapshot;
 use codex_core::NewThread;
+use codex_core::ThreadConfigSnapshot;
+use codex_core::TurnInputRequest;
 use codex_core::parse_turn_item;
+use codex_history::InitialHistory;
+use codex_history::ResumedHistory;
+use codex_history::RolloutItem;
+use codex_history::RolloutLine;
 use codex_protocol::items::TurnItem;
+use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::InitialHistory;
-use codex_protocol::protocol::Op;
-use codex_protocol::protocol::ResumedHistory;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
+use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::protocol::ThreadSettingsAppliedEvent;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
@@ -49,15 +55,10 @@ async fn fork_thread_twice_drops_to_first_message() {
     // Send three user messages; wait for three completed turns.
     for text in ["first", "second", "third"] {
         codex
-            .submit(Op::UserInput {
-                environments: None,
-                items: vec![UserInput::Text {
-                    text: text.to_string(),
-                    text_elements: Vec::new(),
-                }],
-                final_output_json_schema: None,
-                responsesapi_client_metadata: None,
-            })
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: text.to_string(),
+                text_elements: Vec::new(),
+            }]))
             .await
             .unwrap();
         let _ = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -88,7 +89,7 @@ async fn fork_thread_twice_drops_to_first_message() {
 
     // After cutting at nth user input (n=1 → second user message), cut strictly before that input.
     let cut1 = user_inputs.get(1).copied().unwrap_or(0);
-    let expected_after_first: Vec<RolloutItem> = base_items[..cut1].to_vec();
+    let mut expected_after_first: Vec<RolloutItem> = base_items[..cut1].to_vec();
 
     // After dropping again (n=1 on fork1), compute expected relative to fork1's rollout.
 
@@ -101,13 +102,16 @@ async fn fork_thread_twice_drops_to_first_message() {
             ForkSnapshot::TruncateBeforeNthUserMessage(1),
             config_for_fork.clone(),
             base_path.clone(),
-            /*persist_extended_history*/ false,
+            /*thread_source*/ None,
             /*parent_trace*/ None,
         )
         .await
         .expect("fork 1");
 
     let fork1_path = codex_fork1.rollout_path().expect("rollout path");
+    expected_after_first.push(thread_settings_applied_item(
+        codex_fork1.config_snapshot().await,
+    ));
 
     // GetHistory on fork1 flushed; the file is ready.
     let fork1_items = read_rollout_items(&fork1_path);
@@ -125,7 +129,7 @@ async fn fork_thread_twice_drops_to_first_message() {
             ForkSnapshot::TruncateBeforeNthUserMessage(0),
             config_for_fork.clone(),
             fork1_path.clone(),
-            /*persist_extended_history*/ false,
+            /*thread_source*/ None,
             /*parent_trace*/ None,
         )
         .await
@@ -139,7 +143,10 @@ async fn fork_thread_twice_drops_to_first_message() {
         .get(fork1_user_inputs.len().saturating_sub(1))
         .copied()
         .unwrap_or(0);
-    let expected_after_second: Vec<RolloutItem> = fork1_items[..cut_last_on_fork1].to_vec();
+    let mut expected_after_second: Vec<RolloutItem> = fork1_items[..cut_last_on_fork1].to_vec();
+    expected_after_second.push(thread_settings_applied_item(
+        codex_fork2.config_snapshot().await,
+    ));
     let fork2_items = read_rollout_items(&fork2_path);
     pretty_assertions::assert_eq!(
         serde_json::to_value(&fork2_items).unwrap(),
@@ -147,8 +154,25 @@ async fn fork_thread_twice_drops_to_first_message() {
     );
 }
 
+fn thread_settings_applied_item(snapshot: ThreadConfigSnapshot) -> RolloutItem {
+    RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(
+        ThreadSettingsAppliedEvent {
+            thread_settings: snapshot.into_thread_settings_snapshot(),
+        },
+    ))
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fork_thread_from_history_does_not_require_source_rollout_path() {
+    assert_copied_fork_persists_inherited_history(ThreadHistoryMode::Legacy).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn copied_paginated_fork_persists_inherited_history() {
+    assert_copied_fork_persists_inherited_history(ThreadHistoryMode::Paginated).await;
+}
+
+async fn assert_copied_fork_persists_inherited_history(history_mode: ThreadHistoryMode) {
     skip_if_no_network!();
 
     let server = MockServer::start().await;
@@ -160,31 +184,35 @@ async fn fork_thread_from_history_does_not_require_source_rollout_path() {
                 .insert_header("content-type", "text/event-stream")
                 .set_body_raw(sse, "text/event-stream"),
         )
-        .expect(1)
+        .expect(if matches!(history_mode, ThreadHistoryMode::Paginated) {
+            2
+        } else {
+            1
+        })
         .mount(&server)
         .await;
 
-    let mut builder = test_codex();
+    let mut builder = test_codex().with_history_mode(history_mode);
     let test = builder.build(&server).await.expect("create conversation");
     let codex = test.codex.clone();
     let thread_manager = test.thread_manager.clone();
 
     codex
-        .submit(Op::UserInput {
-            environments: None,
-            items: vec![UserInput::Text {
-                text: "fork me from stored history".to_string(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "fork me from stored history".to_string(),
+            text_elements: Vec::new(),
+        }]))
         .await
-        .unwrap();
+        .expect("submit initial user turn");
     let _ = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let source_path = codex.rollout_path().expect("source rollout path");
     let source_items = read_rollout_items(&source_path);
+    let source_meta = codex_rollout::read_session_meta_line(source_path.as_path())
+        .await
+        .expect("read source session metadata");
+    let mut supplied_history = vec![RolloutItem::SessionMeta(source_meta)];
+    supplied_history.extend(source_items.iter().cloned());
     let NewThread {
         thread: forked_thread,
         ..
@@ -193,12 +221,13 @@ async fn fork_thread_from_history_does_not_require_source_rollout_path() {
             ForkSnapshot::Interrupted,
             test.config.clone(),
             InitialHistory::Resumed(ResumedHistory {
-                conversation_id: test.session_configured.session_id,
-                history: source_items.clone(),
+                conversation_id: test.session_configured.thread_id,
+                history: Arc::new(supplied_history),
                 rollout_path: None,
             }),
-            /*persist_extended_history*/ false,
+            /*thread_source*/ None,
             /*parent_trace*/ None,
+            ClientMcpExtensions::default(),
         )
         .await
         .expect("fork from stored history");
@@ -207,36 +236,72 @@ async fn fork_thread_from_history_does_not_require_source_rollout_path() {
     let forked_items = read_rollout_items(&forked_path);
     let forked_items = forked_items
         .iter()
-        .map(|item| serde_json::to_value(item).unwrap())
+        .map(|item| serde_json::to_value(item).expect("serialize forked rollout item"))
         .collect::<Vec<_>>();
     let source_items = source_items
         .iter()
-        .map(|item| serde_json::to_value(item).unwrap())
+        .map(|item| serde_json::to_value(item).expect("serialize source rollout item"))
         .collect::<Vec<_>>();
     assert!(
         forked_items.starts_with(&source_items),
         "forked history should start with the supplied source history"
     );
+
+    if matches!(history_mode, ThreadHistoryMode::Paginated) {
+        forked_thread
+            .shutdown_and_wait()
+            .await
+            .expect("shutdown copied paginated fork");
+        let resumed_history = codex_rollout::RolloutRecorder::get_rollout_history(&forked_path)
+            .await
+            .expect("load copied paginated fork history");
+        let resumed = thread_manager
+            .resume_thread_with_history(
+                test.config.clone(),
+                resumed_history,
+                codex_core::test_support::auth_manager_from_auth(
+                    codex_login::CodexAuth::from_api_key("dummy"),
+                ),
+                /*parent_trace*/ None,
+                ClientMcpExtensions::default(),
+            )
+            .await
+            .expect("resume copied paginated fork")
+            .thread;
+        resumed
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: "continue after cold resume".to_string(),
+                text_elements: Vec::new(),
+            }]))
+            .await
+            .expect("start resumed turn");
+        wait_for_event(&resumed, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+        let requests = server.received_requests().await.expect("response requests");
+        let input = serde_json::to_string(
+            &requests
+                .last()
+                .expect("resumed model request")
+                .body_json::<serde_json::Value>()
+                .expect("response request body")["input"],
+        )
+        .expect("serialize model input");
+        assert!(input.contains("fork me from stored history"));
+        assert!(input.contains("continue after cold resume"));
+    }
 }
 
 fn read_rollout_items(path: &std::path::Path) -> Vec<RolloutItem> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(err) => panic!("failed to read rollout file {}: {err}", path.display()),
-    };
+    let read_message = format!("failed to read rollout file {}", path.display());
+    let text = std::fs::read_to_string(path).expect(&read_message);
     let mut items: Vec<RolloutItem> = Vec::new();
     for line in text.lines() {
         if line.trim().is_empty() {
             continue;
         }
-        let v: serde_json::Value = match serde_json::from_str(line) {
-            Ok(value) => value,
-            Err(err) => panic!("failed to parse rollout JSON line `{line}`: {err}"),
-        };
-        let rl: RolloutLine = match serde_json::from_value(v) {
-            Ok(line) => line,
-            Err(err) => panic!("failed to parse rollout line `{line}`: {err}"),
-        };
+        let parse_json_message = format!("failed to parse rollout JSON line `{line}`");
+        let v: serde_json::Value = serde_json::from_str(line).expect(&parse_json_message);
+        let parse_line_message = format!("failed to parse rollout line `{line}`");
+        let rl: RolloutLine = serde_json::from_value(v).expect(&parse_line_message);
         match rl.item {
             RolloutItem::SessionMeta(_) => {}
             other => items.push(other),

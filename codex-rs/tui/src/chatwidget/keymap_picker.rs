@@ -16,6 +16,7 @@ use codex_terminal_detection::terminal_info;
 
 use super::ChatWidget;
 use super::queued_message_edit_hint_binding;
+use crate::app_event::KeymapCaptureMode;
 use crate::app_event::KeymapEditIntent;
 use crate::keymap::RuntimeKeymap;
 use crate::keymap_setup;
@@ -30,9 +31,10 @@ impl ChatWidget {
     pub(crate) fn open_keymap_picker(&mut self) {
         match RuntimeKeymap::from_config(&self.config.tui_keymap) {
             Ok(runtime_keymap) => {
-                let params = keymap_setup::build_keymap_picker_params(
+                let params = keymap_setup::build_keymap_picker_params_with_filter(
                     &runtime_keymap,
                     &self.config.tui_keymap,
+                    self.keymap_action_filter(),
                 );
                 self.bottom_pane.show_selection_view(params);
             }
@@ -72,15 +74,24 @@ impl ChatWidget {
         context: String,
         action: String,
         intent: KeymapEditIntent,
+        capture_mode: KeymapCaptureMode,
         runtime_keymap: &RuntimeKeymap,
     ) {
         let view = keymap_setup::build_keymap_capture_view(
             context,
             action,
             intent,
+            capture_mode,
             runtime_keymap,
             self.app_event_tx.clone(),
         );
+        self.bottom_pane.show_view(Box::new(view));
+        self.request_redraw();
+    }
+
+    /// Opens the keypress inspector with the current runtime bindings.
+    pub(crate) fn open_keymap_debug(&mut self, runtime_keymap: &RuntimeKeymap) {
+        let view = keymap_setup::build_keymap_debug_view(runtime_keymap, &self.config.tui_keymap);
         self.bottom_pane.show_view(Box::new(view));
         self.request_redraw();
     }
@@ -113,9 +124,10 @@ impl ChatWidget {
         action: &str,
         runtime_keymap: &RuntimeKeymap,
     ) {
-        let params = keymap_setup::build_keymap_picker_params_for_selected_action(
+        let params = keymap_setup::build_keymap_picker_params_for_selected_action_with_filter(
             runtime_keymap,
             &self.config.tui_keymap,
+            self.keymap_action_filter(),
             context,
             action,
         );
@@ -128,15 +140,22 @@ impl ChatWidget {
             params,
         );
         if !replaced {
-            let params = keymap_setup::build_keymap_picker_params_for_selected_action(
+            let params = keymap_setup::build_keymap_picker_params_for_selected_action_with_filter(
                 runtime_keymap,
                 &self.config.tui_keymap,
+                self.keymap_action_filter(),
                 context,
                 action,
             );
             self.bottom_pane.show_selection_view(params);
         }
         self.request_redraw();
+    }
+
+    fn keymap_action_filter(&self) -> keymap_setup::KeymapActionFilter {
+        keymap_setup::KeymapActionFilter {
+            fast_mode_enabled: self.fast_mode_enabled(),
+        }
     }
 
     /// Applies a committed keymap edit to the live chat widget.
@@ -153,10 +172,8 @@ impl ChatWidget {
         self.config.tui_keymap = keymap_config;
         self.copy_last_response_binding = runtime_keymap.app.copy.clone();
         self.chat_keymap = runtime_keymap.chat.clone();
-        self.queued_message_edit_hint_binding = queued_message_edit_hint_binding(
-            &self.chat_keymap.edit_queued_message,
-            terminal_info(),
-        );
+        self.queued_message_edit_hint_binding =
+            queued_message_edit_hint_binding(runtime_keymap, terminal_info());
         self.bottom_pane
             .set_queued_message_edit_binding(self.queued_message_edit_hint_binding);
         self.bottom_pane.set_keymap_bindings(runtime_keymap);

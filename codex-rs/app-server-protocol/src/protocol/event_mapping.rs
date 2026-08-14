@@ -59,6 +59,9 @@ pub fn item_event_to_server_notification(
                             CoreDynamicToolCallOutputContentItem::InputImage { image_url } => {
                                 DynamicToolCallOutputContentItem::InputImage { image_url }
                             }
+                            CoreDynamicToolCallOutputContentItem::InputAudio { audio_url } => {
+                                DynamicToolCallOutputContentItem::InputAudio { audio_url }
+                            }
                         })
                         .collect(),
                 ),
@@ -69,6 +72,7 @@ pub fn item_event_to_server_notification(
                 thread_id,
                 turn_id: response.turn_id,
                 item,
+                completed_at_ms: response.completed_at_ms,
             })
         }
         EventMsg::CollabAgentSpawnBegin(begin_event) => {
@@ -87,6 +91,7 @@ pub fn item_event_to_server_notification(
                 thread_id,
                 turn_id,
                 item,
+                started_at_ms: begin_event.started_at_ms,
             })
         }
         EventMsg::CollabAgentSpawnEnd(end_event) => {
@@ -125,6 +130,7 @@ pub fn item_event_to_server_notification(
                 thread_id,
                 turn_id,
                 item,
+                completed_at_ms: end_event.completed_at_ms,
             })
         }
         EventMsg::CollabAgentInteractionBegin(begin_event) => {
@@ -144,6 +150,7 @@ pub fn item_event_to_server_notification(
                 thread_id,
                 turn_id,
                 item,
+                started_at_ms: begin_event.started_at_ms,
             })
         }
         EventMsg::CollabAgentInteractionEnd(end_event) => {
@@ -171,6 +178,21 @@ pub fn item_event_to_server_notification(
                 thread_id,
                 turn_id,
                 item,
+                completed_at_ms: end_event.completed_at_ms,
+            })
+        }
+        EventMsg::SubAgentActivity(activity) => {
+            let item = ThreadItem::SubAgentActivity {
+                id: activity.event_id,
+                kind: activity.kind.into(),
+                agent_thread_id: activity.agent_thread_id.to_string(),
+                agent_path: String::from(activity.agent_path),
+            };
+            ServerNotification::ItemCompleted(ItemCompletedNotification {
+                thread_id,
+                turn_id,
+                item,
+                completed_at_ms: activity.occurred_at_ms,
             })
         }
         EventMsg::CollabWaitingBegin(begin_event) => {
@@ -194,6 +216,7 @@ pub fn item_event_to_server_notification(
                 thread_id,
                 turn_id,
                 item,
+                started_at_ms: begin_event.started_at_ms,
             })
         }
         EventMsg::CollabWaitingEnd(end_event) => {
@@ -229,6 +252,7 @@ pub fn item_event_to_server_notification(
                 thread_id,
                 turn_id,
                 item,
+                completed_at_ms: end_event.completed_at_ms,
             })
         }
         EventMsg::CollabCloseBegin(begin_event) => {
@@ -247,6 +271,7 @@ pub fn item_event_to_server_notification(
                 thread_id,
                 turn_id,
                 item,
+                started_at_ms: begin_event.started_at_ms,
             })
         }
         EventMsg::CollabCloseEnd(end_event) => {
@@ -279,6 +304,7 @@ pub fn item_event_to_server_notification(
                 thread_id,
                 turn_id,
                 item,
+                completed_at_ms: end_event.completed_at_ms,
             })
         }
         EventMsg::CollabResumeBegin(begin_event) => {
@@ -297,6 +323,7 @@ pub fn item_event_to_server_notification(
                 thread_id,
                 turn_id,
                 item,
+                started_at_ms: begin_event.started_at_ms,
             })
         }
         EventMsg::CollabResumeEnd(end_event) => {
@@ -329,6 +356,7 @@ pub fn item_event_to_server_notification(
                 thread_id,
                 turn_id,
                 item,
+                completed_at_ms: end_event.completed_at_ms,
             })
         }
         EventMsg::AgentMessageContentDelta(event) => {
@@ -378,6 +406,7 @@ pub fn item_event_to_server_notification(
                 thread_id,
                 turn_id,
                 item: item_started_event.item.into(),
+                started_at_ms: item_started_event.started_at_ms,
             })
         }
         EventMsg::ItemCompleted(item_completed_event) => {
@@ -385,6 +414,7 @@ pub fn item_event_to_server_notification(
                 thread_id,
                 turn_id,
                 item: item_completed_event.item.into(),
+                completed_at_ms: item_completed_event.completed_at_ms,
             })
         }
         EventMsg::PatchApplyUpdated(event) => {
@@ -400,6 +430,7 @@ pub fn item_event_to_server_notification(
                 thread_id,
                 turn_id,
                 item: build_command_execution_begin_item(&exec_command_begin_event),
+                started_at_ms: exec_command_begin_event.started_at_ms,
             })
         }
         EventMsg::ExecCommandOutputDelta(exec_command_output_delta_event) => {
@@ -428,6 +459,7 @@ pub fn item_event_to_server_notification(
                 thread_id,
                 turn_id,
                 item: build_command_execution_end_item(&exec_command_end_event),
+                completed_at_ms: exec_command_end_event.completed_at_ms,
             })
         }
         _ => unreachable!("unsupported item event"),
@@ -480,6 +512,7 @@ mod tests {
     fn collab_resume_begin_maps_to_item_started_resume_agent() {
         let event = CollabResumeBeginEvent {
             call_id: "call-1".to_string(),
+            started_at_ms: 123,
             sender_thread_id: ThreadId::new(),
             receiver_thread_id: ThreadId::new(),
             receiver_agent_nickname: None,
@@ -496,6 +529,7 @@ mod tests {
             ItemStartedNotification {
                 thread_id: "thread-1".to_string(),
                 turn_id: "turn-1".to_string(),
+                started_at_ms: event.started_at_ms,
                 item: ThreadItem::CollabAgentToolCall {
                     id: event.call_id,
                     tool: CollabAgentTool::ResumeAgent,
@@ -515,6 +549,7 @@ mod tests {
     fn collab_resume_end_maps_to_item_completed_resume_agent() {
         let event = CollabResumeEndEvent {
             call_id: "call-2".to_string(),
+            completed_at_ms: 456,
             sender_thread_id: ThreadId::new(),
             receiver_thread_id: ThreadId::new(),
             receiver_agent_nickname: None,
@@ -533,6 +568,7 @@ mod tests {
             ItemCompletedNotification {
                 thread_id: "thread-2".to_string(),
                 turn_id: "turn-2".to_string(),
+                completed_at_ms: event.completed_at_ms,
                 item: ThreadItem::CollabAgentToolCall {
                     id: event.call_id,
                     tool: CollabAgentTool::ResumeAgent,

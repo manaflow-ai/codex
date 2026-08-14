@@ -18,9 +18,7 @@ fn model_info() -> ModelInfo {
         "priority": 1,
         "availability_nux": null,
         "upgrade": null,
-        "base_instructions": "base",
         "model_messages": null,
-        "supports_reasoning_summaries": false,
         "default_reasoning_summary": "auto",
         "support_verbosity": false,
         "default_verbosity": null,
@@ -29,7 +27,6 @@ fn model_info() -> ModelInfo {
             "mode": "bytes",
             "limit": 10000
         },
-        "supports_parallel_tool_calls": false,
         "supports_image_detail_original": true,
         "context_window": null,
         "auto_compact_token_limit": null,
@@ -70,6 +67,10 @@ fn explicit_original_is_dropped_without_model_support() {
 fn explicit_non_original_detail_is_preserved() {
     let model_info = model_info();
 
+    assert_eq!(
+        normalize_output_image_detail(&model_info, Some(ImageDetail::Auto)),
+        Some(ImageDetail::Auto)
+    );
     assert_eq!(
         normalize_output_image_detail(&model_info, Some(ImageDetail::Low)),
         Some(ImageDetail::Low)

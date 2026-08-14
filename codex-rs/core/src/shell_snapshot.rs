@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
 
+use crate::StateDbHandle;
 use crate::rollout::list::find_thread_path_by_id_str;
 use crate::shell::Shell;
 use crate::shell::ShellType;
@@ -13,20 +14,31 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
+use codex_exec_server::Environment;
 use codex_otel::SessionTelemetry;
 use codex_protocol::ThreadId;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
 use tokio::fs;
 use tokio::process::Command;
-use tokio::sync::watch;
 use tokio::time::timeout;
 use tracing::Instrument;
 use tracing::info_span;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ShellSnapshot {
-    pub path: AbsolutePathBuf,
-    pub cwd: AbsolutePathBuf,
+#[derive(Clone)]
+pub(crate) struct ShellSnapshot {
+    config: Option<Arc<ShellSnapshotConfig>>,
+}
+
+struct ShellSnapshotConfig {
+    codex_home: AbsolutePathBuf,
+    session_id: ThreadId,
+    session_telemetry: SessionTelemetry,
+    state_db: Option<StateDbHandle>,
+}
+
+pub(crate) struct ShellSnapshotFile {
+    path: AbsolutePathBuf,
 }
 
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -35,82 +47,84 @@ const SNAPSHOT_DIR: &str = "shell_snapshots";
 const EXCLUDED_EXPORT_VARS: &[&str] = &["PWD", "OLDPWD"];
 
 impl ShellSnapshot {
-    pub fn start_snapshotting(
+    pub(crate) fn new(
         codex_home: AbsolutePathBuf,
         session_id: ThreadId,
-        session_cwd: AbsolutePathBuf,
-        shell: &mut Shell,
         session_telemetry: SessionTelemetry,
-    ) -> watch::Sender<Option<Arc<ShellSnapshot>>> {
-        let (shell_snapshot_tx, shell_snapshot_rx) = watch::channel(None);
-        shell.shell_snapshot = shell_snapshot_rx;
-
-        Self::spawn_snapshot_task(
-            codex_home,
-            session_id,
-            session_cwd,
-            shell.clone(),
-            shell_snapshot_tx.clone(),
-            session_telemetry,
-        );
-
-        shell_snapshot_tx
+        state_db: Option<StateDbHandle>,
+    ) -> Self {
+        Self {
+            config: Some(Arc::new(ShellSnapshotConfig {
+                codex_home,
+                session_id,
+                session_telemetry,
+                state_db,
+            })),
+        }
     }
 
-    pub fn refresh_snapshot(
-        codex_home: AbsolutePathBuf,
-        session_id: ThreadId,
-        session_cwd: AbsolutePathBuf,
+    pub(crate) fn disabled() -> Self {
+        Self { config: None }
+    }
+
+    pub(crate) async fn build(
+        self,
+        environment: Arc<Environment>,
+        cwd: PathUri,
+        shell: Option<Shell>,
+    ) -> Option<Arc<ShellSnapshotFile>> {
+        let config = self.config.as_ref()?;
+        if environment.is_remote() {
+            return None;
+        }
+
+        let shell = shell?;
+        // TODO(anp): Migrate shell snapshot creation to accept PathUri and defer native
+        // conversion to the spawned shell process.
+        let cwd = cwd.to_abs_path().ok()?;
+        Self::build_for_cwd(Arc::clone(config), cwd, shell).await
+    }
+
+    async fn build_for_cwd(
+        config: Arc<ShellSnapshotConfig>,
+        cwd: AbsolutePathBuf,
         shell: Shell,
-        shell_snapshot_tx: watch::Sender<Option<Arc<ShellSnapshot>>>,
-        session_telemetry: SessionTelemetry,
-    ) {
-        Self::spawn_snapshot_task(
-            codex_home,
-            session_id,
-            session_cwd,
-            shell,
-            shell_snapshot_tx,
-            session_telemetry,
-        );
-    }
-
-    fn spawn_snapshot_task(
-        codex_home: AbsolutePathBuf,
-        session_id: ThreadId,
-        session_cwd: AbsolutePathBuf,
-        snapshot_shell: Shell,
-        shell_snapshot_tx: watch::Sender<Option<Arc<ShellSnapshot>>>,
-        session_telemetry: SessionTelemetry,
-    ) {
-        let snapshot_span = info_span!("shell_snapshot", thread_id = %session_id);
-        tokio::spawn(
-            async move {
-                let timer = session_telemetry.start_timer("codex.shell_snapshot.duration_ms", &[]);
-                let snapshot =
-                    ShellSnapshot::try_new(&codex_home, session_id, &session_cwd, &snapshot_shell)
-                        .await
-                        .map(Arc::new);
-                let success = snapshot.is_ok();
-                let success_tag = if success { "true" } else { "false" };
-                let _ = timer.map(|timer| timer.record(&[("success", success_tag)]));
-                let mut counter_tags = vec![("success", success_tag)];
-                if let Some(failure_reason) = snapshot.as_ref().err() {
-                    counter_tags.push(("failure_reason", *failure_reason));
-                }
-                session_telemetry.counter("codex.shell_snapshot", /*inc*/ 1, &counter_tags);
-                let _ = shell_snapshot_tx.send(snapshot.ok());
+    ) -> Option<Arc<ShellSnapshotFile>> {
+        let snapshot_span = info_span!("shell_snapshot", thread_id = %config.session_id);
+        async {
+            let timer = config
+                .session_telemetry
+                .start_timer("codex.shell_snapshot.duration_ms", &[]);
+            let snapshot = ShellSnapshot::try_create(
+                &config.codex_home,
+                config.session_id,
+                &cwd,
+                &shell,
+                config.state_db.clone(),
+            )
+            .await;
+            let success_tag = if snapshot.is_ok() { "true" } else { "false" };
+            let _ = timer.map(|timer| timer.record(&[("success", success_tag)]));
+            let mut counter_tags = vec![("success", success_tag)];
+            if let Some(failure_reason) = snapshot.as_ref().err() {
+                counter_tags.push(("failure_reason", *failure_reason));
             }
-            .instrument(snapshot_span),
-        );
+            config
+                .session_telemetry
+                .counter("codex.shell_snapshot", /*inc*/ 1, &counter_tags);
+            snapshot.ok().map(Arc::new)
+        }
+        .instrument(snapshot_span)
+        .await
     }
 
-    async fn try_new(
+    async fn try_create(
         codex_home: &AbsolutePathBuf,
         session_id: ThreadId,
         session_cwd: &AbsolutePathBuf,
         shell: &Shell,
-    ) -> std::result::Result<Self, &'static str> {
+        state_db: Option<StateDbHandle>,
+    ) -> std::result::Result<ShellSnapshotFile, &'static str> {
         // File to store the snapshot
         let extension = match shell.shell_type {
             ShellType::PowerShell => "ps1",
@@ -131,15 +145,15 @@ impl ShellSnapshot {
         let codex_home = codex_home.clone();
         let cleanup_session_id = session_id;
         tokio::spawn(async move {
-            if let Err(err) = cleanup_stale_snapshots(&codex_home, cleanup_session_id).await {
+            if let Err(err) =
+                cleanup_stale_snapshots(&codex_home, cleanup_session_id, state_db).await
+            {
                 tracing::warn!("Failed to clean up shell snapshots: {err:?}");
             }
         });
 
         // Make the new snapshot.
-        if let Err(err) =
-            write_shell_snapshot(shell.shell_type.clone(), &temp_path, session_cwd).await
-        {
+        if let Err(err) = write_shell_snapshot(shell.shell_type, &temp_path, session_cwd).await {
             tracing::warn!(
                 "Failed to create shell snapshot for {}: {err:?}",
                 shell.name()
@@ -163,14 +177,17 @@ impl ShellSnapshot {
             return Err("write_failed");
         }
 
-        Ok(Self {
-            path,
-            cwd: session_cwd.clone(),
-        })
+        Ok(ShellSnapshotFile { path })
     }
 }
 
-impl Drop for ShellSnapshot {
+impl ShellSnapshotFile {
+    pub(crate) fn path(&self) -> AbsolutePathBuf {
+        self.path.clone()
+    }
+}
+
+impl Drop for ShellSnapshotFile {
     fn drop(&mut self) {
         if let Err(err) = std::fs::remove_file(&self.path) {
             tracing::warn!(
@@ -189,7 +206,7 @@ async fn write_shell_snapshot(
     if shell_type == ShellType::PowerShell || shell_type == ShellType::Cmd {
         bail!("Shell snapshot not supported yet for {shell_type:?}");
     }
-    let shell = get_shell(shell_type.clone(), /*path*/ None)
+    let shell = get_shell(shell_type, /*path*/ None)
         .with_context(|| format!("No available shell for {shell_type:?}"))?;
 
     let raw_snapshot = capture_snapshot(&shell, cwd).await?;
@@ -211,7 +228,7 @@ async fn write_shell_snapshot(
 }
 
 async fn capture_snapshot(shell: &Shell, cwd: &AbsolutePathBuf) -> Result<String> {
-    let shell_type = shell.shell_type.clone();
+    let shell_type = shell.shell_type;
     match shell_type {
         ShellType::Zsh => run_shell_script(shell, &zsh_snapshot_script(), cwd).await,
         ShellType::Bash => run_shell_script(shell, &bash_snapshot_script(), cwd).await,
@@ -272,6 +289,7 @@ async fn run_script_with_timeout(
     // Handler is kept as guard to control the drop. The `mut` pattern is required because .args()
     // returns a ref of handler.
     let mut handler = Command::new(&args[0]);
+    codex_protocol::shell_environment::scrub_non_inheritable_env_vars(handler.as_std_mut());
     handler.args(&args[1..]);
     handler.stdin(Stdio::null());
     handler.current_dir(cwd);
@@ -328,6 +346,13 @@ export_lines=$(export -p | awk '
   line=$0
   name=line
   sub(/^(export|declare -x|typeset -x) /, "", name)
+  if (name ~ /^-[A-Za-z]*r[A-Za-z]* /) {
+    next
+  }
+  if (name ~ /^-[A-Za-z]*T[A-Za-z]* /) {
+    sub(/^-[A-Za-z]*T[A-Za-z]* /, "", name)
+    sub(/ [A-Za-z_][A-Za-z0-9_]*=.*/, "", name)
+  }
   sub(/=.*/, "", name)
   if (name ~ /^(EXCLUDED_EXPORTS)$/) {
     next
@@ -486,6 +511,7 @@ $envVars | ForEach-Object {
 pub async fn cleanup_stale_snapshots(
     codex_home: &AbsolutePathBuf,
     active_session_id: ThreadId,
+    state_db: Option<StateDbHandle>,
 ) -> Result<()> {
     let snapshot_dir = codex_home.join(SNAPSHOT_DIR);
 
@@ -515,7 +541,8 @@ pub async fn cleanup_stale_snapshots(
             continue;
         }
 
-        let rollout_path = find_thread_path_by_id_str(codex_home, session_id).await?;
+        let rollout_path =
+            find_thread_path_by_id_str(codex_home, session_id, state_db.as_deref()).await?;
         let Some(rollout_path) = rollout_path else {
             remove_snapshot_file(&path).await;
             continue;

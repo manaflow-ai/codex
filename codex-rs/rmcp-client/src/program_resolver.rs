@@ -44,7 +44,11 @@ pub fn resolve(
     cwd: &Path,
 ) -> std::io::Result<OsString> {
     // Extract PATH from environment for search locations
-    let search_path = env.get(std::ffi::OsStr::new("PATH"));
+    let search_path = env.iter().find_map(|(name, value)| {
+        name.to_string_lossy()
+            .eq_ignore_ascii_case("PATH")
+            .then_some(value)
+    });
 
     // Attempt resolution via which crate
     match which::which_in(&program, search_path, cwd) {
@@ -75,10 +79,25 @@ mod tests {
     #[tokio::test]
     async fn test_unix_executes_script_without_extension() -> Result<()> {
         let env = TestExecutableEnv::new()?;
-        let mut cmd = Command::new(&env.program_name);
-        cmd.envs(&env.mcp_env);
+        // Linux can transiently report ETXTBSY while the freshly written test
+        // script is becoming executable on the backing filesystem.
+        let mut retries = 0;
+        let output = loop {
+            let mut cmd = Command::new(&env.program_name);
+            cmd.envs(&env.mcp_env);
 
-        let output = cmd.output().await;
+            let output = cmd.output().await;
+            if !output
+                .as_ref()
+                .is_err_and(|err| err.kind() == std::io::ErrorKind::ExecutableFileBusy)
+                || retries == 2
+            {
+                break output;
+            }
+            retries += 1;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+
         assert!(
             output.is_ok(),
             "Unix should execute PATH-resolved scripts directly: {output:?}"
@@ -124,6 +143,16 @@ mod tests {
     #[tokio::test]
     async fn test_resolved_program_executes_successfully() -> Result<()> {
         let env = TestExecutableEnv::new()?;
+        #[cfg(windows)]
+        let env = {
+            let mut env = env;
+            let path = env
+                .mcp_env
+                .remove(std::ffi::OsStr::new("PATH"))
+                .expect("test environment should include PATH");
+            env.mcp_env.insert(OsString::from("Path"), path);
+            env
+        };
         let program = OsString::from(&env.program_name);
 
         // Apply platform-specific resolution

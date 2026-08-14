@@ -1,6 +1,7 @@
 use std::path::Path;
 
-use futures::future::join_all;
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 
 use codex_protocol::protocol::HookCompletedEvent;
 use codex_protocol::protocol::HookEventName;
@@ -10,9 +11,10 @@ use codex_protocol::protocol::HookRunStatus;
 use codex_protocol::protocol::HookRunSummary;
 use codex_protocol::protocol::HookScope;
 
-use super::CommandShell;
+use super::ClaudeHooksEngine;
 use super::ConfiguredHandler;
-use super::command_runner::CommandRunResult;
+use super::ConfiguredHandlerKind;
+use super::HandlerRunResult;
 use super::command_runner::run_command;
 use crate::events::common::matches_matcher;
 
@@ -20,6 +22,7 @@ use crate::events::common::matches_matcher;
 pub(crate) struct ParsedHandler<T> {
     pub completed: HookCompletedEvent,
     pub data: T,
+    pub completion_order: usize,
 }
 
 pub(crate) fn select_handlers(
@@ -46,7 +49,12 @@ pub(crate) fn select_handlers_for_matcher_inputs(
             HookEventName::PreToolUse
             | HookEventName::PermissionRequest
             | HookEventName::PostToolUse
-            | HookEventName::SessionStart => {
+            | HookEventName::SessionStart
+            | HookEventName::SessionEnd
+            | HookEventName::SubagentStart
+            | HookEventName::SubagentStop
+            | HookEventName::PreCompact
+            | HookEventName::PostCompact => {
                 if matcher_inputs.is_empty() {
                     matches_matcher(handler.matcher.as_deref(), /*input*/ None)
                 } else {
@@ -65,8 +73,8 @@ pub(crate) fn running_summary(handler: &ConfiguredHandler) -> HookRunSummary {
     HookRunSummary {
         id: handler.run_id(),
         event_name: handler.event_name,
-        handler_type: HookHandlerType::Command,
-        execution_mode: HookExecutionMode::Sync,
+        handler_type: handler.handler_type(),
+        execution_mode: handler.execution_mode(),
         scope: scope_for_event(handler.event_name),
         source_path: handler.source_path.clone(),
         source: handler.source,
@@ -80,39 +88,68 @@ pub(crate) fn running_summary(handler: &ConfiguredHandler) -> HookRunSummary {
     }
 }
 
-pub(crate) async fn execute_handlers<T>(
-    shell: &CommandShell,
+pub(crate) async fn execute_handlers<T: 'static>(
+    engine: &ClaudeHooksEngine,
     handlers: Vec<ConfiguredHandler>,
     input_json: String,
     cwd: &Path,
     turn_id: Option<String>,
-    parse: fn(&ConfiguredHandler, CommandRunResult, Option<String>) -> ParsedHandler<T>,
+    parse: fn(&ConfiguredHandler, HandlerRunResult, Option<String>) -> ParsedHandler<T>,
 ) -> Vec<ParsedHandler<T>> {
-    let results = join_all(
-        handlers
-            .iter()
-            .map(|handler| run_command(shell, handler, &input_json, cwd)),
-    )
-    .await;
+    let mut pending = FuturesUnordered::new();
+    for (configured_order, handler) in handlers.into_iter().enumerate() {
+        if handler.execution_mode() == HookExecutionMode::Async {
+            engine.command_runtime.schedule_async_hook(
+                handler,
+                input_json.clone(),
+                cwd.to_path_buf(),
+                turn_id.clone(),
+                parse,
+            );
+            continue;
+        }
+        let input_json = input_json.clone();
+        let turn_id = turn_id.clone();
+        pending.push(async move {
+            let result = match &handler.kind {
+                ConfiguredHandlerKind::Command { command, env, .. } => {
+                    run_command(
+                        &engine.command_runtime,
+                        &handler,
+                        command,
+                        env,
+                        &input_json,
+                        cwd,
+                    )
+                    .await
+                }
+            };
+            (configured_order, parse(&handler, result, turn_id))
+        });
+    }
 
-    handlers
-        .into_iter()
-        .zip(results)
-        .map(|(handler, result)| parse(&handler, result, turn_id.clone()))
-        .collect()
+    let mut completed = Vec::new();
+    let mut completion_order = 0;
+    while let Some((configured_order, mut parsed)) = pending.next().await {
+        parsed.completion_order = completion_order;
+        completion_order += 1;
+        completed.push((configured_order, parsed));
+    }
+    completed.sort_by_key(|(configured_order, _)| *configured_order);
+    completed.into_iter().map(|(_, parsed)| parsed).collect()
 }
 
 pub(crate) fn completed_summary(
     handler: &ConfiguredHandler,
-    run_result: &CommandRunResult,
+    run_result: &HandlerRunResult,
     status: HookRunStatus,
     entries: Vec<codex_protocol::protocol::HookOutputEntry>,
 ) -> HookRunSummary {
     HookRunSummary {
         id: handler.run_id(),
         event_name: handler.event_name,
-        handler_type: HookHandlerType::Command,
-        execution_mode: HookExecutionMode::Sync,
+        handler_type: handler.handler_type(),
+        execution_mode: handler.execution_mode(),
         scope: scope_for_event(handler.event_name),
         source_path: handler.source_path.clone(),
         source: handler.source,
@@ -126,14 +163,75 @@ pub(crate) fn completed_summary(
     }
 }
 
-fn scope_for_event(event_name: HookEventName) -> HookScope {
+pub(crate) fn scope_for_event(event_name: HookEventName) -> HookScope {
     match event_name {
-        HookEventName::SessionStart => HookScope::Thread,
+        HookEventName::SessionStart | HookEventName::SessionEnd | HookEventName::SubagentStart => {
+            HookScope::Thread
+        }
         HookEventName::PreToolUse
         | HookEventName::PermissionRequest
         | HookEventName::PostToolUse
+        | HookEventName::PreCompact
+        | HookEventName::PostCompact
         | HookEventName::UserPromptSubmit
+        | HookEventName::SubagentStop
         | HookEventName::Stop => HookScope::Turn,
+    }
+}
+
+pub(crate) fn hook_event_name_label(event_name: HookEventName) -> &'static str {
+    match event_name {
+        HookEventName::PreToolUse => "PreToolUse",
+        HookEventName::PermissionRequest => "PermissionRequest",
+        HookEventName::PostToolUse => "PostToolUse",
+        HookEventName::PreCompact => "PreCompact",
+        HookEventName::PostCompact => "PostCompact",
+        HookEventName::SessionStart => "SessionStart",
+        HookEventName::SessionEnd => "SessionEnd",
+        HookEventName::UserPromptSubmit => "UserPromptSubmit",
+        HookEventName::SubagentStart => "SubagentStart",
+        HookEventName::SubagentStop => "SubagentStop",
+        HookEventName::Stop => "Stop",
+    }
+}
+
+pub(crate) fn hook_execution_mode_label(mode: HookExecutionMode) -> &'static str {
+    match mode {
+        HookExecutionMode::Sync => "sync",
+        HookExecutionMode::Async => "async",
+    }
+}
+
+pub(crate) fn hook_handler_type_label(handler_type: HookHandlerType) -> &'static str {
+    match handler_type {
+        HookHandlerType::Command => "command",
+        HookHandlerType::Prompt => "prompt",
+        HookHandlerType::Agent => "agent",
+    }
+}
+
+pub(crate) fn hook_scope_label(scope: HookScope) -> &'static str {
+    match scope {
+        HookScope::Thread => "thread",
+        HookScope::Turn => "turn",
+    }
+}
+
+pub(crate) fn hook_source_label(source: codex_protocol::protocol::HookSource) -> &'static str {
+    match source {
+        codex_protocol::protocol::HookSource::System => "system",
+        codex_protocol::protocol::HookSource::User => "user",
+        codex_protocol::protocol::HookSource::Project => "project",
+        codex_protocol::protocol::HookSource::Mdm => "mdm",
+        codex_protocol::protocol::HookSource::SessionFlags => "session_flags",
+        codex_protocol::protocol::HookSource::Plugin => "plugin",
+        codex_protocol::protocol::HookSource::CloudRequirements => "cloud_requirements",
+        codex_protocol::protocol::HookSource::CloudManagedConfig => "cloud_managed_config",
+        codex_protocol::protocol::HookSource::LegacyManagedConfigFile => {
+            "legacy_managed_config_file"
+        }
+        codex_protocol::protocol::HookSource::LegacyManagedConfigMdm => "legacy_managed_config_mdm",
+        codex_protocol::protocol::HookSource::Unknown => "unknown",
     }
 }
 
@@ -143,8 +241,10 @@ mod tests {
     use codex_protocol::protocol::HookSource;
     use codex_utils_absolute_path::test_support::PathBufExt;
     use codex_utils_absolute_path::test_support::test_path_buf;
+    use pretty_assertions::assert_eq;
 
     use super::ConfiguredHandler;
+    use super::ConfiguredHandlerKind;
     use super::select_handlers;
     use super::select_handlers_for_matcher_inputs;
 
@@ -157,13 +257,17 @@ mod tests {
         ConfiguredHandler {
             event_name,
             matcher: matcher.map(str::to_owned),
-            command: command.to_string(),
             timeout_sec: 5,
             status_message: None,
+            additional_context_limit: Default::default(),
             source_path: test_path_buf("/tmp/hooks.json").abs(),
             source: HookSource::User,
             display_order,
-            env: std::collections::HashMap::new(),
+            kind: ConfiguredHandlerKind::Command {
+                command: command.to_string(),
+                r#async: false,
+                env: std::collections::HashMap::new(),
+            },
         }
     }
 
@@ -213,6 +317,29 @@ mod tests {
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[0].display_order, 0);
         assert_eq!(selected[1].display_order, 1);
+    }
+
+    #[test]
+    fn compact_hooks_match_trigger() {
+        let handlers = vec![
+            make_handler(
+                HookEventName::PreCompact,
+                Some("manual"),
+                "echo manual",
+                /*display_order*/ 0,
+            ),
+            make_handler(
+                HookEventName::PreCompact,
+                Some("auto"),
+                "echo auto",
+                /*display_order*/ 1,
+            ),
+        ];
+
+        let selected = select_handlers(&handlers, HookEventName::PreCompact, Some("manual"));
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].display_order, 0);
     }
 
     #[test]
@@ -400,9 +527,6 @@ mod tests {
 
         let selected = select_handlers(&handlers, HookEventName::Stop, /*matcher_input*/ None);
 
-        assert_eq!(selected.len(), 3);
-        assert_eq!(selected[0].command, "first");
-        assert_eq!(selected[1].command, "second");
-        assert_eq!(selected[2].command, "third");
+        assert_eq!(selected, handlers);
     }
 }

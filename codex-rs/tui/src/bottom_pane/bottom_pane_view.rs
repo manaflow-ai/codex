@@ -1,9 +1,11 @@
 use crate::app::app_server_requests::ResolvedAppServerRequest;
 use crate::bottom_pane::ApprovalRequest;
 use crate::bottom_pane::McpServerElicitationFormRequest;
+use crate::keymap::KeymapContextSet;
 use crate::render::renderable::Renderable;
 use codex_app_server_protocol::ToolRequestUserInputParams;
 use crossterm::event::KeyEvent;
+use std::time::Instant;
 
 use super::CancellationEvent;
 
@@ -19,6 +21,11 @@ pub(crate) trait BottomPaneView: Renderable {
     /// Handle a key event while the view is active. A redraw is always
     /// scheduled after this call.
     fn handle_key_event(&mut self, _key_event: KeyEvent) {}
+
+    /// Return the keymap contexts whose handlers are active in this view.
+    fn keymap_contexts(&self) -> KeymapContextSet {
+        KeymapContextSet::default()
+    }
 
     /// Return `true` if the view has finished and should be removed.
     fn is_complete(&self) -> bool {
@@ -66,6 +73,11 @@ pub(crate) trait BottomPaneView: Renderable {
         false
     }
 
+    /// Return true when this key event will interrupt the active agent turn.
+    fn will_interrupt_turn_on_key_event(&self, _key_event: KeyEvent) -> bool {
+        false
+    }
+
     /// Optional paste handler. Return true if the view modified its state and
     /// needs a redraw.
     fn handle_paste(&mut self, _pasted: String) -> bool {
@@ -85,6 +97,14 @@ pub(crate) trait BottomPaneView: Renderable {
     /// When `true`, the bottom pane will schedule a short delayed redraw to
     /// give the burst time window a chance to flush.
     fn is_in_paste_burst(&self) -> bool {
+        false
+    }
+
+    /// Process time-based state immediately before rendering.
+    ///
+    /// Return true when state changed and the bottom pane should redraw or
+    /// complete the active view.
+    fn pre_draw_tick(&mut self, _now: Instant) -> bool {
         false
     }
 
@@ -129,5 +149,10 @@ pub(crate) trait BottomPaneView: Renderable {
     /// Codex needs user input.
     fn terminal_title_requires_action(&self) -> bool {
         false
+    }
+
+    /// Return the next time-based redraw this view needs while it is active.
+    fn next_frame_delay(&self) -> Option<std::time::Duration> {
+        None
     }
 }

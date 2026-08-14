@@ -1,11 +1,15 @@
 use anyhow::Result;
 use app_test_support::ChatGptAuthFixture;
-use app_test_support::McpProcess;
+use app_test_support::MockResponsesConfig;
+use app_test_support::TestAppServer;
 use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
 use chrono::Duration;
 use chrono::Utc;
+use codex_app_server_protocol::Account;
 use codex_app_server_protocol::AuthMode;
+use codex_app_server_protocol::GetAccountParams;
+use codex_app_server_protocol::GetAccountResponse;
 use codex_app_server_protocol::GetAuthStatusParams;
 use codex_app_server_protocol::GetAuthStatusResponse;
 use codex_app_server_protocol::JSONRPCError;
@@ -13,7 +17,9 @@ use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::LoginAccountResponse;
 use codex_app_server_protocol::RequestId;
 use codex_config::types::AuthCredentialsStoreMode;
+use codex_features::Feature;
 use codex_login::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
+use codex_protocol::account::PlanType as AccountPlanType;
 use pretty_assertions::assert_eq;
 use std::path::Path;
 use tempfile::TempDir;
@@ -21,6 +27,7 @@ use tokio::time::timeout;
 use wiremock::Mock;
 use wiremock::MockServer;
 use wiremock::ResponseTemplate;
+use wiremock::matchers::header;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 
@@ -32,33 +39,13 @@ fn create_config_toml_custom_provider(
     codex_home: &Path,
     requires_openai_auth: bool,
 ) -> std::io::Result<()> {
-    let config_toml = codex_home.join("config.toml");
-    let requires_line = if requires_openai_auth {
-        "requires_openai_auth = true\n"
-    } else {
-        ""
-    };
-    let contents = format!(
-        r#"
-model = "mock-model"
-approval_policy = "never"
-sandbox_mode = "danger-full-access"
-
-model_provider = "mock_provider"
-
-[features]
-shell_snapshot = false
-
-[model_providers.mock_provider]
-name = "Mock provider for test"
-base_url = "http://127.0.0.1:0/v1"
-wire_api = "responses"
-request_max_retries = 0
-stream_max_retries = 0
-{requires_line}
-"#
-    );
-    std::fs::write(config_toml, contents)
+    let mut config = MockResponsesConfig::new("http://127.0.0.1:0")
+        .with_sandbox_mode("danger-full-access")
+        .disable_feature(Feature::ShellSnapshot);
+    if requires_openai_auth {
+        config = config.with_provider_config("requires_openai_auth = true");
+    }
+    config.write(codex_home)
 }
 
 fn create_config_toml(codex_home: &Path) -> std::io::Result<()> {
@@ -92,15 +79,11 @@ shell_snapshot = false
     std::fs::write(config_toml, contents)
 }
 
-async fn login_with_api_key_via_request(mcp: &mut McpProcess, api_key: &str) -> Result<()> {
+async fn login_with_api_key_via_request(mcp: &mut TestAppServer, api_key: &str) -> Result<()> {
     let request_id = mcp.send_login_account_api_key_request(api_key).await?;
 
-    let resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let response: LoginAccountResponse = to_response(resp)?;
+    let response: LoginAccountResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
     assert_eq!(response, LoginAccountResponse::ApiKey {});
     Ok(())
 }
@@ -110,8 +93,12 @@ async fn get_auth_status_no_auth() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path())?;
 
-    let mut mcp = McpProcess::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .with_env_overrides(&[("OPENAI_API_KEY", None)])
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_get_auth_status_request(GetAuthStatusParams {
@@ -120,12 +107,8 @@ async fn get_auth_status_no_auth() -> Result<()> {
         })
         .await?;
 
-    let resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let status: GetAuthStatusResponse = to_response(resp)?;
+    let status: GetAuthStatusResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
     assert_eq!(status.auth_method, None, "expected no auth method");
     assert_eq!(status.auth_token, None, "expected no token");
     Ok(())
@@ -136,8 +119,11 @@ async fn get_auth_status_with_api_key() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path())?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     login_with_api_key_via_request(&mut mcp, "sk-test-key").await?;
 
@@ -148,14 +134,100 @@ async fn get_auth_status_with_api_key() -> Result<()> {
         })
         .await?;
 
-    let resp: JSONRPCResponse = timeout(
+    let status: GetAuthStatusResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
+    assert_eq!(status.auth_method, Some(AuthMode::ApiKey));
+    assert_eq!(status.auth_token, Some("sk-test-key".to_string()));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn personal_access_token_without_email_supports_auth_status_and_account_read() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path())?;
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/user-auth-credential/whoami"))
+        .and(header("Authorization", "Bearer at-test-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "email": null,
+            "chatgpt_user_id": "user-123",
+            "chatgpt_account_id": "account-123",
+            "chatgpt_plan_type": "enterprise_cbp_automation",
+            "chatgpt_account_is_fedramp": false,
+        })))
+        .expect(1..)
+        .mount(&server)
+        .await;
+
+    let authapi_base_url = server.uri();
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .with_env_overrides(&[
+            ("OPENAI_API_KEY", None),
+            ("CODEX_ACCESS_TOKEN", Some("at-test-token")),
+            ("CODEX_AUTHAPI_BASE_URL", Some(authapi_base_url.as_str())),
+        ])
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
+
+    let request_id = mcp
+        .send_get_auth_status_request(GetAuthStatusParams {
+            include_token: Some(true),
+            refresh_token: Some(false),
+        })
+        .await?;
+
+    let status: GetAuthStatusResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
+    assert_eq!(
+        status,
+        GetAuthStatusResponse {
+            auth_method: Some(AuthMode::PersonalAccessToken),
+            auth_token: None,
+            requires_openai_auth: Some(true),
+        }
+    );
+
+    let request_id = mcp
+        .send_get_account_request(GetAccountParams {
+            refresh_token: false,
+        })
+        .await?;
+    let response: JSONRPCResponse = timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
     )
     .await??;
-    let status: GetAuthStatusResponse = to_response(resp)?;
-    assert_eq!(status.auth_method, Some(AuthMode::ApiKey));
-    assert_eq!(status.auth_token, Some("sk-test-key".to_string()));
+    assert_eq!(
+        response
+            .result
+            .get("account")
+            .and_then(|account| account.get("email")),
+        Some(&serde_json::Value::Null),
+    );
+    assert_eq!(
+        response
+            .result
+            .get("account")
+            .and_then(|account| account.get("planType"))
+            .and_then(serde_json::Value::as_str),
+        Some("enterprise_cbp_automation"),
+    );
+    assert_eq!(
+        to_response::<GetAccountResponse>(response)?,
+        GetAccountResponse {
+            account: Some(Account::Chatgpt {
+                email: None,
+                plan_type: AccountPlanType::EnterpriseCbpAutomation,
+            }),
+            requires_openai_auth: true,
+        }
+    );
+
+    server.verify().await;
     Ok(())
 }
 
@@ -164,8 +236,11 @@ async fn get_auth_status_with_api_key_when_auth_not_required() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml_custom_provider(codex_home.path(), /*requires_openai_auth*/ false)?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     login_with_api_key_via_request(&mut mcp, "sk-test-key").await?;
 
@@ -176,12 +251,8 @@ async fn get_auth_status_with_api_key_when_auth_not_required() -> Result<()> {
         })
         .await?;
 
-    let resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let status: GetAuthStatusResponse = to_response(resp)?;
+    let status: GetAuthStatusResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
     assert_eq!(status.auth_method, None, "expected no auth method");
     assert_eq!(status.auth_token, None, "expected no token");
     assert_eq!(
@@ -197,8 +268,11 @@ async fn get_auth_status_with_api_key_no_include_token() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path())?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     login_with_api_key_via_request(&mut mcp, "sk-test-key").await?;
 
@@ -209,12 +283,8 @@ async fn get_auth_status_with_api_key_no_include_token() -> Result<()> {
     };
     let request_id = mcp.send_get_auth_status_request(params).await?;
 
-    let resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let status: GetAuthStatusResponse = to_response(resp)?;
+    let status: GetAuthStatusResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
     assert_eq!(status.auth_method, Some(AuthMode::ApiKey));
     assert!(status.auth_token.is_none(), "token must be omitted");
     Ok(())
@@ -225,8 +295,11 @@ async fn get_auth_status_with_api_key_refresh_requested() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path())?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     login_with_api_key_via_request(&mut mcp, "sk-test-key").await?;
 
@@ -237,12 +310,8 @@ async fn get_auth_status_with_api_key_refresh_requested() -> Result<()> {
         })
         .await?;
 
-    let resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let status: GetAuthStatusResponse = to_response(resp)?;
+    let status: GetAuthStatusResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
     assert_eq!(
         status,
         GetAuthStatusResponse {
@@ -281,18 +350,18 @@ async fn get_auth_status_omits_token_after_permanent_refresh_failure() -> Result
         .await;
 
     let refresh_url = format!("{}/oauth/token", server.uri());
-    let mut mcp = McpProcess::new_with_env(
-        codex_home.path(),
-        &[
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .with_env_overrides(&[
             ("OPENAI_API_KEY", None),
             (
                 REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR,
                 Some(refresh_url.as_str()),
             ),
-        ],
-    )
-    .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+        ])
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_get_auth_status_request(GetAuthStatusParams {
@@ -301,12 +370,8 @@ async fn get_auth_status_omits_token_after_permanent_refresh_failure() -> Result
         })
         .await?;
 
-    let resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let status: GetAuthStatusResponse = to_response(resp)?;
+    let status: GetAuthStatusResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
     assert_eq!(
         status,
         GetAuthStatusResponse {
@@ -323,12 +388,8 @@ async fn get_auth_status_omits_token_after_permanent_refresh_failure() -> Result
         })
         .await?;
 
-    let second_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(second_request_id)),
-    )
-    .await??;
-    let second_status: GetAuthStatusResponse = to_response(second_resp)?;
+    let second_status: GetAuthStatusResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(second_request_id)).await??;
     assert_eq!(second_status, status);
 
     server.verify().await;
@@ -363,18 +424,18 @@ async fn get_auth_status_omits_token_after_proactive_refresh_failure() -> Result
         .await;
 
     let refresh_url = format!("{}/oauth/token", server.uri());
-    let mut mcp = McpProcess::new_with_env(
-        codex_home.path(),
-        &[
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .with_env_overrides(&[
             ("OPENAI_API_KEY", None),
             (
                 REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR,
                 Some(refresh_url.as_str()),
             ),
-        ],
-    )
-    .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+        ])
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_get_auth_status_request(GetAuthStatusParams {
@@ -383,12 +444,8 @@ async fn get_auth_status_omits_token_after_proactive_refresh_failure() -> Result
         })
         .await?;
 
-    let resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let status: GetAuthStatusResponse = to_response(resp)?;
+    let status: GetAuthStatusResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
     assert_eq!(
         status,
         GetAuthStatusResponse {
@@ -430,18 +487,18 @@ async fn get_auth_status_returns_token_after_proactive_refresh_recovery() -> Res
         .await;
 
     let refresh_url = format!("{}/oauth/token", server.uri());
-    let mut mcp = McpProcess::new_with_env(
-        codex_home.path(),
-        &[
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .with_env_overrides(&[
             ("OPENAI_API_KEY", None),
             (
                 REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR,
                 Some(refresh_url.as_str()),
             ),
-        ],
-    )
-    .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+        ])
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let failed_request_id = mcp
         .send_get_auth_status_request(GetAuthStatusParams {
@@ -450,12 +507,8 @@ async fn get_auth_status_returns_token_after_proactive_refresh_recovery() -> Res
         })
         .await?;
 
-    let failed_resp: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(failed_request_id)),
-    )
-    .await??;
-    let failed_status: GetAuthStatusResponse = to_response(failed_resp)?;
+    let failed_status: GetAuthStatusResponse =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(failed_request_id)).await??;
     assert_eq!(
         failed_status,
         GetAuthStatusResponse {
@@ -483,12 +536,11 @@ async fn get_auth_status_returns_token_after_proactive_refresh_recovery() -> Res
         })
         .await?;
 
-    let recovered_resp: JSONRPCResponse = timeout(
+    let recovered_status: GetAuthStatusResponse = timeout(
         DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(recovered_request_id)),
+        mcp.read_response(recovered_request_id),
     )
     .await??;
-    let recovered_status: GetAuthStatusResponse = to_response(recovered_resp)?;
     assert_eq!(
         recovered_status,
         GetAuthStatusResponse {
@@ -507,8 +559,11 @@ async fn login_api_key_rejected_when_forced_chatgpt() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml_forced_login(codex_home.path(), "chatgpt")?;
 
-    let mut mcp = McpProcess::new(codex_home.path()).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
 
     let request_id = mcp
         .send_login_account_api_key_request("sk-test-key")

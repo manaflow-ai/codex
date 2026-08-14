@@ -6,7 +6,26 @@ use pretty_assertions::assert_eq;
 use tokio::sync::mpsc::unbounded_channel;
 
 fn all_model_presets() -> Vec<ModelPreset> {
-    crate::legacy_core::test_support::all_model_presets().clone()
+    crate::test_support::TEST_MODEL_PRESETS.clone()
+}
+
+fn model_presets_with_test_upgrades() -> Vec<ModelPreset> {
+    let mut presets = all_model_presets();
+    for model in ["gpt-5.2", "gpt-5.4"] {
+        let preset = presets
+            .iter_mut()
+            .find(|preset| preset.model == model)
+            .unwrap_or_else(|| panic!("{model} preset present"));
+        preset.upgrade = Some(ModelUpgrade {
+            id: "gpt-5.5".to_string(),
+            migration_config_key: "hide_test_migration_prompt".to_string(),
+            model_link: None,
+            upgrade_copy: None,
+            migration_markdown: None,
+            retirement_at: None,
+        });
+    }
+    presets
 }
 
 fn model_availability_nux_config(shown_count: &[(&str, u32)]) -> ModelAvailabilityNuxConfig {
@@ -40,23 +59,15 @@ fn model_migration_copy_to_plain_text(copy: &crate::model_migration::ModelMigrat
 #[tokio::test]
 async fn model_migration_prompt_only_shows_for_deprecated_models() {
     let seen = BTreeMap::new();
+    let presets = model_presets_with_test_upgrades();
     assert!(should_show_model_migration_prompt(
-        "gpt-5.2",
-        "gpt-5.4",
-        &seen,
-        &all_model_presets()
+        "gpt-5.2", "gpt-5.5", &seen, &presets
     ));
     assert!(should_show_model_migration_prompt(
-        "gpt-5.3-codex",
-        "gpt-5.4",
-        &seen,
-        &all_model_presets()
+        "gpt-5.4", "gpt-5.5", &seen, &presets
     ));
     assert!(!should_show_model_migration_prompt(
-        "gpt-5.3-codex",
-        "gpt-5.3-codex",
-        &seen,
-        &all_model_presets()
+        "gpt-5.4", "gpt-5.4", &seen, &presets
     ));
 }
 
@@ -86,7 +97,7 @@ fn select_model_availability_nux_picks_only_eligible_model() {
 }
 
 #[test]
-fn select_model_availability_nux_skips_missing_and_exhausted_models() {
+fn select_model_availability_nux_does_not_fall_back_to_older_announcement() {
     let mut presets = all_model_presets();
     presets.iter_mut().for_each(|preset| {
         preset.availability_nux = None;
@@ -111,13 +122,7 @@ fn select_model_availability_nux_skips_missing_and_exhausted_models() {
         &model_availability_nux_config(&[("gpt-5.4", MODEL_AVAILABILITY_NUX_MAX_SHOW_COUNT)]),
     );
 
-    assert_eq!(
-        selected,
-        Some(StartupTooltipOverride {
-            model_slug: "gpt-5.4-mini".to_string(),
-            message: "gpt-5.4-mini is available".to_string(),
-        })
-    );
+    assert_eq!(selected, None);
 }
 
 #[test]
@@ -172,6 +177,46 @@ fn select_model_availability_nux_returns_none_when_all_models_are_exhausted() {
     );
 
     assert_eq!(selected, None);
+}
+
+#[tokio::test]
+async fn prepare_startup_tooltip_override_persists_model_availability_nux_count() {
+    let codex_home = tempdir().expect("temp codex home");
+    let mut config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .build()
+        .await
+        .expect("config");
+    let mut presets = all_model_presets();
+    presets.iter_mut().for_each(|preset| {
+        preset.availability_nux = None;
+    });
+    let target = presets
+        .iter_mut()
+        .find(|preset| preset.model == "gpt-5.4")
+        .expect("target preset present");
+    target.availability_nux = Some(ModelAvailabilityNux {
+        message: "gpt-5.4 is available".to_string(),
+    });
+
+    let tooltip =
+        prepare_startup_tooltip_override(&mut config, &presets, /*is_first_run*/ false).await;
+
+    assert_eq!(tooltip.as_deref(), Some("gpt-5.4 is available"));
+    assert_eq!(
+        config.model_availability_nux.shown_count,
+        HashMap::from([("gpt-5.4".to_string(), 1)])
+    );
+
+    let reloaded = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .build()
+        .await
+        .expect("reloaded config");
+    assert_eq!(
+        reloaded.model_availability_nux.shown_count,
+        HashMap::from([("gpt-5.4".to_string(), 1)])
+    );
 }
 
 #[tokio::test]
@@ -257,11 +302,11 @@ async fn model_migration_prompt_skips_when_target_missing_or_hidden() {
         .expect("preset present");
     current.upgrade = Some(ModelUpgrade {
         id: "missing-target".to_string(),
-        reasoning_effort_mapping: None,
         migration_config_key: HIDE_GPT5_1_MIGRATION_PROMPT_CONFIG.to_string(),
         model_link: None,
         upgrade_copy: None,
         migration_markdown: None,
+        retirement_at: None,
     });
     available.retain(|preset| preset.model != "gpt-5.2");
     available.push(current.clone());
@@ -300,16 +345,16 @@ async fn model_migration_prompt_shows_for_hidden_model() {
         .await
         .expect("config");
 
-    let mut available_models = all_model_presets();
+    let mut available_models = model_presets_with_test_upgrades();
     let current = available_models
         .iter_mut()
-        .find(|preset| preset.model == "gpt-5.3-codex")
-        .expect("gpt-5.3-codex preset present");
+        .find(|preset| preset.model == "gpt-5.2")
+        .expect("gpt-5.2 preset present");
     current.show_in_picker = false;
     let current = current.clone();
     assert!(
         !current.show_in_picker,
-        "expected gpt-5.3-codex to be hidden from picker for this test"
+        "expected gpt-5.2 to be hidden from picker for this test"
     );
 
     let upgrade = current.upgrade.as_ref().expect("upgrade configured");

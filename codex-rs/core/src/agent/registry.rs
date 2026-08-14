@@ -1,6 +1,7 @@
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
@@ -28,6 +29,7 @@ pub(crate) struct AgentRegistry {
 #[derive(Default)]
 struct ActiveAgents {
     agent_tree: HashMap<String, AgentMetadata>,
+    thread_paths: HashMap<ThreadId, String>,
     used_agent_nicknames: HashSet<String>,
     nickname_reset_count: usize,
 }
@@ -38,7 +40,6 @@ pub(crate) struct AgentMetadata {
     pub(crate) agent_path: Option<AgentPath>,
     pub(crate) agent_nickname: Option<String>,
     pub(crate) agent_role: Option<String>,
-    pub(crate) last_task_message: Option<String>,
 }
 
 fn format_agent_nickname(name: &str, nickname_reset_count: usize) -> String {
@@ -83,7 +84,9 @@ impl AgentRegistry {
     ) -> Result<SpawnReservation> {
         if let Some(max_threads) = max_threads {
             if !self.try_increment_spawned(max_threads) {
-                return Err(CodexErr::AgentLimitReached { max_threads });
+                return Err(CodexErr::new(CodexErrorDetails::AgentLimitReached {
+                    max_threads,
+                }));
             }
         } else {
             self.total_count.fetch_add(1, Ordering::AcqRel);
@@ -102,12 +105,9 @@ impl AgentRegistry {
                 .active_agents
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let removed_key = active_agents
-                .agent_tree
-                .iter()
-                .find_map(|(key, metadata)| (metadata.agent_id == Some(thread_id)).then_some(key))
-                .cloned();
-            removed_key
+            active_agents
+                .thread_paths
+                .remove(&thread_id)
                 .and_then(|key| active_agents.agent_tree.remove(key.as_str()))
                 .is_some_and(|metadata| {
                     !metadata.agent_path.as_ref().is_some_and(AgentPath::is_root)
@@ -123,14 +123,19 @@ impl AgentRegistry {
             .active_agents
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        active_agents
+        let root_path = AgentPath::ROOT.to_string();
+        let root_thread_id = active_agents
             .agent_tree
-            .entry(AgentPath::ROOT.to_string())
+            .entry(root_path.clone())
             .or_insert_with(|| AgentMetadata {
                 agent_id: Some(thread_id),
                 agent_path: Some(AgentPath::root()),
                 ..Default::default()
-            });
+            })
+            .agent_id;
+        if let Some(root_thread_id) = root_thread_id {
+            active_agents.thread_paths.insert(root_thread_id, root_path);
+        }
     }
 
     pub(crate) fn agent_id_for_path(&self, agent_path: &AgentPath) -> Option<ThreadId> {
@@ -143,12 +148,14 @@ impl AgentRegistry {
     }
 
     pub(crate) fn agent_metadata_for_thread(&self, thread_id: ThreadId) -> Option<AgentMetadata> {
-        self.active_agents
+        let active_agents = self
+            .active_agents
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .agent_tree
-            .values()
-            .find(|metadata| metadata.agent_id == Some(thread_id))
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        active_agents
+            .thread_paths
+            .get(&thread_id)
+            .and_then(|path| active_agents.agent_tree.get(path))
             .cloned()
     }
 
@@ -164,20 +171,6 @@ impl AgentRegistry {
             })
             .cloned()
             .collect()
-    }
-
-    pub(crate) fn update_last_task_message(&self, thread_id: ThreadId, last_task_message: String) {
-        let mut active_agents = self
-            .active_agents
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(metadata) = active_agents
-            .agent_tree
-            .values_mut()
-            .find(|metadata| metadata.agent_id == Some(thread_id))
-        {
-            metadata.last_task_message = Some(last_task_message);
-        }
     }
 
     fn register_spawned_thread(&self, agent_metadata: AgentMetadata) {
@@ -196,7 +189,17 @@ impl AgentRegistry {
         if let Some(agent_nickname) = agent_metadata.agent_nickname.clone() {
             active_agents.used_agent_nicknames.insert(agent_nickname);
         }
-        active_agents.agent_tree.insert(key, agent_metadata);
+        if let Some(previous_key) = active_agents.thread_paths.insert(thread_id, key.clone())
+            && previous_key != key
+        {
+            active_agents.agent_tree.remove(previous_key.as_str());
+        }
+        if let Some(previous_metadata) = active_agents.agent_tree.insert(key, agent_metadata)
+            && let Some(previous_thread_id) = previous_metadata.agent_id
+            && previous_thread_id != thread_id
+        {
+            active_agents.thread_paths.remove(&previous_thread_id);
+        }
     }
 
     fn reserve_agent_nickname(&self, names: &[&str], preferred: Option<&str>) -> Option<String> {

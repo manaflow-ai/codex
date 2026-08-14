@@ -2,41 +2,38 @@ use codex_protocol::items::HookPromptItem;
 use codex_protocol::items::parse_hook_prompt_fragment;
 use codex_protocol::models::ContentItem;
 
-use super::EnvironmentContext;
-use super::FragmentRegistration;
-use super::FragmentRegistrationProxy;
-use super::SkillInstructions;
+use super::AdditionalContextUserFragment;
+use super::ContextualUserFragment;
+use super::InternalModelContextFragment;
+use super::LegacyApplyPatchExecCommandWarning;
+use super::LegacyModelMismatchWarning;
+use super::LegacyUnifiedExecProcessLimitWarning;
+use super::RecommendedPluginsInstructions;
 use super::SubagentNotification;
 use super::TurnAborted;
 use super::UserInstructions;
 use super::UserShellCommand;
+use super::world_state::EnvironmentsState;
 
-static USER_INSTRUCTIONS_REGISTRATION: FragmentRegistrationProxy<UserInstructions> =
-    FragmentRegistrationProxy::new();
-static ENVIRONMENT_CONTEXT_REGISTRATION: FragmentRegistrationProxy<EnvironmentContext> =
-    FragmentRegistrationProxy::new();
-static SKILL_INSTRUCTIONS_REGISTRATION: FragmentRegistrationProxy<SkillInstructions> =
-    FragmentRegistrationProxy::new();
-static USER_SHELL_COMMAND_REGISTRATION: FragmentRegistrationProxy<UserShellCommand> =
-    FragmentRegistrationProxy::new();
-static TURN_ABORTED_REGISTRATION: FragmentRegistrationProxy<TurnAborted> =
-    FragmentRegistrationProxy::new();
-static SUBAGENT_NOTIFICATION_REGISTRATION: FragmentRegistrationProxy<SubagentNotification> =
-    FragmentRegistrationProxy::new();
-
-static CONTEXTUAL_USER_FRAGMENTS: &[&dyn FragmentRegistration] = &[
-    &USER_INSTRUCTIONS_REGISTRATION,
-    &ENVIRONMENT_CONTEXT_REGISTRATION,
-    &SKILL_INSTRUCTIONS_REGISTRATION,
-    &USER_SHELL_COMMAND_REGISTRATION,
-    &TURN_ABORTED_REGISTRATION,
-    &SUBAGENT_NOTIFICATION_REGISTRATION,
+const CONTEXTUAL_USER_FRAGMENT_MATCHERS: &[fn(&str) -> bool] = &[
+    UserInstructions::matches_text,
+    EnvironmentsState::matches_text,
+    AdditionalContextUserFragment::matches_text,
+    codex_skills_extension::is_skill_prompt_fragment,
+    UserShellCommand::matches_text,
+    TurnAborted::matches_text,
+    SubagentNotification::matches_text,
+    InternalModelContextFragment::matches_text,
+    RecommendedPluginsInstructions::matches_text,
+    LegacyUnifiedExecProcessLimitWarning::matches_text,
+    LegacyApplyPatchExecCommandWarning::matches_text,
+    LegacyModelMismatchWarning::matches_text,
 ];
 
 fn is_standard_contextual_user_text(text: &str) -> bool {
-    CONTEXTUAL_USER_FRAGMENTS
+    CONTEXTUAL_USER_FRAGMENT_MATCHERS
         .iter()
-        .any(|fragment| fragment.matches_text(text))
+        .any(|matches_text| matches_text(text))
 }
 
 pub(crate) fn is_contextual_user_fragment(content_item: &ContentItem) -> bool {
@@ -47,7 +44,7 @@ pub(crate) fn is_contextual_user_fragment(content_item: &ContentItem) -> bool {
 }
 
 pub(crate) fn parse_visible_hook_prompt_message(
-    id: Option<&String>,
+    id: Option<&str>,
     content: &[ContentItem],
 ) -> Option<HookPromptItem> {
     let mut fragments = Vec::new();

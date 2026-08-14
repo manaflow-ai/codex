@@ -1,7 +1,19 @@
 use codex_protocol::ThreadId;
+use codex_protocol::protocol::ThreadHistoryMode;
 
 /// Result type returned by thread-store operations.
 pub type ThreadStoreResult<T> = Result<T, ThreadStoreError>;
+
+pub(crate) fn reject_paginated_history_mode(
+    history_mode: ThreadHistoryMode,
+) -> ThreadStoreResult<()> {
+    if matches!(history_mode, ThreadHistoryMode::Paginated) {
+        return Err(ThreadStoreError::Unsupported {
+            operation: "paginated_threads",
+        });
+    }
+    Ok(())
+}
 
 /// Error type shared by thread-store implementations.
 #[derive(Debug, thiserror::Error)]
@@ -25,6 +37,13 @@ pub enum ThreadStoreError {
     Conflict {
         /// User-facing explanation of the conflict.
         message: String,
+    },
+
+    /// The store implementation does not support this operation yet.
+    #[error("thread-store unsupported operation: {operation}")]
+    Unsupported {
+        /// Stable operation name for callers that need to map unsupported operations.
+        operation: &'static str,
     },
 
     /// Catch-all for implementation failures that do not fit a more specific category.

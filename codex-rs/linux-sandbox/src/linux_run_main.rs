@@ -25,8 +25,13 @@ use crate::launcher::exec_bwrap;
 use crate::launcher::preferred_bwrap_supports_argv0;
 use crate::proxy_routing::activate_proxy_routes_in_netns;
 use crate::proxy_routing::prepare_host_proxy_route_spec;
+use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::protocol::FileSystemAccessMode;
+use codex_protocol::protocol::FileSystemPath;
+use codex_protocol::protocol::FileSystemSandboxEntry;
 use codex_protocol::protocol::FileSystemSandboxPolicy;
+use codex_protocol::protocol::FileSystemSpecialPath;
 use codex_protocol::protocol::NetworkSandboxPolicy;
 use codex_sandboxing::landlock::CODEX_LINUX_SANDBOX_ARG0;
 
@@ -162,7 +167,7 @@ pub fn run_main() -> ! {
     ensure_inner_stage_mode_is_valid(apply_seccomp_then_exec, use_legacy_landlock);
     let EffectivePermissions {
         permission_profile,
-        file_system_sandbox_policy,
+        mut file_system_sandbox_policy,
         network_sandbox_policy,
     } = resolve_permission_profile(permission_profile).unwrap_or_else(|err| panic!("{err}"));
     ensure_legacy_landlock_mode_supports_policy(
@@ -193,7 +198,40 @@ pub fn run_main() -> ! {
         ) {
             panic!("error applying Linux sandbox restrictions: {e:?}");
         }
-        exec_or_panic(command);
+
+        let signal_mask = ForwardedSignalMask::block();
+        let command_pid = unsafe { libc::fork() };
+        if command_pid < 0 {
+            let err = std::io::Error::last_os_error();
+            panic!("failed to fork sandboxed command: {err}");
+        }
+
+        if command_pid == 0 {
+            reset_forwarded_signal_handlers_to_default();
+            signal_mask.restore();
+            exec_or_panic(command);
+        }
+
+        let signal_forwarders = install_bwrap_signal_forwarders(command_pid);
+        signal_mask.restore();
+        loop {
+            let mut status = 0;
+            let reaped_pid = unsafe { libc::waitpid(-1, &mut status, 0) };
+            if reaped_pid == command_pid {
+                let exit_signal_mask = ForwardedSignalMask::block();
+                signal_forwarders.restore();
+                exit_signal_mask.restore();
+                exit_with_wait_status(status);
+            }
+            if reaped_pid >= 0 {
+                continue;
+            }
+
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EINTR) {
+                panic!("failed to reap sandboxed child: {err}");
+            }
+        }
     }
 
     if file_system_sandbox_policy.has_full_disk_write_access() && !allow_network_for_proxy {
@@ -213,14 +251,17 @@ pub fn run_main() -> ! {
         // Outer stage: bubblewrap first, then re-enter this binary in the
         // sandboxed environment to apply seccomp. This path never falls back
         // to legacy Landlock on failure.
-        let proxy_route_spec =
-            if allow_network_for_proxy {
-                Some(prepare_host_proxy_route_spec().unwrap_or_else(|err| {
-                    panic!("failed to prepare host proxy routing bridge: {err}")
-                }))
-            } else {
-                None
-            };
+        let proxy_route_spec = if allow_network_for_proxy {
+            let (proxy_route_spec, socket_dir) = prepare_host_proxy_route_spec()
+                .unwrap_or_else(|err| panic!("failed to prepare host proxy routing bridge: {err}"));
+            file_system_sandbox_policy = file_system_sandbox_policy.with_additional_readable_roots(
+                &sandbox_policy_cwd,
+                std::slice::from_ref(&socket_dir),
+            );
+            Some(proxy_route_spec)
+        } else {
+            None
+        };
         let inner = build_inner_seccomp_command(InnerSeccompCommandArgs {
             sandbox_policy_cwd: &sandbox_policy_cwd,
             command_cwd: command_cwd.as_deref(),
@@ -327,12 +368,8 @@ fn run_bwrap_with_proc_fallback(
     let command_cwd = command_cwd.unwrap_or(sandbox_policy_cwd);
 
     if mount_proc
-        && !preflight_proc_mount_support(
-            sandbox_policy_cwd,
-            command_cwd,
-            file_system_sandbox_policy,
-            network_mode,
-        )
+        && !preflight_proc_mount_support(network_mode)
+            .unwrap_or_else(|err| exit_with_bwrap_build_error(err))
     {
         // Keep the retry silent so sandbox-internal diagnostics do not leak into the
         // child process stderr stream.
@@ -350,7 +387,8 @@ fn run_bwrap_with_proc_fallback(
         sandbox_policy_cwd,
         command_cwd,
         options,
-    );
+    )
+    .unwrap_or_else(|err| exit_with_bwrap_build_error(err));
     apply_inner_command_argv0(&mut bwrap_args.args);
     run_or_exec_bwrap(bwrap_args);
 }
@@ -374,24 +412,28 @@ fn build_bwrap_argv(
     sandbox_policy_cwd: &Path,
     command_cwd: &Path,
     options: BwrapOptions,
-) -> crate::bwrap::BwrapArgs {
+) -> CodexResult<crate::bwrap::BwrapArgs> {
     let bwrap_args = create_bwrap_command_args(
         inner,
         file_system_sandbox_policy,
         sandbox_policy_cwd,
         command_cwd,
         options,
-    )
-    .unwrap_or_else(|err| panic!("error building bubblewrap command: {err:?}"));
+    )?;
 
     let mut argv = vec!["bwrap".to_string()];
     argv.extend(bwrap_args.args);
-    crate::bwrap::BwrapArgs {
+    Ok(crate::bwrap::BwrapArgs {
         args: argv,
         preserved_files: bwrap_args.preserved_files,
         synthetic_mount_targets: bwrap_args.synthetic_mount_targets,
         protected_create_targets: bwrap_args.protected_create_targets,
-    }
+    })
+}
+
+fn exit_with_bwrap_build_error(err: codex_protocol::error::CodexErr) -> ! {
+    eprintln!("error building bubblewrap command: {err}");
+    std::process::exit(1);
 }
 
 fn apply_inner_command_argv0(argv: &mut Vec<String>) {
@@ -434,34 +476,29 @@ fn current_process_argv0() -> String {
     }
 }
 
-fn preflight_proc_mount_support(
-    sandbox_policy_cwd: &Path,
-    command_cwd: &Path,
-    file_system_sandbox_policy: &FileSystemSandboxPolicy,
-    network_mode: BwrapNetworkMode,
-) -> bool {
-    let preflight_argv = build_preflight_bwrap_argv(
-        sandbox_policy_cwd,
-        command_cwd,
-        file_system_sandbox_policy,
-        network_mode,
-    );
+fn preflight_proc_mount_support(network_mode: BwrapNetworkMode) -> CodexResult<bool> {
+    let preflight_argv = build_preflight_bwrap_argv(network_mode)?;
     let stderr = run_bwrap_in_child_capture_stderr(preflight_argv);
-    !is_proc_mount_failure(stderr.as_str())
+    Ok(!is_proc_mount_failure(stderr.as_str()))
 }
 
 fn build_preflight_bwrap_argv(
-    sandbox_policy_cwd: &Path,
-    command_cwd: &Path,
-    file_system_sandbox_policy: &FileSystemSandboxPolicy,
     network_mode: BwrapNetworkMode,
-) -> crate::bwrap::BwrapArgs {
+) -> CodexResult<crate::bwrap::BwrapArgs> {
+    let file_system_sandbox_policy =
+        FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
+            path: FileSystemPath::Special {
+                value: FileSystemSpecialPath::Minimal,
+            },
+            access: FileSystemAccessMode::Read,
+            missing_path_behavior: None,
+        }]);
     let preflight_command = vec![resolve_true_command()];
     build_bwrap_argv(
         preflight_command,
-        file_system_sandbox_policy,
-        sandbox_policy_cwd,
-        command_cwd,
+        &file_system_sandbox_policy,
+        Path::new("/"),
+        Path::new("/"),
         BwrapOptions {
             mount_proc: true,
             network_mode,
@@ -1235,7 +1272,10 @@ fn synthetic_mount_marker_dir(path: &Path) -> PathBuf {
 }
 
 fn synthetic_mount_registry_root() -> PathBuf {
-    std::env::temp_dir().join("codex-bwrap-synthetic-mount-targets")
+    let effective_uid = unsafe { libc::geteuid() };
+    std::env::temp_dir().join(format!(
+        "codex-bwrap-synthetic-mount-targets-{effective_uid}"
+    ))
 }
 
 fn hash_path(path: &Path) -> u64 {

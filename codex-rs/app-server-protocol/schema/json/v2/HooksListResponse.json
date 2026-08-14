@@ -25,9 +25,21 @@
         "preToolUse",
         "permissionRequest",
         "postToolUse",
+        "preCompact",
+        "postCompact",
         "sessionStart",
+        "sessionEnd",
         "userPromptSubmit",
+        "subagentStart",
+        "subagentStop",
         "stop"
+      ],
+      "type": "string"
+    },
+    "HookExecutionMode": {
+      "enum": [
+        "sync",
+        "async"
       ],
       "type": "string"
     },
@@ -41,11 +53,23 @@
     },
     "HookMetadata": {
       "properties": {
+        "additionalContextLimit": {
+          "description": "Configured `additionalContext` spill threshold. `null` uses 2,500 tokens; `0` disables spilling.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "command": {
           "type": [
             "string",
             "null"
           ]
+        },
+        "currentHash": {
+          "type": "string"
         },
         "displayOrder": {
           "format": "int64",
@@ -56,6 +80,14 @@
         },
         "eventName": {
           "$ref": "#/definitions/HookEventName"
+        },
+        "executionMode": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/HookExecutionMode"
+            }
+          ],
+          "default": "sync"
         },
         "handlerType": {
           "$ref": "#/definitions/HookHandlerType"
@@ -94,9 +126,13 @@
           "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
+        },
+        "trustStatus": {
+          "$ref": "#/definitions/HookTrustStatus"
         }
       },
       "required": [
+        "currentHash",
         "displayOrder",
         "enabled",
         "eventName",
@@ -105,7 +141,8 @@
         "key",
         "source",
         "sourcePath",
-        "timeoutSec"
+        "timeoutSec",
+        "trustStatus"
       ],
       "type": "object"
     },
@@ -118,9 +155,19 @@
         "sessionFlags",
         "plugin",
         "cloudRequirements",
+        "cloudManagedConfig",
         "legacyManagedConfigFile",
         "legacyManagedConfigMdm",
         "unknown"
+      ],
+      "type": "string"
+    },
+    "HookTrustStatus": {
+      "enum": [
+        "managed",
+        "untrusted",
+        "trusted",
+        "modified"
       ],
       "type": "string"
     },

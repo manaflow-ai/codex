@@ -1,73 +1,63 @@
-//! MCP tool metadata, filtering, schema shaping, and name qualification.
+//! MCP tool metadata, filtering, and name normalization.
 //!
 //! Raw MCP tool identities must be preserved for protocol calls, while
 //! model-visible tool names must be sanitized, deduplicated, and kept within API
 //! limits. This module owns that translation as well as the shared [`ToolInfo`]
-//! type and helpers that adjust tool schemas before exposing them to the model.
+//! type.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use codex_config::McpServerConfig;
 use codex_protocol::ToolName;
 use rmcp::model::Tool;
 use serde::Deserialize;
 use serde::Serialize;
-use serde_json::Map;
-use serde_json::Value as JsonValue;
 use sha1::Digest;
 use sha1::Sha1;
 use tracing::warn;
 
 use crate::mcp::sanitize_responses_api_tool_name;
 
-pub(crate) const MCP_TOOLS_CACHE_WRITE_DURATION_METRIC: &str =
-    "codex.mcp.tools.cache_write.duration_ms";
+const LEGACY_MCP_TOOL_NAME_PREFIX: &str = "mcp__";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolInfo {
     /// Raw MCP server name used for routing the tool call.
     pub server_name: String,
+    /// Whether calls routed to this server may run in parallel.
+    #[serde(default)]
+    pub supports_parallel_tool_calls: bool,
+    /// MCP server origin used for telemetry and diagnostics, when known.
+    #[serde(default)]
+    pub server_origin: Option<String>,
     /// Model-visible tool name used in Responses API tool declarations.
     #[serde(rename = "tool_name", alias = "callable_name")]
     pub callable_name: String,
     /// Model-visible namespace used for deferred tool loading.
     #[serde(rename = "tool_namespace", alias = "callable_namespace")]
     pub callable_namespace: String,
-    /// Instructions from the MCP server initialize result.
-    #[serde(default)]
-    pub server_instructions: Option<String>,
+    /// Model-visible namespace description.
+    // Keep the old serialized field name readable for cached ToolInfo values.
+    #[serde(default, alias = "connector_description")]
+    pub namespace_description: Option<String>,
     /// Raw MCP tool definition; `tool.name` is sent back to the MCP server.
     pub tool: Tool,
+    /// Optional provided-file fields accepted by each declared `openai/fileParams`
+    /// argument. This is derived from the raw MCP schema before file arguments are
+    /// masked as local paths for the model.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub openai_file_input_optional_fields: HashMap<String, Vec<String>>,
     pub connector_id: Option<String>,
     pub connector_name: Option<String>,
     #[serde(default)]
     pub plugin_display_names: Vec<String>,
-    pub connector_description: Option<String>,
 }
 
 impl ToolInfo {
     pub fn canonical_tool_name(&self) -> ToolName {
         ToolName::namespaced(self.callable_namespace.clone(), self.callable_name.clone())
     }
-}
-
-pub fn declared_openai_file_input_param_names(
-    meta: Option<&Map<String, JsonValue>>,
-) -> Vec<String> {
-    let Some(meta) = meta else {
-        return Vec::new();
-    };
-
-    meta.get(META_OPENAI_FILE_PARAMS)
-        .and_then(JsonValue::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(JsonValue::as_str)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .collect()
 }
 
 /// A tool is allowed to be used if both are true:
@@ -105,24 +95,6 @@ impl ToolFilter {
     }
 }
 
-/// Returns the model-visible view of a tool while preserving the raw metadata
-/// used by execution. Keep cache entries raw and call this at manager return
-/// boundaries.
-pub(crate) fn tool_with_model_visible_input_schema(tool: &Tool) -> Tool {
-    let file_params = declared_openai_file_input_param_names(tool.meta.as_deref());
-    if file_params.is_empty() {
-        return tool.clone();
-    }
-
-    let mut tool = tool.clone();
-    let mut input_schema = JsonValue::Object(tool.input_schema.as_ref().clone());
-    mask_input_schema_for_file_path_params(&mut input_schema, &file_params);
-    if let JsonValue::Object(input_schema) = input_schema {
-        tool.input_schema = Arc::new(input_schema);
-    }
-    tool
-}
-
 pub(crate) fn filter_tools(tools: Vec<ToolInfo>, filter: &ToolFilter) -> Vec<ToolInfo> {
     tools
         .into_iter()
@@ -130,12 +102,19 @@ pub(crate) fn filter_tools(tools: Vec<ToolInfo>, filter: &ToolFilter) -> Vec<Too
         .collect()
 }
 
-/// Returns a qualified-name lookup for MCP tools.
+/// Returns MCP tools with model-visible names normalized.
 ///
 /// Raw MCP server/tool names are kept on each [`ToolInfo`] for protocol calls, while
 /// `callable_namespace` / `callable_name` are sanitized and, when necessary, hashed so
-/// every model-visible `mcp__namespace__tool` name is unique and <= 64 bytes.
-pub(crate) fn qualify_tools<I>(tools: I) -> HashMap<String, ToolInfo>
+/// every model-visible name is unique and <= 64 bytes.
+///
+/// When `prefix_mcp_tool_names` is true, the historical `mcp__` namespace
+/// prefix is added except for tools from `non_prefixed_mcp_tool_servers`.
+pub(crate) fn normalize_tools_for_model_with_prefix<I>(
+    tools: I,
+    prefix_mcp_tool_names: bool,
+    non_prefixed_mcp_tool_servers: &[String],
+) -> Vec<ToolInfo>
 where
     I: IntoIterator<Item = ToolInfo>,
 {
@@ -157,8 +136,13 @@ where
             continue;
         }
 
+        let callable_namespace = callable_namespace_with_prefix(
+            &sanitize_responses_api_tool_name(&tool.callable_namespace),
+            prefix_mcp_tool_names && !non_prefixed_mcp_tool_servers.contains(&tool.server_name),
+        );
+
         candidates.push(CallableToolCandidate {
-            callable_namespace: sanitize_responses_api_tool_name(&tool.callable_namespace),
+            callable_namespace,
             callable_name: sanitize_responses_api_tool_name(&tool.callable_name),
             raw_namespace_identity,
             raw_tool_identity,
@@ -213,19 +197,20 @@ where
     candidates.sort_by(|left, right| left.raw_tool_identity.cmp(&right.raw_tool_identity));
 
     let mut used_names = HashSet::new();
-    let mut qualified_tools = HashMap::new();
+    let mut model_tools = Vec::new();
     for mut candidate in candidates {
-        let (callable_namespace, callable_name, qualified_name) = unique_callable_parts(
+        let (callable_namespace, callable_name) = unique_callable_parts(
             &candidate.callable_namespace,
             &candidate.callable_name,
             &candidate.raw_tool_identity,
             &mut used_names,
+            MCP_TOOL_NAME_DELIMITER.len(),
         );
         candidate.tool.callable_namespace = callable_namespace;
         candidate.tool.callable_name = callable_name;
-        qualified_tools.insert(qualified_name, candidate.tool);
+        model_tools.push(candidate.tool);
     }
-    qualified_tools
+    model_tools
 }
 
 #[derive(Debug)]
@@ -240,51 +225,11 @@ struct CallableToolCandidate {
 const MCP_TOOL_NAME_DELIMITER: &str = "__";
 const MAX_TOOL_NAME_LENGTH: usize = 64;
 const CALLABLE_NAME_HASH_LEN: usize = 12;
-const META_OPENAI_FILE_PARAMS: &str = "openai/fileParams";
-
-fn mask_input_schema_for_file_path_params(input_schema: &mut JsonValue, file_params: &[String]) {
-    let Some(properties) = input_schema
-        .as_object_mut()
-        .and_then(|schema| schema.get_mut("properties"))
-        .and_then(JsonValue::as_object_mut)
-    else {
-        return;
-    };
-
-    for field_name in file_params {
-        let Some(property_schema) = properties.get_mut(field_name) else {
-            continue;
-        };
-        mask_input_property_schema(property_schema);
-    }
-}
-
-fn mask_input_property_schema(schema: &mut JsonValue) {
-    let Some(object) = schema.as_object_mut() else {
-        return;
-    };
-
-    let mut description = object
-        .get("description")
-        .and_then(JsonValue::as_str)
-        .map(str::to_string)
-        .unwrap_or_default();
-    let guidance = "This parameter expects an absolute local file path. If you want to upload a file, provide the absolute path to that file here.";
-    if description.is_empty() {
-        description = guidance.to_string();
-    } else if !description.contains(guidance) {
-        description = format!("{description} {guidance}");
-    }
-
-    let is_array = object.get("type").and_then(JsonValue::as_str) == Some("array")
-        || object.get("items").is_some();
-    object.clear();
-    object.insert("description".to_string(), JsonValue::String(description));
-    if is_array {
-        object.insert("type".to_string(), JsonValue::String("array".to_string()));
-        object.insert("items".to_string(), serde_json::json!({ "type": "string" }));
+fn callable_namespace_with_prefix(namespace: &str, prefix_mcp_tool_names: bool) -> String {
+    if !prefix_mcp_tool_names || namespace.starts_with(LEGACY_MCP_TOOL_NAME_PREFIX) {
+        namespace.to_string()
     } else {
-        object.insert("type".to_string(), JsonValue::String("string".to_string()));
+        format!("{LEGACY_MCP_TOOL_NAME_PREFIX}{namespace}")
     }
 }
 
@@ -325,9 +270,10 @@ fn fit_callable_parts_with_hash(
     namespace: &str,
     tool_name: &str,
     raw_identity: &str,
+    reserved_len: usize,
 ) -> (String, String) {
     let suffix = callable_name_hash_suffix(raw_identity);
-    let max_tool_len = MAX_TOOL_NAME_LENGTH.saturating_sub(namespace.len());
+    let max_tool_len = MAX_TOOL_NAME_LENGTH.saturating_sub(namespace.len() + reserved_len);
     if max_tool_len >= suffix.len() {
         let prefix_len = max_tool_len - suffix.len();
         return (
@@ -336,7 +282,7 @@ fn fit_callable_parts_with_hash(
         );
     }
 
-    let max_namespace_len = MAX_TOOL_NAME_LENGTH - suffix.len();
+    let max_namespace_len = MAX_TOOL_NAME_LENGTH.saturating_sub(suffix.len() + reserved_len);
     (truncate_name(namespace, max_namespace_len), suffix)
 }
 
@@ -345,10 +291,11 @@ fn unique_callable_parts(
     tool_name: &str,
     raw_identity: &str,
     used_names: &mut HashSet<String>,
-) -> (String, String, String) {
-    let qualified_name = format!("{namespace}{tool_name}");
-    if qualified_name.len() <= MAX_TOOL_NAME_LENGTH && used_names.insert(qualified_name.clone()) {
-        return (namespace.to_string(), tool_name.to_string(), qualified_name);
+    reserved_len: usize,
+) -> (String, String) {
+    let model_name = format!("{namespace}{tool_name}");
+    if model_name.len() + reserved_len <= MAX_TOOL_NAME_LENGTH && used_names.insert(model_name) {
+        return (namespace.to_string(), tool_name.to_string());
     }
 
     let mut attempt = 0_u32;
@@ -359,10 +306,10 @@ fn unique_callable_parts(
             format!("{raw_identity}\0{attempt}")
         };
         let (namespace, tool_name) =
-            fit_callable_parts_with_hash(namespace, tool_name, &hash_input);
-        let qualified_name = format!("{namespace}{tool_name}");
-        if used_names.insert(qualified_name.clone()) {
-            return (namespace, tool_name, qualified_name);
+            fit_callable_parts_with_hash(namespace, tool_name, &hash_input, reserved_len);
+        let model_name = format!("{namespace}{tool_name}");
+        if used_names.insert(model_name) {
+            return (namespace, tool_name);
         }
         attempt = attempt.saturating_add(1);
     }

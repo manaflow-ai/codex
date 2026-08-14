@@ -1,6 +1,7 @@
 use anyhow::Result;
+use codex_core::TurnInputRequest;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::Op;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::ByteRange;
 use codex_protocol::user_input::TextElement;
 use codex_protocol::user_input::UserInput;
@@ -13,49 +14,10 @@ use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
-use core_test_support::test_codex::TestCodex;
-use core_test_support::test_codex::TestCodexBuilder;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
-use tempfile::TempDir;
-use wiremock::MockServer;
-
-async fn resume_until_initial_messages(
-    builder: &mut TestCodexBuilder,
-    server: &MockServer,
-    home: Arc<TempDir>,
-    rollout_path: PathBuf,
-    predicate: impl Fn(&[EventMsg]) -> bool,
-) -> Result<TestCodex> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    let poll_interval = Duration::from_millis(10);
-    let mut last_initial_messages = "<missing initial messages>".to_string();
-
-    loop {
-        let resumed = builder
-            .resume(server, Arc::clone(&home), rollout_path.clone())
-            .await?;
-        if let Some(initial_messages) = resumed.session_configured.initial_messages.as_ref() {
-            if predicate(initial_messages) {
-                return Ok(resumed);
-            }
-            last_initial_messages = format!("{initial_messages:#?}");
-        }
-
-        if tokio::time::Instant::now() >= deadline {
-            panic!(
-                "timed out waiting for rollout resume messages to stabilize: {last_initial_messages}"
-            );
-        }
-
-        drop(resumed);
-        tokio::time::sleep(poll_interval).await;
-    }
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resume_includes_initial_messages_from_rollout_events() -> Result<()> {
@@ -65,12 +27,6 @@ async fn resume_includes_initial_messages_from_rollout_events() -> Result<()> {
     let mut builder = test_codex();
     let initial = builder.build(&server).await?;
     let codex = Arc::clone(&initial.codex);
-    let home = initial.home.clone();
-    let rollout_path = initial
-        .session_configured
-        .rollout_path
-        .clone()
-        .expect("rollout path");
 
     let initial_sse = sse(vec![
         ev_response_created("resp-initial"),
@@ -85,39 +41,14 @@ async fn resume_includes_initial_messages_from_rollout_events() -> Result<()> {
     )];
 
     codex
-        .submit(Op::UserInput {
-            environments: None,
-            items: vec![UserInput::Text {
-                text: "Record some messages".into(),
-                text_elements: text_elements.clone(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Record some messages".into(),
+            text_elements: text_elements.clone(),
+        }]))
         .await?;
 
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
-
-    let resumed = resume_until_initial_messages(
-        &mut builder,
-        &server,
-        home,
-        rollout_path,
-        |initial_messages| {
-            matches!(
-                initial_messages,
-                [
-                    EventMsg::TurnStarted(_),
-                    EventMsg::UserMessage(_),
-                    EventMsg::TokenCount(_),
-                    EventMsg::AgentMessage(_),
-                    EventMsg::TokenCount(_),
-                    EventMsg::TurnComplete(_),
-                ]
-            )
-        },
-    )
-    .await?;
+    let resumed = builder.restart(&server, &initial).await?;
     let initial_messages = resumed
         .session_configured
         .initial_messages
@@ -126,7 +57,6 @@ async fn resume_includes_initial_messages_from_rollout_events() -> Result<()> {
         [
             EventMsg::TurnStarted(started),
             EventMsg::UserMessage(first_user),
-            EventMsg::TokenCount(_),
             EventMsg::AgentMessage(assistant_message),
             EventMsg::TokenCount(_),
             EventMsg::TurnComplete(completed),
@@ -156,12 +86,6 @@ async fn resume_includes_initial_messages_from_reasoning_events() -> Result<()> 
     });
     let initial = builder.build(&server).await?;
     let codex = Arc::clone(&initial.codex);
-    let home = initial.home.clone();
-    let rollout_path = initial
-        .session_configured
-        .rollout_path
-        .clone()
-        .expect("rollout path");
 
     let initial_sse = sse(vec![
         ev_response_created("resp-initial"),
@@ -172,41 +96,14 @@ async fn resume_includes_initial_messages_from_reasoning_events() -> Result<()> 
     mount_sse_once(&server, initial_sse).await;
 
     codex
-        .submit(Op::UserInput {
-            environments: None,
-            items: vec![UserInput::Text {
-                text: "Record reasoning messages".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Record reasoning messages".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
 
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
-
-    let resumed = resume_until_initial_messages(
-        &mut builder,
-        &server,
-        home,
-        rollout_path,
-        |initial_messages| {
-            matches!(
-                initial_messages,
-                [
-                    EventMsg::TurnStarted(_),
-                    EventMsg::UserMessage(_),
-                    EventMsg::TokenCount(_),
-                    EventMsg::AgentReasoning(_),
-                    EventMsg::AgentReasoningRawContent(_),
-                    EventMsg::AgentMessage(_),
-                    EventMsg::TokenCount(_),
-                    EventMsg::TurnComplete(_),
-                ]
-            )
-        },
-    )
-    .await?;
+    let resumed = builder.restart(&server, &initial).await?;
     let initial_messages = resumed
         .session_configured
         .initial_messages
@@ -215,7 +112,6 @@ async fn resume_includes_initial_messages_from_reasoning_events() -> Result<()> 
         [
             EventMsg::TurnStarted(started),
             EventMsg::UserMessage(first_user),
-            EventMsg::TokenCount(_),
             EventMsg::AgentReasoning(reasoning),
             EventMsg::AgentReasoningRawContent(raw),
             EventMsg::AgentMessage(assistant_message),
@@ -248,12 +144,6 @@ async fn resume_switches_models_preserves_base_instructions() -> Result<()> {
     });
     let initial = builder.build(&server).await?;
     let codex = Arc::clone(&initial.codex);
-    let home = initial.home.clone();
-    let rollout_path = initial
-        .session_configured
-        .rollout_path
-        .clone()
-        .expect("rollout path");
 
     let initial_sse = sse(vec![
         ev_response_created("resp-initial"),
@@ -263,18 +153,12 @@ async fn resume_switches_models_preserves_base_instructions() -> Result<()> {
     let initial_mock = mount_sse_once(&server, initial_sse).await;
 
     codex
-        .submit(Op::UserInput {
-            environments: None,
-            items: vec![UserInput::Text {
-                text: "Record initial instructions".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Record initial instructions".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
-
     let initial_body = initial_mock.single_request().body_json();
     let initial_instructions = initial_body
         .get("instructions")
@@ -300,20 +184,15 @@ async fn resume_switches_models_preserves_base_instructions() -> Result<()> {
     .await;
 
     let mut resume_builder = test_codex().with_config(|config| {
-        config.model = Some("gpt-5.3-codex".to_string());
+        config.model = Some("gpt-5.4".to_string());
     });
-    let resumed = resume_builder.resume(&server, home, rollout_path).await?;
+    let resumed = resume_builder.restart(&server, &initial).await?;
     resumed
         .codex
-        .submit(Op::UserInput {
-            environments: None,
-            items: vec![UserInput::Text {
-                text: "Resume with different model".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Resume with different model".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&resumed.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
@@ -322,15 +201,10 @@ async fn resume_switches_models_preserves_base_instructions() -> Result<()> {
 
     resumed
         .codex
-        .submit(Op::UserInput {
-            environments: None,
-            items: vec![UserInput::Text {
-                text: "Second turn after resume".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Second turn after resume".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&resumed.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
@@ -377,12 +251,6 @@ async fn resume_model_switch_is_not_duplicated_after_pre_turn_override() -> Resu
     });
     let initial = builder.build(&server).await?;
     let codex = Arc::clone(&initial.codex);
-    let home = initial.home.clone();
-    let rollout_path = initial
-        .session_configured
-        .rollout_path
-        .clone()
-        .expect("rollout path");
 
     let initial_mock = mount_sse_once(
         &server,
@@ -394,15 +262,10 @@ async fn resume_model_switch_is_not_duplicated_after_pre_turn_override() -> Resu
     )
     .await;
     codex
-        .submit(Op::UserInput {
-            environments: None,
-            items: vec![UserInput::Text {
-                text: "Record initial instructions".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Record initial instructions".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
     let _ = initial_mock.single_request();
@@ -418,37 +281,23 @@ async fn resume_model_switch_is_not_duplicated_after_pre_turn_override() -> Resu
     .await;
 
     let mut resume_builder = test_codex().with_config(|config| {
-        config.model = Some("gpt-5.3-codex".to_string());
+        config.model = Some("gpt-5.5".to_string());
     });
-    let resumed = resume_builder.resume(&server, home, rollout_path).await?;
-    resumed
-        .codex
-        .submit(Op::OverrideTurnContext {
-            cwd: None,
-            approval_policy: None,
-            approvals_reviewer: None,
-            sandbox_policy: None,
-            permission_profile: None,
-            windows_sandbox_level: None,
+    let resumed = resume_builder.restart(&server, &initial).await?;
+    core_test_support::submit_thread_settings(
+        &resumed.codex,
+        ThreadSettingsOverrides {
             model: Some("gpt-5.4".to_string()),
-            effort: None,
-            summary: None,
-            service_tier: None,
-            collaboration_mode: None,
-            personality: None,
-        })
-        .await?;
+            ..Default::default()
+        },
+    )
+    .await?;
     resumed
         .codex
-        .submit(Op::UserInput {
-            environments: None,
-            items: vec![UserInput::Text {
-                text: "first turn after override".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "first turn after override".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&resumed.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))

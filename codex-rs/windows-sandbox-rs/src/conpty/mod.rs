@@ -11,16 +11,21 @@ use crate::proc_thread_attr::ProcThreadAttributeList;
 use crate::winutil::format_last_error;
 use crate::winutil::quote_windows_arg;
 use crate::winutil::to_wide;
+use anyhow::Context;
 use anyhow::Result;
+use codex_utils_pty::JobObject;
+use codex_utils_pty::PsuedoCon;
 use codex_utils_pty::RawConPty;
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::IntoRawHandle;
 use std::path::Path;
+use std::sync::Arc;
 use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-use windows_sys::Win32::System::Console::ClosePseudoConsole;
 use windows_sys::Win32::System::Threading::CREATE_UNICODE_ENVIRONMENT;
 use windows_sys::Win32::System::Threading::CreateProcessAsUserW;
 use windows_sys::Win32::System::Threading::EXTENDED_STARTUPINFO_PRESENT;
@@ -32,10 +37,11 @@ use crate::process::make_env_block;
 
 /// Owns a ConPTY handle and its backing pipe handles.
 pub struct ConptyInstance {
-    pub hpc: HANDLE,
-    pub input_write: HANDLE,
-    pub output_read: HANDLE,
-    desktop: Option<LaunchDesktop>,
+    pseudoconsole: Option<PsuedoCon>,
+    input_write: HANDLE,
+    output_read: HANDLE,
+    job: Option<Arc<JobObject>>,
+    _desktop: Option<LaunchDesktop>,
 }
 
 impl Drop for ConptyInstance {
@@ -47,19 +53,29 @@ impl Drop for ConptyInstance {
             if self.output_read != 0 && self.output_read != INVALID_HANDLE_VALUE {
                 CloseHandle(self.output_read);
             }
-            if self.hpc != 0 && self.hpc != INVALID_HANDLE_VALUE {
-                ClosePseudoConsole(self.hpc);
-            }
         }
+        let _ = self.pseudoconsole.take();
     }
 }
 
 impl ConptyInstance {
-    /// Consume the instance and return raw handles without closing them.
-    pub fn into_raw(self) -> (HANDLE, HANDLE, HANDLE, Option<LaunchDesktop>) {
-        let me = std::mem::ManuallyDrop::new(self);
-        let desktop = unsafe { std::ptr::read(&me.desktop) };
-        (me.hpc, me.input_write, me.output_read, desktop)
+    pub fn raw_handle(&self) -> Option<HANDLE> {
+        self.pseudoconsole
+            .as_ref()
+            .map(|pseudoconsole| pseudoconsole.raw_handle() as HANDLE)
+    }
+
+    pub fn take_input_write(&mut self) -> HANDLE {
+        std::mem::replace(&mut self.input_write, 0)
+    }
+
+    pub fn take_output_read(&mut self) -> HANDLE {
+        std::mem::replace(&mut self.output_read, 0)
+    }
+
+    /// Returns the Job Object containing the spawned process, if this instance owns one.
+    pub fn job(&self) -> Option<Arc<JobObject>> {
+        self.job.as_ref().map(Arc::clone)
     }
 }
 
@@ -70,13 +86,14 @@ impl ConptyInstance {
 #[allow(dead_code)]
 pub fn create_conpty(cols: i16, rows: i16) -> Result<ConptyInstance> {
     let raw = RawConPty::new(cols, rows)?;
-    let (hpc, input_write, output_read) = raw.into_raw_handles();
+    let (pseudoconsole, input_write, output_read) = raw.into_handles();
 
     Ok(ConptyInstance {
-        hpc: hpc as HANDLE,
-        input_write: input_write as HANDLE,
-        output_read: output_read as HANDLE,
-        desktop: None,
+        pseudoconsole: Some(pseudoconsole),
+        input_write: input_write.into_raw_handle() as HANDLE,
+        output_read: output_read.into_raw_handle() as HANDLE,
+        job: None,
+        _desktop: None,
     })
 }
 
@@ -107,17 +124,21 @@ pub fn spawn_conpty_process_as_user(
     si.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
     let desktop = LaunchDesktop::prepare(use_private_desktop, logs_base_dir)?;
     si.StartupInfo.lpDesktop = desktop.startup_info_desktop();
+    let job = Arc::new(JobObject::create().context("create process job")?);
 
     let raw = RawConPty::new(/*cols*/ 80, /*rows*/ 24)?;
-    let (hpc, input_write, output_read) = raw.into_raw_handles();
+    let (pseudoconsole, input_write, output_read) = raw.into_handles();
+    let hpc = pseudoconsole.raw_handle() as HANDLE;
     let conpty = ConptyInstance {
-        hpc: hpc as HANDLE,
-        input_write: input_write as HANDLE,
-        output_read: output_read as HANDLE,
-        desktop: Some(desktop),
+        pseudoconsole: Some(pseudoconsole),
+        input_write: input_write.into_raw_handle() as HANDLE,
+        output_read: output_read.into_raw_handle() as HANDLE,
+        job: Some(Arc::clone(&job)),
+        _desktop: Some(desktop),
     };
-    let mut attrs = ProcThreadAttributeList::new(/*attr_count*/ 1)?;
-    attrs.set_pseudoconsole(conpty.hpc)?;
+    let mut attrs = ProcThreadAttributeList::new(/*attr_count*/ 2)?;
+    attrs.set_pseudoconsole(hpc)?;
+    attrs.set_job(job.as_raw_handle() as HANDLE)?;
     si.lpAttributeList = attrs.as_mut_ptr();
 
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
@@ -138,14 +159,15 @@ pub fn spawn_conpty_process_as_user(
     };
     if ok == 0 {
         let err = unsafe { GetLastError() } as i32;
-        return Err(anyhow::anyhow!(
+        let message = format!(
             "CreateProcessAsUserW failed: {} ({}) | cwd={} | cmd={} | env_u16_len={}",
             err,
             format_last_error(err),
             cwd.display(),
             cmdline_str,
             env_block.len()
-        ));
+        );
+        return Err(std::io::Error::from_raw_os_error(err)).context(message);
     }
     Ok((pi, conpty))
 }

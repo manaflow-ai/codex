@@ -11,6 +11,81 @@ fn make_vars(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
 }
 
 #[test]
+fn inject_permission_profile_env_overrides_policy_value() {
+    let mut env = HashMap::from([(
+        CODEX_PERMISSION_PROFILE_ENV_VAR.to_string(),
+        "stale-profile".to_string(),
+    )]);
+
+    inject_permission_profile_env(
+        &mut env,
+        Some(&ActivePermissionProfile::new("current-profile")),
+    );
+
+    assert_eq!(
+        env.get(CODEX_PERMISSION_PROFILE_ENV_VAR)
+            .map(String::as_str),
+        Some("current-profile")
+    );
+}
+
+#[test]
+fn inject_permission_profile_env_removes_stale_value_without_active_profile() {
+    let mut env = HashMap::from([(
+        CODEX_PERMISSION_PROFILE_ENV_VAR.to_string(),
+        "stale-profile".to_string(),
+    )]);
+
+    inject_permission_profile_env(&mut env, /*active_permission_profile*/ None);
+
+    assert_eq!(env.get(CODEX_PERMISSION_PROFILE_ENV_VAR), None);
+}
+
+#[test]
+fn inject_apply_patch_env_follows_preserve_line_endings_feature() {
+    let mut env = HashMap::from([(
+        CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS_ENV_VAR.to_ascii_lowercase(),
+        "stale".to_string(),
+    )]);
+    let mut features = Features::with_defaults();
+
+    inject_apply_patch_env(&mut env, &features);
+    assert_eq!(env, HashMap::new());
+
+    features.enable(Feature::ApplyPatchPreserveLineEndings);
+    inject_apply_patch_env(&mut env, &features);
+    assert_eq!(
+        env,
+        HashMap::from([(
+            CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS_ENV_VAR.to_string(),
+            "1".to_string(),
+        )])
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn inject_permission_profile_env_replaces_differently_cased_windows_key() {
+    let mut env = HashMap::from([(
+        "codex_permission_profile".to_string(),
+        "stale-profile".to_string(),
+    )]);
+
+    inject_permission_profile_env(
+        &mut env,
+        Some(&ActivePermissionProfile::new("current-profile")),
+    );
+
+    assert_eq!(
+        env,
+        HashMap::from([(
+            CODEX_PERMISSION_PROFILE_ENV_VAR.to_string(),
+            "current-profile".to_string(),
+        )])
+    );
+}
+
+#[test]
 fn test_core_inherit_defaults_keep_sensitive_vars() {
     let vars = make_vars(&[
         ("PATH", "/usr/bin"),

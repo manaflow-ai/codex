@@ -8,21 +8,16 @@ pub(super) use super::*;
 pub(super) use crate::app_command::AppCommand as Op;
 pub(super) use crate::app_event::AppEvent;
 pub(super) use crate::app_event::ExitMode;
-#[cfg(not(target_os = "linux"))]
-pub(super) use crate::app_event::RealtimeAudioDeviceKind;
 pub(super) use crate::app_event_sender::AppEventSender;
 pub(super) use crate::approval_events::ApplyPatchApprovalRequestEvent;
 pub(super) use crate::approval_events::ExecApprovalRequestEvent;
 pub(super) use crate::bottom_pane::LocalImageAttachment;
 pub(super) use crate::bottom_pane::MentionBinding;
 pub(super) use crate::bottom_pane::QueuedInputAction;
-pub(super) use crate::chatwidget::realtime::RealtimeConversationPhase;
 pub(super) use crate::diff_model::FileChange;
 pub(super) use crate::history_cell::UserHistoryCell;
 pub(super) use crate::legacy_core::config::Config;
 pub(super) use crate::legacy_core::config::ConfigBuilder;
-pub(super) use crate::legacy_core::config::Constrained;
-pub(super) use crate::legacy_core::config::ConstraintError;
 pub(super) use crate::model_catalog::ModelCatalog;
 pub(super) use crate::test_backend::VT100Backend;
 pub(super) use crate::test_support::PathBufExt;
@@ -82,6 +77,7 @@ pub(super) use codex_app_server_protocol::MarketplaceUpgradeResponse;
 pub(super) use codex_app_server_protocol::McpServerStartupState;
 pub(super) use codex_app_server_protocol::McpServerStatusDetail;
 pub(super) use codex_app_server_protocol::McpServerStatusUpdatedNotification;
+pub(super) use codex_app_server_protocol::ModelSafetyBufferingUpdatedNotification;
 pub(super) use codex_app_server_protocol::ModelVerification as AppServerModelVerification;
 pub(super) use codex_app_server_protocol::ModelVerificationNotification;
 pub(super) use codex_app_server_protocol::NonSteerableTurnKind;
@@ -103,11 +99,10 @@ pub(super) use codex_app_server_protocol::RateLimitWindow;
 pub(super) use codex_app_server_protocol::ReasoningSummaryTextDeltaNotification;
 pub(super) use codex_app_server_protocol::ReviewTarget;
 pub(super) use codex_app_server_protocol::ServerNotification;
+pub(super) use codex_app_server_protocol::SkillMetadata;
 pub(super) use codex_app_server_protocol::SkillSummary;
 pub(super) use codex_app_server_protocol::ThreadClosedNotification;
 pub(super) use codex_app_server_protocol::ThreadItem as AppServerThreadItem;
-pub(super) use codex_app_server_protocol::ThreadRealtimeClosedNotification;
-pub(super) use codex_app_server_protocol::ThreadRealtimeErrorNotification;
 pub(super) use codex_app_server_protocol::ToolRequestUserInputOption;
 pub(super) use codex_app_server_protocol::ToolRequestUserInputParams;
 pub(super) use codex_app_server_protocol::ToolRequestUserInputQuestion;
@@ -119,21 +114,19 @@ pub(super) use codex_app_server_protocol::TurnStatus as AppServerTurnStatus;
 pub(super) use codex_app_server_protocol::UserInput;
 pub(super) use codex_app_server_protocol::UserInput as AppServerUserInput;
 pub(super) use codex_app_server_protocol::WarningNotification;
-pub(super) use codex_config::AppRequirementToml;
-pub(super) use codex_config::AppsRequirementsToml;
 pub(super) use codex_config::ConfigLayerStack;
-pub(super) use codex_config::ConfigRequirements;
-pub(super) use codex_config::ConfigRequirementsToml;
+pub(super) use codex_config::Constrained;
+pub(super) use codex_config::ConstraintError;
 pub(super) use codex_config::RequirementSource;
 pub(super) use codex_config::types::ApprovalsReviewer;
 pub(super) use codex_config::types::Notifications;
-#[cfg(target_os = "windows")]
 pub(super) use codex_config::types::WindowsSandboxModeToml;
 pub(super) use codex_core_plugins::OPENAI_CURATED_MARKETPLACE_NAME;
-pub(super) use codex_core_skills::model::SkillMetadata;
 pub(super) use codex_features::FEATURES;
 pub(super) use codex_features::Feature;
 pub(super) use codex_git_utils::CommitLogEntry;
+pub(super) use codex_models_manager::test_support::construct_model_info_offline_for_tests;
+pub(super) use codex_models_manager::test_support::get_model_offline_for_tests;
 pub(super) use codex_otel::RuntimeMetricsSummary;
 pub(super) use codex_otel::SessionTelemetry;
 pub(super) use codex_protocol::ThreadId;
@@ -148,8 +141,10 @@ pub(super) use codex_protocol::approvals::GuardianUserAuthorization;
 pub(super) use codex_protocol::config_types::CollaborationMode;
 pub(super) use codex_protocol::config_types::ModeKind;
 pub(super) use codex_protocol::config_types::Personality;
+pub(super) use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 pub(super) use codex_protocol::config_types::ServiceTier;
-pub(super) use codex_protocol::config_types::Settings;
+pub(super) use codex_protocol::models::ActivePermissionProfile;
+pub(super) use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
 pub(super) use codex_protocol::models::FileSystemPermissions;
 pub(super) use codex_protocol::models::MessagePhase;
 pub(super) use codex_protocol::models::NetworkPermissions;
@@ -170,6 +165,7 @@ pub(super) use codex_terminal_detection::TerminalInfo;
 pub(super) use codex_terminal_detection::TerminalName;
 pub(super) use codex_utils_absolute_path::AbsolutePathBuf;
 pub(super) use codex_utils_approval_presets::builtin_approval_presets;
+pub(super) use codex_utils_path_uri::LegacyAppPathString;
 pub(super) use crossterm::event::KeyCode;
 pub(super) use crossterm::event::KeyEvent;
 pub(super) use crossterm::event::KeyModifiers;
@@ -177,9 +173,7 @@ pub(super) use insta::assert_snapshot;
 pub(super) use serde_json::json;
 #[cfg(target_os = "windows")]
 pub(super) use serial_test::serial;
-pub(super) use std::collections::BTreeMap;
 pub(super) use std::collections::HashMap;
-pub(super) use std::collections::HashSet;
 pub(super) use std::path::PathBuf;
 pub(super) use tempfile::NamedTempFile;
 pub(super) use tempfile::tempdir;
@@ -221,17 +215,38 @@ macro_rules! assert_chatwidget_snapshot {
     }};
 }
 
+fn next_goal_draft(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+    expected_thread_id: ThreadId,
+) -> crate::goal_files::GoalDraft {
+    loop {
+        let event = rx.try_recv().expect("expected goal draft event");
+        if let AppEvent::SetThreadGoalDraft {
+            thread_id, draft, ..
+        } = event
+        {
+            assert_eq!(thread_id, expected_thread_id);
+            return draft;
+        }
+    }
+}
+
 mod app_server;
 mod approval_requests;
 mod composer_submission;
+#[path = "tests/config_errors_tests.rs"]
+mod config_errors;
 mod exec_flow;
 mod goal_menu;
+mod goal_validation;
 mod guardian;
-mod helpers;
+pub(crate) mod helpers;
 mod history_replay;
 mod mcp_startup;
 mod permissions;
 mod plan_mode;
+#[path = "tests/plugin_catalog_tests.rs"]
+mod plugin_catalog;
 mod popups_and_settings;
 mod review_mode;
 mod side;
@@ -240,6 +255,7 @@ mod status_and_layout;
 mod status_command_tests;
 mod status_surface_previews;
 mod terminal_title;
+mod usage;
 
 pub(crate) use helpers::make_chatwidget_manual_with_sender;
 pub(crate) use helpers::set_chatgpt_auth;

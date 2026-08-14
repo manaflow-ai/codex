@@ -1,29 +1,37 @@
+use crate::error_subtype::http_status_sub_error_type;
+use crate::plugin_bundle_archive::PluginBundleUnpackError;
+use crate::plugin_bundle_archive::unpack_plugin_bundle_tar_gz;
+use crate::remote::REMOTE_GLOBAL_MARKETPLACE_NAME;
+use crate::remote::RemotePluginServiceConfig;
 use crate::store::PluginInstallResult;
 use crate::store::PluginStore;
 use crate::store::PluginStoreError;
+use crate::store::error_context_sub_error_type;
 use crate::store::validate_plugin_version_segment;
-use codex_login::default_client::build_reqwest_client;
+use codex_http_client::HttpResponse;
+use codex_http_client::RouteAwareRequestError;
 use codex_plugin::PluginId;
 use codex_plugin::PluginIdError;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_plugins::AGENT_PLUGIN_MANIFEST_RELATIVE_PATH;
+use codex_utils_plugins::AgentPluginSchemaStatus;
+use codex_utils_plugins::agent_plugin_schema_status;
 use codex_utils_plugins::find_plugin_manifest_path;
-use flate2::read::GzDecoder;
-use reqwest::Response;
-use reqwest::StatusCode;
+use http::Method;
+use http::StatusCode;
+use serde_json::Value as JsonValue;
 use std::fs;
 use std::io;
-use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
-use tar::Archive;
 use url::Host;
 use url::Url;
 
 const REMOTE_PLUGIN_BUNDLE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
-const REMOTE_PLUGIN_BUNDLE_MAX_DOWNLOAD_BYTES: u64 = 50 * 1024 * 1024;
+const REMOTE_PLUGIN_BUNDLE_MAX_DOWNLOAD_BYTES: u64 = 100 * 1024 * 1024;
 const REMOTE_PLUGIN_BUNDLE_ERROR_BODY_MAX_BYTES: u64 = 8 * 1024;
-const REMOTE_PLUGIN_BUNDLE_MAX_EXTRACTED_BYTES: u64 = 250 * 1024 * 1024;
+const REMOTE_PLUGIN_BUNDLE_MAX_EXTRACTED_BYTES: u64 = 512 * 1024 * 1024;
 const REMOTE_PLUGIN_INSTALL_STAGING_DIR: &str = "plugins/.remote-plugin-install-staging";
 #[cfg(debug_assertions)]
 const TEST_ALLOW_LOOPBACK_HTTP_REMOTE_PLUGIN_BUNDLES_ENV: &str =
@@ -33,6 +41,8 @@ const TEST_ALLOW_LOOPBACK_HTTP_REMOTE_PLUGIN_BUNDLES_ENV: &str =
 pub struct ValidatedRemotePluginBundle {
     pub plugin_id: PluginId,
     pub plugin_version: String,
+    remote_plugin_id: String,
+    app_manifest: Option<JsonValue>,
     bundle_download_url: String,
 }
 
@@ -83,7 +93,7 @@ pub enum RemotePluginBundleInstallError {
     DownloadRequest {
         url: String,
         #[source]
-        source: reqwest::Error,
+        source: RouteAwareRequestError,
     },
 
     #[error("remote plugin bundle download from {url} failed with status {status}: {body}")]
@@ -97,7 +107,7 @@ pub enum RemotePluginBundleInstallError {
     DownloadBody {
         url: String,
         #[source]
-        source: reqwest::Error,
+        source: codex_http_client::HttpError,
     },
 
     #[error("remote plugin bundle download from {url} exceeded maximum size of {max_bytes} bytes")]
@@ -129,6 +139,28 @@ impl RemotePluginBundleInstallError {
     fn io(context: &'static str, source: io::Error) -> Self {
         Self::Io { context, source }
     }
+
+    pub fn sub_error_type(&self) -> Option<String> {
+        match self {
+            Self::Io { context, .. } => Some(error_context_sub_error_type(context)),
+            Self::Store(err) => err.sub_error_type(),
+            Self::DownloadStatus { status, .. } => {
+                Some(http_status_sub_error_type(*status).to_string())
+            }
+            Self::MissingReleaseVersion { .. }
+            | Self::InvalidReleaseVersion { .. }
+            | Self::MissingBundleDownloadUrl { .. }
+            | Self::InvalidBundleDownloadUrl { .. }
+            | Self::UnsupportedBundleDownloadUrlScheme { .. }
+            | Self::InvalidPluginId { .. }
+            | Self::DownloadRequest { .. }
+            | Self::DownloadBody { .. }
+            | Self::DownloadTooLarge { .. }
+            | Self::UnsupportedBundleDownloadFinalUrl { .. }
+            | Self::ExtractedBundleTooLarge { .. }
+            | Self::InvalidBundle(_) => None,
+        }
+    }
 }
 
 pub fn validate_remote_plugin_bundle(
@@ -137,6 +169,7 @@ pub fn validate_remote_plugin_bundle(
     plugin_name: &str,
     release_version: Option<&str>,
     bundle_download_url: Option<&str>,
+    app_manifest: Option<JsonValue>,
 ) -> Result<ValidatedRemotePluginBundle, RemotePluginBundleInstallError> {
     let plugin_id = PluginId::new(plugin_name.to_string(), remote_marketplace_name.to_string())
         .map_err(|source| RemotePluginBundleInstallError::InvalidPluginId {
@@ -187,6 +220,8 @@ pub fn validate_remote_plugin_bundle(
     Ok(ValidatedRemotePluginBundle {
         plugin_id,
         plugin_version,
+        remote_plugin_id: remote_plugin_id.to_string(),
+        app_manifest,
         bundle_download_url,
     })
 }
@@ -220,10 +255,12 @@ fn is_loopback_url(url: &Url) -> bool {
 }
 
 pub async fn download_and_install_remote_plugin_bundle(
+    config: &RemotePluginServiceConfig,
     codex_home: PathBuf,
     bundle: ValidatedRemotePluginBundle,
 ) -> Result<PluginInstallResult, RemotePluginBundleInstallError> {
     let bundle_bytes = download_remote_plugin_bundle_with_limit(
+        config,
         &bundle.bundle_download_url,
         /*max_bytes*/ REMOTE_PLUGIN_BUNDLE_MAX_DOWNLOAD_BYTES,
     )
@@ -239,13 +276,35 @@ pub async fn download_and_install_remote_plugin_bundle(
     })?
 }
 
+pub(crate) async fn download_and_extract_remote_plugin_bundle_to_path(
+    config: &RemotePluginServiceConfig,
+    bundle: ValidatedRemotePluginBundle,
+    destination: AbsolutePathBuf,
+) -> Result<AbsolutePathBuf, RemotePluginBundleInstallError> {
+    let bundle_bytes = download_remote_plugin_bundle_with_limit(
+        config,
+        &bundle.bundle_download_url,
+        /*max_bytes*/ REMOTE_PLUGIN_BUNDLE_MAX_DOWNLOAD_BYTES,
+    )
+    .await?;
+    tokio::task::spawn_blocking(move || {
+        extract_remote_plugin_bundle_to_path(bundle, bundle_bytes, destination)
+    })
+    .await
+    .map_err(|err| {
+        RemotePluginBundleInstallError::InvalidBundle(format!(
+            "failed to join remote plugin bundle extraction task: {err}"
+        ))
+    })?
+}
+
 async fn download_remote_plugin_bundle_with_limit(
+    config: &RemotePluginServiceConfig,
     bundle_download_url: &str,
     max_bytes: u64,
 ) -> Result<Vec<u8>, RemotePluginBundleInstallError> {
-    let client = build_reqwest_client();
-    let response = client
-        .get(bundle_download_url)
+    let response = config
+        .http_request(Method::GET, bundle_download_url)
         .timeout(REMOTE_PLUGIN_BUNDLE_DOWNLOAD_TIMEOUT)
         .send()
         .await
@@ -255,8 +314,8 @@ async fn download_remote_plugin_bundle_with_limit(
         })?;
 
     let final_url = response.url().clone();
-    // reqwest may already have followed redirects here. For backend-issued bundle URLs, keep the
-    // shared client policy and fail unsupported final schemes before caching.
+    // The shared client has already followed redirects here. Reject an unsupported final scheme
+    // before caching a backend-issued bundle.
     if !is_allowed_bundle_download_url(&final_url, allow_test_loopback_http_bundle_downloads()) {
         return Err(
             RemotePluginBundleInstallError::UnsupportedBundleDownloadFinalUrl {
@@ -269,13 +328,37 @@ async fn download_remote_plugin_bundle_with_limit(
     let url = final_url.to_string();
     let status = response.status();
     if !status.is_success() {
-        let body = read_response_body_with_limit(
-            response,
-            &url,
-            /*max_bytes*/ REMOTE_PLUGIN_BUNDLE_ERROR_BODY_MAX_BYTES,
-        )
-        .await?;
-        let body = String::from_utf8_lossy(&body).to_string();
+        let mut response = response;
+        let mut body = Vec::new();
+        let mut body_truncated = false;
+        let mut body_read_error = None;
+        loop {
+            let chunk = match response.chunk().await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                Err(source) => {
+                    body_read_error = Some(source);
+                    break;
+                }
+            };
+            let remaining = REMOTE_PLUGIN_BUNDLE_ERROR_BODY_MAX_BYTES as usize - body.len();
+            if chunk.len() > remaining {
+                body.extend_from_slice(&chunk[..remaining]);
+                body_truncated = true;
+                break;
+            }
+            body.extend_from_slice(&chunk);
+        }
+
+        let mut body = String::from_utf8_lossy(&body).into_owned();
+        if body_truncated {
+            body.push_str(&format!(
+                "\n[response body truncated after {REMOTE_PLUGIN_BUNDLE_ERROR_BODY_MAX_BYTES} bytes]"
+            ));
+        }
+        if let Some(source) = body_read_error {
+            body.push_str(&format!("\n[failed to read response body: {source}]"));
+        }
         return Err(RemotePluginBundleInstallError::DownloadStatus { url, status, body });
     }
 
@@ -283,7 +366,7 @@ async fn download_remote_plugin_bundle_with_limit(
 }
 
 async fn read_response_body_with_limit(
-    mut response: Response,
+    mut response: HttpResponse,
     url: &str,
     max_bytes: u64,
 ) -> Result<Vec<u8>, RemotePluginBundleInstallError> {
@@ -347,6 +430,7 @@ fn install_remote_plugin_bundle(
 
     extract_plugin_bundle_tar_gz(&bundle_bytes, extract_dir.path())?;
     let plugin_root = find_extracted_plugin_root(extract_dir.path())?;
+    prepare_extracted_remote_plugin_root(&plugin_root, &bundle)?;
     let plugin_root = AbsolutePathBuf::try_from(plugin_root).map_err(|err| {
         RemotePluginBundleInstallError::InvalidBundle(format!(
             "failed to resolve extracted remote plugin bundle root: {err}"
@@ -354,9 +438,158 @@ fn install_remote_plugin_bundle(
     })?;
 
     let store = PluginStore::try_new(codex_home)?;
-    store
+    let remote_plugin_id = bundle.remote_plugin_id;
+    let result = store
         .install_with_version(plugin_root, bundle.plugin_id, bundle.plugin_version)
-        .map_err(RemotePluginBundleInstallError::from)
+        .map_err(RemotePluginBundleInstallError::from)?;
+    store.write_remote_plugin_id(&result.plugin_id, &remote_plugin_id)?;
+    Ok(result)
+}
+
+fn extract_remote_plugin_bundle_to_path(
+    bundle: ValidatedRemotePluginBundle,
+    bundle_bytes: Vec<u8>,
+    destination: AbsolutePathBuf,
+) -> Result<AbsolutePathBuf, RemotePluginBundleInstallError> {
+    if destination.as_path().exists() {
+        return Err(RemotePluginBundleInstallError::InvalidBundle(format!(
+            "plugin checkout destination already exists: {}",
+            destination.display()
+        )));
+    }
+
+    let parent = destination.as_path().parent().ok_or_else(|| {
+        RemotePluginBundleInstallError::InvalidBundle(format!(
+            "plugin checkout destination has no parent: {}",
+            destination.display()
+        ))
+    })?;
+    fs::create_dir_all(parent).map_err(|source| {
+        RemotePluginBundleInstallError::io("failed to create plugin checkout directory", source)
+    })?;
+
+    let extract_dir = tempfile::Builder::new()
+        .prefix("remote-plugin-checkout-")
+        .tempdir_in(parent)
+        .map_err(|source| {
+            RemotePluginBundleInstallError::io(
+                "failed to create remote plugin bundle extraction directory",
+                source,
+            )
+        })?;
+
+    extract_plugin_bundle_tar_gz(&bundle_bytes, extract_dir.path())?;
+    let plugin_root = find_extracted_plugin_root(extract_dir.path())?;
+    let manifest = crate::manifest::load_plugin_manifest(&plugin_root).ok_or_else(|| {
+        RemotePluginBundleInstallError::InvalidBundle(
+            "remote plugin bundle did not contain a valid plugin.json".to_string(),
+        )
+    })?;
+    if manifest.name != bundle.plugin_id.plugin_name {
+        return Err(RemotePluginBundleInstallError::InvalidBundle(format!(
+            "plugin.json name `{}` does not match remote plugin name `{}`",
+            manifest.name, bundle.plugin_id.plugin_name
+        )));
+    }
+
+    let staged_path = extract_dir.keep();
+    fs::rename(&staged_path, destination.as_path()).map_err(|source| {
+        RemotePluginBundleInstallError::io(
+            "failed to activate checked out plugin directory",
+            source,
+        )
+    })?;
+
+    Ok(destination)
+}
+
+fn prepare_extracted_remote_plugin_root(
+    plugin_root: &Path,
+    bundle: &ValidatedRemotePluginBundle,
+) -> Result<(), RemotePluginBundleInstallError> {
+    if bundle.plugin_id.marketplace_name != REMOTE_GLOBAL_MARKETPLACE_NAME {
+        return Ok(());
+    }
+
+    overwrite_plugin_manifest_version(plugin_root, &bundle.plugin_version)?;
+    if let Some(app_manifest) = &bundle.app_manifest {
+        overwrite_plugin_app_manifest(plugin_root, app_manifest)?;
+    }
+    Ok(())
+}
+
+fn overwrite_plugin_manifest_version(
+    plugin_root: &Path,
+    plugin_version: &str,
+) -> Result<(), RemotePluginBundleInstallError> {
+    let manifest_path = find_plugin_manifest_path(plugin_root).ok_or_else(|| {
+        RemotePluginBundleInstallError::InvalidBundle(
+            "remote plugin bundle did not contain a valid plugin.json".to_string(),
+        )
+    })?;
+    let contents = fs::read_to_string(&manifest_path).map_err(|source| {
+        RemotePluginBundleInstallError::io("failed to read remote plugin manifest", source)
+    })?;
+    if manifest_path == plugin_root.join(AGENT_PLUGIN_MANIFEST_RELATIVE_PATH)
+        && agent_plugin_schema_status(&contents) == AgentPluginSchemaStatus::Supported
+    {
+        return Ok(());
+    }
+    let mut manifest: JsonValue = serde_json::from_str(&contents).map_err(|err| {
+        RemotePluginBundleInstallError::InvalidBundle(format!(
+            "failed to parse remote plugin manifest: {err}"
+        ))
+    })?;
+    let Some(manifest_object) = manifest.as_object_mut() else {
+        return Err(RemotePluginBundleInstallError::InvalidBundle(
+            "remote plugin manifest must be a JSON object".to_string(),
+        ));
+    };
+    manifest_object.insert(
+        "version".to_string(),
+        JsonValue::String(plugin_version.to_string()),
+    );
+    write_json_file(
+        &manifest_path,
+        &manifest,
+        "failed to write remote plugin manifest",
+    )
+}
+
+fn overwrite_plugin_app_manifest(
+    plugin_root: &Path,
+    app_manifest: &JsonValue,
+) -> Result<(), RemotePluginBundleInstallError> {
+    let app_manifest_path = crate::manifest::load_plugin_manifest(plugin_root)
+        .and_then(|manifest| manifest.paths.apps.map(|path| path.to_path_buf()))
+        .unwrap_or_else(|| plugin_root.join(".app.json"));
+    write_json_file(
+        &app_manifest_path,
+        app_manifest,
+        "failed to write remote plugin app manifest",
+    )
+}
+
+fn write_json_file(
+    path: &Path,
+    value: &JsonValue,
+    context: &'static str,
+) -> Result<(), RemotePluginBundleInstallError> {
+    let parent = path.parent().ok_or_else(|| {
+        RemotePluginBundleInstallError::InvalidBundle(format!(
+            "remote plugin output path has no parent: {}",
+            path.display()
+        ))
+    })?;
+    fs::create_dir_all(parent)
+        .map_err(|source| RemotePluginBundleInstallError::io(context, source))?;
+    let mut contents = serde_json::to_vec_pretty(value).map_err(|err| {
+        RemotePluginBundleInstallError::InvalidBundle(format!(
+            "failed to serialize remote plugin JSON override: {err}"
+        ))
+    })?;
+    contents.push(b'\n');
+    fs::write(path, contents).map_err(|source| RemotePluginBundleInstallError::io(context, source))
 }
 
 fn extract_plugin_bundle_tar_gz(
@@ -375,146 +608,17 @@ fn extract_plugin_bundle_tar_gz_with_limits(
     destination: &Path,
     max_total_bytes: u64,
 ) -> Result<(), RemotePluginBundleInstallError> {
-    fs::create_dir_all(destination).map_err(|source| {
-        RemotePluginBundleInstallError::io(
-            "failed to create remote plugin bundle extraction directory",
-            source,
-        )
-    })?;
-
-    let archive = GzDecoder::new(std::io::Cursor::new(bytes));
-    let mut archive = Archive::new(archive);
-    extract_plugin_bundle_tar(&mut archive, destination, max_total_bytes)
-}
-
-fn extract_plugin_bundle_tar<R: Read>(
-    archive: &mut Archive<R>,
-    destination: &Path,
-    max_total_bytes: u64,
-) -> Result<(), RemotePluginBundleInstallError> {
-    let mut extracted_bytes = 0u64;
-    let entries = archive.entries().map_err(|source| {
-        RemotePluginBundleInstallError::io("failed to read remote plugin bundle tar", source)
-    })?;
-    let entries = entries.raw(true);
-    for entry in entries {
-        let mut entry = entry.map_err(|source| {
-            RemotePluginBundleInstallError::io(
-                "failed to read remote plugin bundle tar entry",
-                source,
-            )
-        })?;
-        let entry_type = entry.header().entry_type();
-        let entry_size = entry.size();
-        let entry_path = entry.path().map_err(|source| {
-            RemotePluginBundleInstallError::io(
-                "failed to read remote plugin bundle tar entry path",
-                source,
-            )
-        })?;
-        let entry_path = entry_path.into_owned();
-        let output_path = checked_tar_output_path(destination, &entry_path)?;
-
-        if entry_type.is_dir() {
-            fs::create_dir_all(&output_path).map_err(|source| {
-                RemotePluginBundleInstallError::io(
-                    "failed to create remote plugin bundle directory",
-                    source,
-                )
-            })?;
-            continue;
+    unpack_plugin_bundle_tar_gz(bytes, destination, max_total_bytes).map_err(|err| match err {
+        PluginBundleUnpackError::ExtractedBundleTooLarge { bytes, max_bytes } => {
+            RemotePluginBundleInstallError::ExtractedBundleTooLarge { bytes, max_bytes }
         }
-
-        if entry_type.is_file() {
-            enforce_total_extracted_size(entry_size, &mut extracted_bytes, max_total_bytes)?;
-            let Some(parent) = output_path.parent() else {
-                return Err(RemotePluginBundleInstallError::InvalidBundle(format!(
-                    "remote plugin bundle output path has no parent: {}",
-                    output_path.display()
-                )));
-            };
-            fs::create_dir_all(parent).map_err(|source| {
-                RemotePluginBundleInstallError::io(
-                    "failed to create remote plugin bundle directory",
-                    source,
-                )
-            })?;
-            entry.unpack(&output_path).map_err(|source| {
-                RemotePluginBundleInstallError::io(
-                    "failed to unpack remote plugin bundle entry",
-                    source,
-                )
-            })?;
-            continue;
+        PluginBundleUnpackError::Io { context, source } => {
+            RemotePluginBundleInstallError::io(context, source)
         }
-
-        if entry_type.is_hard_link() || entry_type.is_symlink() {
-            return Err(RemotePluginBundleInstallError::InvalidBundle(format!(
-                "remote plugin bundle tar entry `{}` is a link",
-                entry_path.display()
-            )));
+        PluginBundleUnpackError::InvalidBundle(message) => {
+            RemotePluginBundleInstallError::InvalidBundle(message)
         }
-
-        return Err(RemotePluginBundleInstallError::InvalidBundle(format!(
-            "remote plugin bundle tar entry `{}` has unsupported type {:?}",
-            entry_path.display(),
-            entry_type
-        )));
-    }
-
-    Ok(())
-}
-
-fn checked_tar_output_path(
-    destination: &Path,
-    entry_name: &Path,
-) -> Result<PathBuf, RemotePluginBundleInstallError> {
-    let mut output_path = destination.to_path_buf();
-    let mut has_component = false;
-    for component in entry_name.components() {
-        match component {
-            std::path::Component::Normal(component) => {
-                has_component = true;
-                output_path.push(component);
-            }
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir
-            | std::path::Component::RootDir
-            | std::path::Component::Prefix(_) => {
-                return Err(RemotePluginBundleInstallError::InvalidBundle(format!(
-                    "remote plugin bundle tar entry `{}` escapes extraction root",
-                    entry_name.display()
-                )));
-            }
-        }
-    }
-    if !has_component {
-        return Err(RemotePluginBundleInstallError::InvalidBundle(
-            "remote plugin bundle tar entry has an empty path".to_string(),
-        ));
-    }
-    Ok(output_path)
-}
-
-fn enforce_total_extracted_size(
-    entry_size: u64,
-    extracted_bytes: &mut u64,
-    max_total_bytes: u64,
-) -> Result<(), RemotePluginBundleInstallError> {
-    let next_total = extracted_bytes.checked_add(entry_size).ok_or(
-        RemotePluginBundleInstallError::ExtractedBundleTooLarge {
-            bytes: u64::MAX,
-            max_bytes: max_total_bytes,
-        },
-    )?;
-    if next_total > max_total_bytes {
-        return Err(RemotePluginBundleInstallError::ExtractedBundleTooLarge {
-            bytes: next_total,
-            max_bytes: max_total_bytes,
-        });
-    }
-    *extracted_bytes = next_total;
-    Ok(())
+    })
 }
 
 fn find_extracted_plugin_root(
@@ -536,26 +640,51 @@ fn is_standard_plugin_root(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::recorded_http_client_urls;
+    use crate::test_support::recording_remote_plugin_service_config;
     use flate2::Compression;
     use flate2::write::GzEncoder;
     use pretty_assertions::assert_eq;
+    use std::io::Write;
     use tempfile::tempdir;
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
 
     const REMOTE_PLUGIN_ID: &str = "plugins~Plugin_00000000000000000000000000000000";
+
+    #[test]
+    fn remote_version_normalization_preserves_portable_root_manifest() {
+        let temp_dir = tempdir().expect("tempdir");
+        let manifest_path = temp_dir.path().join("plugin.json");
+        let original = r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"portable","version":"release-2026-07"}"#;
+        fs::write(&manifest_path, original).expect("write portable manifest");
+
+        overwrite_plugin_manifest_version(temp_dir.path(), "1.2.3")
+            .expect("prepare portable remote plugin");
+
+        assert_eq!(
+            fs::read_to_string(manifest_path).expect("read portable manifest"),
+            original
+        );
+    }
 
     #[test]
     fn validate_remote_plugin_bundle_uses_detail_name_for_local_plugin_id() {
         let bundle = validate_remote_plugin_bundle(
             REMOTE_PLUGIN_ID,
-            "chatgpt-global",
+            "openai-curated-remote",
             "linear",
             Some("1.2.3"),
             Some("https://example.com/linear.tar.gz"),
+            /*app_manifest*/ None,
         )
         .expect("valid install plan");
 
         assert_eq!(bundle.plugin_id.plugin_name, "linear");
-        assert_eq!(bundle.plugin_id.marketplace_name, "chatgpt-global");
+        assert_eq!(bundle.plugin_id.marketplace_name, "openai-curated-remote");
         assert_eq!(bundle.plugin_version, "1.2.3");
         assert_eq!(
             bundle.bundle_download_url.as_str(),
@@ -567,10 +696,11 @@ mod tests {
     fn validate_remote_plugin_bundle_rejects_missing_release_version() {
         let err = validate_remote_plugin_bundle(
             REMOTE_PLUGIN_ID,
-            "chatgpt-global",
+            "openai-curated-remote",
             "linear",
             /*release_version*/ None,
             Some("https://example.com/linear.tar.gz"),
+            /*app_manifest*/ None,
         )
         .expect_err("missing release version should be rejected");
 
@@ -584,10 +714,11 @@ mod tests {
     fn validate_remote_plugin_bundle_rejects_invalid_release_version() {
         let err = validate_remote_plugin_bundle(
             REMOTE_PLUGIN_ID,
-            "chatgpt-global",
+            "openai-curated-remote",
             "linear",
             Some("../1.2.3"),
             Some("https://example.com/linear.tar.gz"),
+            /*app_manifest*/ None,
         )
         .expect_err("invalid release version should be rejected");
 
@@ -601,10 +732,11 @@ mod tests {
     fn validate_remote_plugin_bundle_rejects_missing_download_url() {
         let err = validate_remote_plugin_bundle(
             REMOTE_PLUGIN_ID,
-            "chatgpt-global",
+            "openai-curated-remote",
             "linear",
             Some("1.2.3"),
             /*bundle_download_url*/ None,
+            /*app_manifest*/ None,
         )
         .expect_err("missing bundle download URL should be rejected");
 
@@ -618,10 +750,11 @@ mod tests {
     fn validate_remote_plugin_bundle_rejects_unsupported_download_url_scheme() {
         let err = validate_remote_plugin_bundle(
             REMOTE_PLUGIN_ID,
-            "chatgpt-global",
+            "openai-curated-remote",
             "linear",
             Some("1.2.3"),
             Some("http://example.com/linear.tar.gz"),
+            /*app_manifest*/ None,
         )
         .expect_err("plain HTTP URLs should be rejected before cloud install");
 
@@ -646,6 +779,34 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn bundle_download_routes_the_backend_supplied_url() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/signed/plugin-bundle"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"bundle"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (config, selected_urls) =
+            recording_remote_plugin_service_config(format!("{}/backend-api", server.uri()));
+        let download_url = format!("{}/signed/plugin-bundle?sig=signed-token", server.uri());
+
+        let err =
+            download_remote_plugin_bundle_with_limit(&config, &download_url, /*max_bytes*/ 64)
+                .await
+                .expect_err("plain HTTP final URL should remain unsupported");
+
+        assert!(matches!(
+            err,
+            RemotePluginBundleInstallError::UnsupportedBundleDownloadFinalUrl { .. }
+        ));
+        assert_eq!(
+            recorded_http_client_urls(&selected_urls),
+            vec![download_url]
+        );
+    }
+
     #[test]
     fn install_rejects_invalid_tar_gz_bundle() {
         let codex_home = tempdir().expect("tempdir");
@@ -658,7 +819,7 @@ mod tests {
         )
         .expect_err("invalid tar.gz should be rejected");
 
-        assert!(format!("{err}").contains("failed to read remote plugin bundle tar"));
+        assert!(format!("{err}").contains("failed to read plugin bundle tar"));
     }
 
     #[test]
@@ -675,6 +836,115 @@ mod tests {
 
         assert!(
             format!("{err}").contains("did not contain a standard plugin root with plugin.json")
+        );
+    }
+
+    #[test]
+    fn install_persists_remote_plugin_install_metadata() {
+        let codex_home = tempdir().expect("tempdir");
+        let bundle = valid_remote_plugin_bundle();
+
+        let result = install_remote_plugin_bundle(
+            codex_home.path().to_path_buf(),
+            bundle,
+            tar_gz_bytes(&[(
+                ".codex-plugin/plugin.json",
+                br#"{"name":"linear","version":"1.2.3"}"#,
+                /*mode*/ 0o644,
+            )]),
+        )
+        .expect("install bundle");
+        let store = PluginStore::new(codex_home.path().to_path_buf());
+
+        assert_eq!(
+            store.remote_plugin_id(&result.plugin_id).unwrap(),
+            Some(REMOTE_PLUGIN_ID.to_string())
+        );
+        let metadata_path = store
+            .plugin_base_root(&result.plugin_id)
+            .join(".codex-remote-plugin-install.json");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                &std::fs::read_to_string(metadata_path.as_path())
+                    .expect("read remote plugin install metadata")
+            )
+            .expect("parse remote plugin install metadata"),
+            serde_json::json!({
+                "schema_version": 1,
+                "remote_plugin_id": REMOTE_PLUGIN_ID,
+            })
+        );
+    }
+
+    #[test]
+    fn install_preserves_non_global_bundle_manifest_metadata() {
+        let codex_home = tempdir().expect("tempdir");
+        let bundle = validate_remote_plugin_bundle(
+            REMOTE_PLUGIN_ID,
+            "workspace-shared-with-me",
+            "linear",
+            Some("backend-version"),
+            Some("https://example.com/linear.tar.gz"),
+            Some(serde_json::json!({
+                "apps": {
+                    "remote": {
+                        "id": "remote-app"
+                    }
+                }
+            })),
+        )
+        .expect("valid install plan");
+
+        let result = install_remote_plugin_bundle(
+            codex_home.path().to_path_buf(),
+            bundle,
+            tar_gz_bytes(&[
+                (
+                    ".codex-plugin/plugin.json",
+                    br#"{"name":"linear","version":"bundle-version"}"#,
+                    /*mode*/ 0o644,
+                ),
+                (
+                    ".app.json",
+                    br#"{"apps":{"bundled":{"id":"bundled-app"}}}"#,
+                    /*mode*/ 0o644,
+                ),
+            ]),
+        )
+        .expect("install bundle");
+
+        assert_eq!(result.plugin_version, "backend-version");
+        let installed_manifest: JsonValue = serde_json::from_str(
+            &std::fs::read_to_string(
+                result
+                    .installed_path
+                    .join(".codex-plugin/plugin.json")
+                    .as_path(),
+            )
+            .expect("read installed plugin manifest"),
+        )
+        .expect("parse installed plugin manifest");
+        assert_eq!(
+            installed_manifest,
+            serde_json::json!({
+                "name": "linear",
+                "version": "bundle-version",
+            })
+        );
+        let installed_app_manifest: JsonValue = serde_json::from_str(
+            &std::fs::read_to_string(result.installed_path.join(".app.json").as_path())
+                .expect("read installed app manifest"),
+        )
+        .expect("parse installed app manifest");
+        assert_eq!(
+            installed_app_manifest,
+            serde_json::json!({
+                "apps": {
+                    "bundled": {
+                        "id": "bundled-app",
+                    },
+                },
+            })
         );
     }
 
@@ -717,8 +987,11 @@ mod tests {
     #[test]
     fn extraction_rejects_tar_path_traversal() {
         let destination = tempdir().expect("tempdir");
-        let err = checked_tar_output_path(destination.path(), Path::new("../evil.txt"))
-            .expect_err("tar path traversal should be rejected");
+        let err = extract_plugin_bundle_tar_gz(
+            &tar_gz_bytes_with_raw_path("../evil.txt", b"evil", /*mode*/ 0o644),
+            destination.path(),
+        )
+        .expect_err("tar path traversal should be rejected");
 
         assert!(format!("{err}").contains("escapes extraction root"));
     }
@@ -743,20 +1016,20 @@ mod tests {
     }
 
     #[test]
-    fn extraction_rejects_pax_metadata_entries() {
+    fn extraction_supports_gnu_long_name_entries() {
         let destination = tempdir().expect("tempdir");
-        let err = extract_plugin_bundle_tar_gz(
-            &tar_gz_bytes_with_entry_type(
-                tar::EntryType::XHeader,
-                "PaxHeaders.0/linear",
-                b"18 path=linear\n",
-                /*mode*/ 0o644,
-            ),
+        let long_path = format!("{}/file.txt", ["segment"; 40].join("/"));
+
+        extract_plugin_bundle_tar_gz(
+            &tar_gz_bytes(&[(long_path.as_str(), b"long", /*mode*/ 0o644)]),
             destination.path(),
         )
-        .expect_err("pax metadata entries should be rejected");
+        .expect("extract bundle with GNU long name entry");
 
-        assert!(format!("{err}").contains("unsupported type"));
+        assert_eq!(
+            std::fs::read(destination.path().join(long_path)).expect("read extracted file"),
+            b"long"
+        );
     }
 
     #[cfg(unix)]
@@ -789,10 +1062,11 @@ mod tests {
     fn valid_remote_plugin_bundle() -> ValidatedRemotePluginBundle {
         validate_remote_plugin_bundle(
             REMOTE_PLUGIN_ID,
-            "chatgpt-global",
+            "openai-curated-remote",
             "linear",
             Some("1.2.3"),
             Some("https://example.com/linear.tar.gz"),
+            /*app_manifest*/ None,
         )
         .expect("valid install plan")
     }
@@ -806,16 +1080,25 @@ mod tests {
         finish_tar_gz(tar)
     }
 
-    fn tar_gz_bytes_with_entry_type(
-        entry_type: tar::EntryType,
-        path: &str,
-        contents: &[u8],
-        mode: u32,
-    ) -> Vec<u8> {
-        let encoder = GzEncoder::new(Vec::new(), Compression::default());
-        let mut tar = tar::Builder::new(encoder);
-        append_tar_entry(&mut tar, entry_type, path, contents, mode);
-        finish_tar_gz(tar)
+    fn tar_gz_bytes_with_raw_path(path: &str, contents: &[u8], mode: u32) -> Vec<u8> {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(contents.len() as u64);
+        header.set_mode(mode);
+        header.as_mut_bytes()[..path.len()].copy_from_slice(path.as_bytes());
+        header.set_cksum();
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder
+            .write_all(header.as_bytes())
+            .expect("write tar header");
+        encoder.write_all(contents).expect("write tar contents");
+        let padding = (512 - (contents.len() % 512)) % 512;
+        encoder
+            .write_all(&vec![0; padding])
+            .expect("write tar padding");
+        encoder.write_all(&[0; 1024]).expect("write tar terminator");
+        encoder.finish().expect("finish gzip")
     }
 
     fn append_tar_entry<W: std::io::Write>(

@@ -4,6 +4,6 @@ expression: terminal.backend()
 ---
 "                                                                                "
 "                                                                                "
-"› Check recently modified functions for compatibility                           "
+"› Ask a follow-up question                                                      "
 "                                                                                "
-"  gpt-5.5 default · … Side from main thread · main needs input · Esc to return  "
+"  Side from main thread · main needs input · ctrl + / to switch · ctrl + c to cl"

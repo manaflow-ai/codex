@@ -37,9 +37,15 @@ impl<T: HttpTransport> ModelsClient<T> {
         req.url = format!("{}{}client_version={client_version}", req.url, separator);
     }
 
+    pub fn request_url(provider: &Provider, client_version: &str) -> String {
+        let mut request = provider.build_request(Method::GET, Self::path());
+        Self::append_client_version_query(&mut request, client_version);
+        request.url
+    }
+
     pub async fn list_models(
         &self,
-        client_version: &str,
+        request_url: String,
         extra_headers: HeaderMap,
     ) -> Result<(Vec<ModelInfo>, Option<String>), ApiError> {
         let resp = self
@@ -49,8 +55,8 @@ impl<T: HttpTransport> ModelsClient<T> {
                 Self::path(),
                 extra_headers,
                 /*body*/ None,
-                |req| {
-                    Self::append_client_version_query(req, client_version);
+                move |req| {
+                    req.url.clone_from(&request_url);
                 },
             )
             .await?;
@@ -78,7 +84,6 @@ mod tests {
     use super::*;
     use crate::auth::AuthProvider;
     use crate::provider::RetryConfig;
-    use async_trait::async_trait;
     use codex_client::Request;
     use codex_client::Response;
     use codex_client::StreamResponse;
@@ -108,7 +113,6 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl HttpTransport for CapturingTransport {
         async fn execute(&self, req: Request) -> Result<Response, TransportError> {
             *self.last_request.lock().unwrap() = Some(req);
@@ -163,14 +167,12 @@ mod tests {
             etag: None,
         };
 
-        let client = ModelsClient::new(
-            transport.clone(),
-            provider("https://example.com/api/codex"),
-            Arc::new(DummyAuth),
-        );
+        let provider = provider("https://example.com/api/codex");
+        let request_url = ModelsClient::<CapturingTransport>::request_url(&provider, "0.99.0");
+        let client = ModelsClient::new(transport.clone(), provider, Arc::new(DummyAuth));
 
         let (models, _) = client
-            .list_models("0.99.0", HeaderMap::new())
+            .list_models(request_url, HeaderMap::new())
             .await
             .expect("request should succeed");
 
@@ -206,13 +208,10 @@ mod tests {
                     "supported_in_api": true,
                     "priority": 1,
                     "upgrade": null,
-                    "base_instructions": "base instructions",
-                    "supports_reasoning_summaries": false,
                     "support_verbosity": false,
                     "default_verbosity": null,
                     "apply_patch_tool_type": null,
                     "truncation_policy": {"mode": "bytes", "limit": 10_000},
-                    "supports_parallel_tool_calls": false,
                     "supports_image_detail_original": false,
                     "context_window": 272_000,
                     "experimental_supported_tools": [],
@@ -227,14 +226,12 @@ mod tests {
             etag: None,
         };
 
-        let client = ModelsClient::new(
-            transport,
-            provider("https://example.com/api/codex"),
-            Arc::new(DummyAuth),
-        );
+        let provider = provider("https://example.com/api/codex");
+        let request_url = ModelsClient::<CapturingTransport>::request_url(&provider, "0.99.0");
+        let client = ModelsClient::new(transport, provider, Arc::new(DummyAuth));
 
         let (models, _) = client
-            .list_models("0.99.0", HeaderMap::new())
+            .list_models(request_url, HeaderMap::new())
             .await
             .expect("request should succeed");
 
@@ -254,14 +251,12 @@ mod tests {
             etag: Some("\"abc\"".to_string()),
         };
 
-        let client = ModelsClient::new(
-            transport,
-            provider("https://example.com/api/codex"),
-            Arc::new(DummyAuth),
-        );
+        let provider = provider("https://example.com/api/codex");
+        let request_url = ModelsClient::<CapturingTransport>::request_url(&provider, "0.1.0");
+        let client = ModelsClient::new(transport, provider, Arc::new(DummyAuth));
 
         let (models, etag) = client
-            .list_models("0.1.0", HeaderMap::new())
+            .list_models(request_url, HeaderMap::new())
             .await
             .expect("request should succeed");
 

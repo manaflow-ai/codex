@@ -1,7 +1,11 @@
 use std::io;
 use std::sync::LazyLock;
 
-use crate::legacy_core::config::set_default_oss_provider;
+use crate::key_hint;
+use crate::key_hint::KeyBinding;
+use crate::key_hint::KeyBindingListExt;
+use codex_http_client::HttpClient;
+use codex_http_client::HttpClientBuilder;
 use codex_model_provider_info::DEFAULT_LMSTUDIO_PORT;
 use codex_model_provider_info::DEFAULT_OLLAMA_PORT;
 use codex_model_provider_info::LMSTUDIO_OSS_PROVIDER_ID;
@@ -10,6 +14,7 @@ use crossterm::event::Event;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
+use crossterm::event::KeyModifiers;
 use crossterm::event::{self};
 use crossterm::execute;
 use crossterm::terminal::EnterAlternateScreen;
@@ -19,9 +24,9 @@ use crossterm::terminal::enable_raw_mode;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
-use ratatui::layout::Alignment;
 use ratatui::layout::Constraint;
 use ratatui::layout::Direction;
+use ratatui::layout::HorizontalAlignment;
 use ratatui::layout::Layout;
 use ratatui::layout::Margin;
 use ratatui::layout::Rect;
@@ -76,6 +81,18 @@ static OSS_SELECT_OPTIONS: LazyLock<Vec<SelectOption>> = LazyLock::new(|| {
         },
     ]
 });
+
+// This startup wizard runs before the main TUI runtime keymap is available, so
+// it mirrors the built-in horizontal list defaults instead of reading config.
+// The shared matcher still covers raw C0 Ctrl-H/Ctrl-L terminal reports.
+const MOVE_LEFT_KEYS: [KeyBinding; 2] = [
+    key_hint::plain(KeyCode::Left),
+    key_hint::ctrl(KeyCode::Char('h')),
+];
+const MOVE_RIGHT_KEYS: [KeyBinding; 2] = [
+    key_hint::plain(KeyCode::Right),
+    key_hint::ctrl(KeyCode::Char('l')),
+];
 
 pub struct OssSelectionWidget<'a> {
     select_options: &'a Vec<SelectOption>,
@@ -178,29 +195,35 @@ impl OssSelectionWidget<'_> {
     }
 
     fn handle_select_key(&mut self, key_event: KeyEvent) {
-        match key_event.code {
-            KeyCode::Char('c')
-                if key_event
-                    .modifiers
-                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
-            {
+        match key_event {
+            KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) => {
                 self.send_decision("__CANCELLED__".to_string());
             }
-            KeyCode::Left => {
+            _ if MOVE_LEFT_KEYS.is_pressed(key_event) => {
                 self.selected_option = (self.selected_option + self.select_options.len() - 1)
                     % self.select_options.len();
             }
-            KeyCode::Right => {
+            _ if MOVE_RIGHT_KEYS.is_pressed(key_event) => {
                 self.selected_option = (self.selected_option + 1) % self.select_options.len();
             }
-            KeyCode::Enter => {
+            KeyEvent {
+                code: KeyCode::Enter,
+                ..
+            } => {
                 let opt = &self.select_options[self.selected_option];
                 self.send_decision(opt.provider_id.to_string());
             }
-            KeyCode::Esc => {
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } => {
                 self.send_decision(LMSTUDIO_OSS_PROVIDER_ID.to_string());
             }
-            other => {
+            KeyEvent { code, .. } => {
+                let other = code;
                 let normalized = Self::normalize_keycode(other);
                 if let Some(opt) = self
                     .select_options
@@ -247,7 +270,10 @@ impl WidgetRef for &OssSelectionWidget<'_> {
                 } else {
                     Style::new().bg(Color::DarkGray)
                 };
-                opt.label.clone().alignment(Alignment::Center).style(style)
+                opt.label
+                    .clone()
+                    .alignment(HorizontalAlignment::Center)
+                    .style(style)
             })
             .collect();
 
@@ -287,20 +313,37 @@ fn get_status_symbol_and_color(status: &ProviderStatus) -> (&'static str, Color)
     }
 }
 
-pub async fn select_oss_provider(codex_home: &std::path::Path) -> io::Result<String> {
+pub(crate) struct OssProviderSelection {
+    pub(crate) provider: String,
+    pub(crate) manually_selected: bool,
+}
+
+pub async fn select_oss_provider() -> io::Result<OssProviderSelection> {
+    // These probes intentionally bypass proxy discovery because both targets are
+    // hardcoded plaintext loopback endpoints. Preserve the legacy custom-CA fallback so an
+    // invalid inherited certificate bundle cannot prevent best-effort provider detection.
+    #[allow(deprecated)]
+    let client = HttpClientBuilder::new().build_direct_with_custom_ca_fallback();
+
     // Check provider statuses first
-    let lmstudio_status = check_lmstudio_status().await;
-    let ollama_status = check_ollama_status().await;
+    let lmstudio_status = check_lmstudio_status(&client).await;
+    let ollama_status = check_ollama_status(&client).await;
 
     // Autoselect if only one is running
     match (&lmstudio_status, &ollama_status) {
         (ProviderStatus::Running, ProviderStatus::NotRunning) => {
             let provider = LMSTUDIO_OSS_PROVIDER_ID.to_string();
-            return Ok(provider);
+            return Ok(OssProviderSelection {
+                provider,
+                manually_selected: false,
+            });
         }
         (ProviderStatus::NotRunning, ProviderStatus::Running) => {
             let provider = OLLAMA_OSS_PROVIDER_ID.to_string();
-            return Ok(provider);
+            return Ok(OssProviderSelection {
+                provider,
+                manually_selected: false,
+            });
         }
         _ => {
             // Both running or both not running - show UI
@@ -324,50 +367,112 @@ pub async fn select_oss_provider(codex_home: &std::path::Path) -> io::Result<Str
         if let Event::Key(key_event) = event::read()?
             && let Some(selection) = widget.handle_key_event(key_event)
         {
-            break Ok(selection);
+            break Ok(OssProviderSelection {
+                provider: selection,
+                manually_selected: true,
+            });
         }
     };
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
-    // If the user manually selected an OSS provider, we save it as the
-    // default one to use later.
-    if let Ok(ref provider) = result
-        && let Err(e) = set_default_oss_provider(codex_home, provider)
-    {
-        tracing::warn!("Failed to save OSS provider preference: {e}");
-    }
-
     result
 }
 
-async fn check_lmstudio_status() -> ProviderStatus {
-    match check_port_status(DEFAULT_LMSTUDIO_PORT).await {
+async fn check_lmstudio_status(client: &HttpClient) -> ProviderStatus {
+    match check_port_status(client, DEFAULT_LMSTUDIO_PORT).await {
         Ok(true) => ProviderStatus::Running,
         Ok(false) => ProviderStatus::NotRunning,
         Err(_) => ProviderStatus::Unknown,
     }
 }
 
-async fn check_ollama_status() -> ProviderStatus {
-    match check_port_status(DEFAULT_OLLAMA_PORT).await {
+async fn check_ollama_status(client: &HttpClient) -> ProviderStatus {
+    match check_port_status(client, DEFAULT_OLLAMA_PORT).await {
         Ok(true) => ProviderStatus::Running,
         Ok(false) => ProviderStatus::NotRunning,
         Err(_) => ProviderStatus::Unknown,
     }
 }
 
-async fn check_port_status(port: u16) -> io::Result<bool> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .map_err(io::Error::other)?;
-
+async fn check_port_status(client: &HttpClient, port: u16) -> io::Result<bool> {
     let url = format!("http://localhost:{port}");
 
-    match client.get(&url).send().await {
+    match client
+        .get(&url)
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+    {
         Ok(response) => Ok(response.status().is_success()),
         Err(_) => Ok(false), // Connection failed = not running
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ctrl_h_l_move_provider_selection() {
+        let mut widget = OssSelectionWidget::new(ProviderStatus::Unknown, ProviderStatus::Unknown)
+            .expect("widget should initialize");
+
+        assert_eq!(widget.selected_option, 0);
+        widget.handle_key_event(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+        assert_eq!(widget.selected_option, 1);
+        widget.handle_key_event(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        assert_eq!(widget.selected_option, 0);
+    }
+
+    #[tokio::test]
+    async fn localhost_probe_succeeds_with_invalid_inherited_ca_bundle() {
+        const CHILD_ENV: &str = "CODEX_OSS_SELECTION_INVALID_CA_TEST_CHILD";
+
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let temp_dir = tempfile::tempdir().expect("temporary directory should be created");
+            let invalid_ca_path = temp_dir.path().join("invalid-ca.pem");
+            std::fs::write(&invalid_ca_path, "not a PEM certificate")
+                .expect("invalid CA fixture should be written");
+
+            for ca_env in ["CODEX_CA_CERTIFICATE", "SSL_CERT_FILE"] {
+                let output = std::process::Command::new(
+                    std::env::current_exe().expect("test executable should be available"),
+                )
+                .arg("--exact")
+                .arg("oss_selection::tests::localhost_probe_succeeds_with_invalid_inherited_ca_bundle")
+                .arg("--nocapture")
+                .env_remove("CODEX_CA_CERTIFICATE")
+                .env_remove("SSL_CERT_FILE")
+                .env(ca_env, &invalid_ca_path)
+                .env(CHILD_ENV, "1")
+                .output()
+                .expect("isolated CA subprocess should run");
+
+                assert!(
+                    output.status.success(),
+                    "localhost probe failed with invalid {ca_env}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+            }
+            return;
+        }
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        #[allow(deprecated)]
+        let client = HttpClientBuilder::new().build_direct_with_custom_ca_fallback();
+        assert!(
+            check_port_status(&client, server.address().port())
+                .await
+                .expect("localhost provider probe should complete")
+        );
     }
 }

@@ -9,10 +9,10 @@ const ANNOUNCEMENT_TIP_URL: &str =
 const IS_MACOS: bool = cfg!(target_os = "macos");
 const IS_WINDOWS: bool = cfg!(target_os = "windows");
 
-const APP_TOOLTIP: &str = "Try the **Codex App**. Run 'codex app' or visit https://chatgpt.com/codex?app-landing-page=true";
+const APP_TOOLTIP: &str = "Try the **Desktop app**. Run 'codex app' or visit https://chatgpt.com/codex?app-landing-page=true";
 const FAST_TOOLTIP: &str =
     "*New* Use **/fast** to enable our fastest inference with increased plan usage.";
-const OTHER_TOOLTIP: &str = "*New* Build faster with the **Codex App**. Run 'codex app' or visit https://chatgpt.com/codex?app-landing-page=true";
+const OTHER_TOOLTIP: &str = "*New* Build faster with the **Desktop app**. Run 'codex app' or visit https://chatgpt.com/codex?app-landing-page=true";
 const OTHER_TOOLTIP_NON_MAC: &str = "*New* Build faster with Codex.";
 const FREE_GO_TOOLTIP: &str =
     "*New* For a limited time, Codex is included in your plan for free – let’s build together.";
@@ -125,19 +125,27 @@ pub(crate) mod announcement {
     use crate::version::CODEX_CLI_VERSION;
     use chrono::NaiveDate;
     use chrono::Utc;
+    use codex_http_client::ClientRouteClass;
+    use codex_http_client::HttpClientFactory;
+    use codex_http_client::RouteAwareClientPool;
     use codex_protocol::account::PlanType;
     use regex_lite::Regex;
     use serde::Deserialize;
     use std::sync::OnceLock;
-    use std::thread;
     use std::time::Duration;
 
     static ANNOUNCEMENT_TIP: OnceLock<Option<String>> = OnceLock::new();
     const CURRENT_OS: TargetOs = TargetOs::current();
 
     /// Prewarm the cache of the announcement tip.
-    pub(crate) fn prewarm() {
-        let _ = thread::spawn(|| ANNOUNCEMENT_TIP.get_or_init(init_announcement_tip_in_thread));
+    pub(crate) fn prewarm(http_client_factory: HttpClientFactory) {
+        if ANNOUNCEMENT_TIP.get().is_some() {
+            return;
+        }
+        tokio::spawn(async move {
+            let announcement_tip = fetch_announcement_tip_text(http_client_factory).await;
+            let _ = ANNOUNCEMENT_TIP.set(announcement_tip);
+        });
     }
 
     /// Fetch the announcement tip, return None if the prewarm is not done yet.
@@ -199,25 +207,15 @@ pub(crate) mod announcement {
         }
     }
 
-    fn init_announcement_tip_in_thread() -> Option<String> {
-        thread::spawn(blocking_init_announcement_tip)
-            .join()
-            .ok()
-            .flatten()
-    }
-
-    fn blocking_init_announcement_tip() -> Option<String> {
-        // Avoid system proxy detection to prevent macOS system-configuration panics (#8912).
-        let client = reqwest::blocking::Client::builder()
-            .no_proxy()
-            .build()
-            .ok()?;
+    async fn fetch_announcement_tip_text(http_client_factory: HttpClientFactory) -> Option<String> {
+        let client = RouteAwareClientPool::new(http_client_factory, ClientRouteClass::Other);
         let response = client
             .get(ANNOUNCEMENT_TIP_URL)
             .timeout(Duration::from_millis(2000))
             .send()
+            .await
             .ok()?;
-        response.error_for_status().ok()?.text().ok()
+        response.error_for_status().ok()?.text().await.ok()
     }
 
     pub(crate) fn parse_announcement_tip_toml(

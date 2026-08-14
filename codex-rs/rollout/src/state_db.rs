@@ -1,111 +1,245 @@
+use crate::RolloutItem;
 use crate::config::RolloutConfig;
 use crate::config::RolloutConfigView;
 use crate::list::Cursor;
 use crate::list::SortDirection;
 use crate::list::ThreadSortKey;
 use crate::metadata;
+use crate::sqlite_metrics;
+use anyhow::Context;
 use chrono::DateTime;
 use chrono::Utc;
 use codex_protocol::ThreadId;
-use codex_protocol::dynamic_tools::DynamicToolSpec;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::ThreadHistoryMode;
 pub use codex_state::LogEntry;
+use codex_state::SqliteConfig;
 use codex_state::ThreadMetadataBuilder;
 use codex_utils_path::normalize_for_path_comparison;
 use serde_json::Value;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
+use tracing::info;
 use tracing::warn;
 
 /// Core-facing handle to the SQLite-backed state runtime.
 pub type StateDbHandle = Arc<codex_state::StateRuntime>;
 
-/// Initialize the state runtime for thread state persistence and backfill checks.
+#[cfg(not(test))]
+const STARTUP_BACKFILL_POLL_INTERVAL: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const STARTUP_BACKFILL_POLL_INTERVAL: Duration = Duration::from_millis(10);
+#[cfg(not(test))]
+const STARTUP_BACKFILL_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const STARTUP_BACKFILL_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Initialize the state runtime for thread state persistence.
+///
+/// This is the process entry point for local state: it opens the SQLite-backed
+/// runtime, applies rollout metadata backfills as needed, and returns the
+/// initialized handle.
 pub async fn init(config: &impl RolloutConfigView) -> Option<StateDbHandle> {
     let config = RolloutConfig::from_view(config);
-    init_with_roots(
-        config.codex_home,
-        config.sqlite_home,
-        config.model_provider_id,
+    match try_init_with_roots(config.codex_home, config.sqlite, config.model_provider_id).await {
+        Ok(runtime) => Some(runtime),
+        Err(err) => {
+            emit_startup_warning(&format!("failed to initialize state runtime: {err:#}"));
+            None
+        }
+    }
+}
+
+/// Initialize the state runtime and return any initialization error to the caller.
+///
+/// Prefer [`init`] unless the caller needs to surface the exact failure after
+/// tracing or UI setup has completed.
+pub async fn try_init(config: &impl RolloutConfigView) -> anyhow::Result<StateDbHandle> {
+    let config = RolloutConfig::from_view(config);
+    try_init_with_roots(config.codex_home, config.sqlite, config.model_provider_id).await
+}
+
+async fn try_init_with_roots(
+    codex_home: PathBuf,
+    sqlite: SqliteConfig,
+    default_model_provider_id: String,
+) -> anyhow::Result<StateDbHandle> {
+    try_init_with_roots_inner(
+        codex_home,
+        sqlite,
+        default_model_provider_id,
+        /*backfill_lease_seconds*/ None,
     )
     .await
 }
 
-/// Initialize the state runtime for a local thread store.
-pub async fn init_with_roots(
+#[cfg(test)]
+async fn try_init_with_roots_and_backfill_lease(
     codex_home: PathBuf,
-    sqlite_home: PathBuf,
+    sqlite: SqliteConfig,
     default_model_provider_id: String,
-) -> Option<StateDbHandle> {
+    backfill_lease_seconds: i64,
+) -> anyhow::Result<StateDbHandle> {
+    try_init_with_roots_inner(
+        codex_home,
+        sqlite,
+        default_model_provider_id,
+        Some(backfill_lease_seconds),
+    )
+    .await
+}
+
+async fn try_init_with_roots_inner(
+    codex_home: PathBuf,
+    sqlite: SqliteConfig,
+    default_model_provider_id: String,
+    backfill_lease_seconds: Option<i64>,
+) -> anyhow::Result<StateDbHandle> {
+    let runtime =
+        codex_state::StateRuntime::init(sqlite.clone(), default_model_provider_id.clone())
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to initialize state runtime at {}",
+                    sqlite.home().display()
+                )
+            })?;
+    let backfill_gate_started = Instant::now();
+    let backfill_gate_result = wait_for_backfill_gate(
+        runtime.as_ref(),
+        codex_home.as_path(),
+        default_model_provider_id.as_str(),
+        backfill_lease_seconds,
+    )
+    .await;
+    codex_state::record_backfill_gate(
+        /*telemetry*/ None,
+        backfill_gate_started.elapsed(),
+        &backfill_gate_result,
+    );
+    if let Err(err) = backfill_gate_result {
+        runtime.close().await;
+        return Err(err);
+    }
+    Ok(runtime)
+}
+
+async fn wait_for_backfill_gate(
+    runtime: &codex_state::StateRuntime,
+    codex_home: &Path,
+    default_model_provider_id: &str,
+    backfill_lease_seconds: Option<i64>,
+) -> anyhow::Result<()> {
+    let wait_started = Instant::now();
+    let mut reported_wait = false;
+    loop {
+        let backfill_state = runtime.get_backfill_state().await.map_err(|err| {
+            anyhow::anyhow!(
+                "failed to read backfill state at {}: {err}",
+                codex_home.display()
+            )
+        })?;
+        if backfill_state.status == codex_state::BackfillStatus::Complete {
+            return Ok(());
+        }
+
+        if let Some(backfill_lease_seconds) = backfill_lease_seconds {
+            metadata::backfill_sessions_with_lease(
+                runtime,
+                codex_home,
+                default_model_provider_id,
+                backfill_lease_seconds,
+            )
+            .await;
+        } else {
+            metadata::backfill_sessions(runtime, codex_home, default_model_provider_id).await;
+        }
+        let backfill_state = runtime.get_backfill_state().await.map_err(|err| {
+            anyhow::anyhow!(
+                "failed to read backfill state at {} after startup backfill: {err}",
+                codex_home.display()
+            )
+        })?;
+        if backfill_state.status == codex_state::BackfillStatus::Complete {
+            return Ok(());
+        }
+        if wait_started.elapsed() >= STARTUP_BACKFILL_WAIT_TIMEOUT {
+            return Err(anyhow::anyhow!(
+                "timed out waiting for state db backfill at {} after {:?} (status: {})",
+                codex_home.display(),
+                STARTUP_BACKFILL_WAIT_TIMEOUT,
+                backfill_state.status.as_str()
+            ));
+        }
+
+        let message = format!(
+            "state db backfill is {} at {}; waiting up to {:?} before retrying startup initialization",
+            backfill_state.status.as_str(),
+            codex_home.display(),
+            STARTUP_BACKFILL_WAIT_TIMEOUT,
+        );
+        if reported_wait {
+            info!("{message}");
+        } else {
+            emit_startup_warning(&message);
+            reported_wait = true;
+        }
+        tokio::time::sleep(STARTUP_BACKFILL_POLL_INTERVAL).await;
+    }
+}
+
+fn emit_startup_warning(message: &str) {
+    warn!("{message}");
+    if !tracing::dispatcher::has_been_set() {
+        #[allow(clippy::print_stderr)]
+        {
+            eprintln!("{message}");
+        }
+    }
+}
+
+/// Open the DB if it exists and its startup backfill has already completed.
+///
+/// Unlike [`init`], this helper does not run rollout backfill. It is for
+/// optional local reads from non-owning contexts such as remote app-server mode.
+pub async fn get_state_db(config: &impl RolloutConfigView) -> Option<StateDbHandle> {
+    let state_path = config.sqlite_config().state_db_path();
+    if !tokio::fs::try_exists(&state_path).await.unwrap_or(false) {
+        codex_state::record_fallback(
+            "get_state_db",
+            "db_unavailable",
+            /*telemetry_override*/ None,
+        );
+        return None;
+    }
     let runtime = match codex_state::StateRuntime::init(
-        sqlite_home.clone(),
-        default_model_provider_id.clone(),
+        config.sqlite_config().clone(),
+        config.model_provider_id().to_string(),
     )
     .await
     {
         Ok(runtime) => runtime,
-        Err(err) => {
-            warn!(
-                "failed to initialize state runtime at {}: {err}",
-                sqlite_home.display()
+        Err(_) => {
+            codex_state::record_fallback(
+                "get_state_db",
+                "db_error",
+                /*telemetry_override*/ None,
             );
             return None;
         }
     };
-    let backfill_state = match runtime.get_backfill_state().await {
-        Ok(state) => state,
-        Err(err) => {
-            warn!(
-                "failed to read backfill state at {}: {err}",
-                codex_home.display()
-            );
-            return None;
-        }
-    };
-    if backfill_state.status != codex_state::BackfillStatus::Complete {
-        let runtime_for_backfill = runtime.clone();
-        tokio::spawn(async move {
-            metadata::backfill_sessions(
-                runtime_for_backfill.as_ref(),
-                codex_home.as_path(),
-                default_model_provider_id.as_str(),
-            )
-            .await;
-        });
-    }
-    Some(runtime)
+    require_backfill_complete(runtime, config.sqlite_config().home()).await
 }
 
-/// Get the DB if the feature is enabled and the DB exists.
-pub async fn get_state_db(config: &impl RolloutConfigView) -> Option<StateDbHandle> {
-    let state_path = codex_state::state_db_path(config.sqlite_home());
-    if !tokio::fs::try_exists(&state_path).await.unwrap_or(false) {
-        return None;
-    }
-    let runtime = codex_state::StateRuntime::init(
-        config.sqlite_home().to_path_buf(),
-        config.model_provider_id().to_string(),
-    )
-    .await
-    .ok()?;
-    require_backfill_complete(runtime, config.sqlite_home()).await
-}
-
-/// Open the state runtime when the SQLite file exists, without feature gating.
-///
-/// This is used for parity checks during the SQLite migration phase.
-pub async fn open_if_present(codex_home: &Path, default_provider: &str) -> Option<StateDbHandle> {
-    let db_path = codex_state::state_db_path(codex_home);
-    if !tokio::fs::try_exists(&db_path).await.unwrap_or(false) {
-        return None;
-    }
-    let runtime =
-        codex_state::StateRuntime::init(codex_home.to_path_buf(), default_provider.to_string())
-            .await
-            .ok()?;
-    require_backfill_complete(runtime, codex_home).await
+/// Build a SQLite telemetry recorder backed by an OTEL metrics client.
+pub fn sqlite_telemetry_recorder(
+    metrics: codex_otel::MetricsClient,
+    originator: &str,
+) -> codex_state::DbTelemetryHandle {
+    sqlite_metrics::recorder(metrics, originator)
 }
 
 async fn require_backfill_complete(
@@ -120,12 +254,22 @@ async fn require_backfill_complete(
                 codex_home.display(),
                 state.status.as_str()
             );
+            codex_state::record_fallback(
+                "get_state_db",
+                "backfill_incomplete",
+                /*telemetry_override*/ None,
+            );
             None
         }
         Err(err) => {
             warn!(
                 "failed to read backfill state at {}: {err}",
                 codex_home.display()
+            );
+            codex_state::record_fallback(
+                "get_state_db",
+                "db_error",
+                /*telemetry_override*/ None,
             );
             None
         }
@@ -137,7 +281,10 @@ fn cursor_to_anchor(cursor: Option<&Cursor>) -> Option<codex_state::Anchor> {
     let millis = cursor.timestamp().unix_timestamp_nanos() / 1_000_000;
     let millis = i64::try_from(millis).ok()?;
     let ts = chrono::DateTime::<Utc>::from_timestamp_millis(millis)?;
-    Some(codex_state::Anchor { ts })
+    Some(codex_state::Anchor {
+        ts,
+        id: cursor.thread_id(),
+    })
 }
 
 pub fn normalize_cwd_for_state_db(cwd: &Path) -> PathBuf {
@@ -148,7 +295,7 @@ pub fn normalize_cwd_for_state_db(cwd: &Path) -> PathBuf {
 #[allow(clippy::too_many_arguments)]
 pub async fn list_thread_ids_db(
     context: Option<&codex_state::StateRuntime>,
-    codex_home: &Path,
+    sqlite: &codex_state::SqliteConfig,
     page_size: usize,
     cursor: Option<&Cursor>,
     sort_key: ThreadSortKey,
@@ -158,12 +305,13 @@ pub async fn list_thread_ids_db(
     stage: &str,
 ) -> Option<Vec<ThreadId>> {
     let ctx = context?;
-    if ctx.codex_home() != codex_home {
+    if ctx.sqlite() != sqlite {
         warn!(
-            "state db codex_home mismatch: expected {}, got {}",
-            ctx.codex_home().display(),
-            codex_home.display()
+            "state db SQLite home mismatch: expected {}, got {}",
+            sqlite.home().display(),
+            ctx.sqlite().home().display()
         );
+        return None;
     }
 
     let anchor = cursor_to_anchor(cursor);
@@ -183,6 +331,7 @@ pub async fn list_thread_ids_db(
             match sort_key {
                 ThreadSortKey::CreatedAt => codex_state::SortKey::CreatedAt,
                 ThreadSortKey::UpdatedAt => codex_state::SortKey::UpdatedAt,
+                ThreadSortKey::RecencyAt => codex_state::SortKey::RecencyAt,
             },
             allowed_sources.as_slice(),
             model_providers.as_deref(),
@@ -202,7 +351,7 @@ pub async fn list_thread_ids_db(
 #[allow(clippy::too_many_arguments)]
 pub async fn list_threads_db(
     context: Option<&codex_state::StateRuntime>,
-    codex_home: &Path,
+    sqlite: &codex_state::SqliteConfig,
     page_size: usize,
     cursor: Option<&Cursor>,
     sort_key: ThreadSortKey,
@@ -210,19 +359,22 @@ pub async fn list_threads_db(
     allowed_sources: &[SessionSource],
     model_providers: Option<&[String]>,
     cwd_filters: Option<&[PathBuf]>,
+    relation_filter: Option<codex_state::ThreadRelationFilter>,
     archived: bool,
+    section: Option<Option<&str>>,
     search_term: Option<&str>,
 ) -> Option<codex_state::ThreadsPage> {
     let ctx = context?;
-    if ctx.codex_home() != codex_home {
+    if ctx.sqlite() != sqlite {
         warn!(
-            "state db codex_home mismatch: expected {}, got {}",
-            ctx.codex_home().display(),
-            codex_home.display()
+            "state db SQLite home mismatch: expected {}, got {}",
+            sqlite.home().display(),
+            ctx.sqlite().home().display()
         );
+        return None;
     }
 
-    let anchor = cursor_to_anchor(cursor);
+    let mut anchor = cursor_to_anchor(cursor);
     let allowed_sources: Vec<String> = allowed_sources
         .iter()
         .map(|value| match serde_json::to_value(value) {
@@ -238,54 +390,93 @@ pub async fn list_threads_db(
             .map(|cwd| normalize_cwd_for_state_db(cwd))
             .collect::<Vec<_>>()
     });
-    match ctx
-        .list_threads(
-            page_size,
-            codex_state::ThreadFilterOptions {
-                archived_only: archived,
-                allowed_sources: allowed_sources.as_slice(),
-                model_providers: model_providers.as_deref(),
-                cwd_filters: normalized_cwd_filters.as_deref(),
-                anchor: anchor.as_ref(),
-                sort_key: match sort_key {
-                    ThreadSortKey::CreatedAt => codex_state::SortKey::CreatedAt,
-                    ThreadSortKey::UpdatedAt => codex_state::SortKey::UpdatedAt,
-                },
-                sort_direction: match sort_direction {
-                    SortDirection::Asc => codex_state::SortDirection::Asc,
-                    SortDirection::Desc => codex_state::SortDirection::Desc,
-                },
-                search_term,
-            },
-        )
-        .await
-    {
-        Ok(mut page) => {
-            let mut valid_items = Vec::with_capacity(page.items.len());
-            for item in page.items {
-                if tokio::fs::try_exists(&item.rollout_path)
-                    .await
-                    .unwrap_or(false)
-                {
-                    valid_items.push(item);
-                } else {
-                    warn!(
-                        "state db list_threads returned stale rollout path for thread {}: {}",
-                        item.id,
-                        item.rollout_path.display()
-                    );
-                    warn!("state db discrepancy during list_threads_db: stale_db_path_dropped");
-                    let _ = ctx.delete_thread(item.id).await;
-                }
+    let state_sort_key = match sort_key {
+        ThreadSortKey::CreatedAt => codex_state::SortKey::CreatedAt,
+        ThreadSortKey::UpdatedAt => codex_state::SortKey::UpdatedAt,
+        ThreadSortKey::RecencyAt => codex_state::SortKey::RecencyAt,
+    };
+    let state_sort_direction = match sort_direction {
+        SortDirection::Asc => codex_state::SortDirection::Asc,
+        SortDirection::Desc => codex_state::SortDirection::Desc,
+    };
+
+    if let Some(relation_filter) = relation_filter {
+        let filters = codex_state::ThreadFilterOptions {
+            archived_only: archived,
+            section,
+            allowed_sources: allowed_sources.as_slice(),
+            model_providers: model_providers.as_deref(),
+            cwd_filters: normalized_cwd_filters.as_deref(),
+            anchor: anchor.as_ref(),
+            sort_key: state_sort_key,
+            sort_direction: state_sort_direction,
+            search_term,
+        };
+        return match ctx
+            .list_threads_by_relation(page_size, relation_filter, filters)
+            .await
+        {
+            Ok(page) => Some(page),
+            Err(err) => {
+                warn!("state db list_threads failed: {err}");
+                None
             }
-            page.items = valid_items;
-            Some(page)
-        }
-        Err(err) => {
-            warn!("state db list_threads failed: {err}");
-            None
-        }
+        };
     }
+
+    let mut items = Vec::with_capacity(page_size);
+    let mut next_anchor = None;
+    let mut num_scanned_rows = 0usize;
+    while items.len() < page_size {
+        let filters = codex_state::ThreadFilterOptions {
+            archived_only: archived,
+            section,
+            allowed_sources: allowed_sources.as_slice(),
+            model_providers: model_providers.as_deref(),
+            cwd_filters: normalized_cwd_filters.as_deref(),
+            anchor: anchor.as_ref(),
+            sort_key: state_sort_key,
+            sort_direction: state_sort_direction,
+            search_term,
+        };
+        let page = match ctx.list_threads(page_size - items.len(), filters).await {
+            Ok(page) => page,
+            Err(err) => {
+                warn!("state db list_threads failed: {err}");
+                return None;
+            }
+        };
+        num_scanned_rows = num_scanned_rows.saturating_add(page.num_scanned_rows);
+        next_anchor = page.next_anchor;
+
+        for item in page.items {
+            if let Some(existing_path) =
+                crate::compression::existing_rollout_path(item.rollout_path.as_path()).await
+            {
+                let mut item = item;
+                item.rollout_path = existing_path;
+                items.push(item);
+            } else {
+                warn!(
+                    "state db list_threads returned stale rollout path for thread {}: {}",
+                    item.id,
+                    item.rollout_path.display()
+                );
+                warn!("state db discrepancy during list_threads_db: stale_db_path_retained");
+            }
+        }
+
+        if items.len() == page_size || next_anchor.is_none() {
+            break;
+        }
+        anchor = next_anchor.clone();
+    }
+    Some(codex_state::ThreadsPage {
+        items,
+        parent_thread_ids: Default::default(),
+        next_anchor,
+        num_scanned_rows,
+    })
 }
 
 /// Look up the rollout path for a thread id using SQLite.
@@ -304,37 +495,6 @@ pub async fn find_rollout_path_by_id(
         })
 }
 
-/// Get dynamic tools for a thread id using SQLite.
-pub async fn get_dynamic_tools(
-    context: Option<&codex_state::StateRuntime>,
-    thread_id: ThreadId,
-    stage: &str,
-) -> Option<Vec<DynamicToolSpec>> {
-    let ctx = context?;
-    match ctx.get_dynamic_tools(thread_id).await {
-        Ok(tools) => tools,
-        Err(err) => {
-            warn!("state db get_dynamic_tools failed during {stage}: {err}");
-            None
-        }
-    }
-}
-
-/// Persist dynamic tools for a thread id using SQLite, if none exist yet.
-pub async fn persist_dynamic_tools(
-    context: Option<&codex_state::StateRuntime>,
-    thread_id: ThreadId,
-    tools: Option<&[DynamicToolSpec]>,
-    stage: &str,
-) {
-    let Some(ctx) = context else {
-        return;
-    };
-    if let Err(err) = ctx.persist_dynamic_tools(thread_id, tools).await {
-        warn!("state db persist_dynamic_tools failed during {stage}: {err}");
-    }
-}
-
 pub async fn mark_thread_memory_mode_polluted(
     context: Option<&codex_state::StateRuntime>,
     thread_id: ThreadId,
@@ -343,8 +503,12 @@ pub async fn mark_thread_memory_mode_polluted(
     let Some(ctx) = context else {
         return;
     };
-    if let Err(err) = ctx.mark_thread_memory_mode_polluted(thread_id).await {
-        warn!("state db mark_thread_memory_mode_polluted failed during {stage}: {err}");
+    if let Err(err) = ctx
+        .memories()
+        .mark_thread_memory_mode_polluted(thread_id)
+        .await
+    {
+        warn!("memories db mark_thread_memory_mode_polluted failed during {stage}: {err}");
     }
 }
 
@@ -389,8 +553,23 @@ pub async fn reconcile_rollout(
     let mut metadata = outcome.metadata;
     let memory_mode = outcome.memory_mode.unwrap_or_else(|| "enabled".to_string());
     metadata.cwd = normalize_cwd_for_state_db(&metadata.cwd);
-    if let Ok(Some(existing_metadata)) = ctx.get_thread(metadata.id).await {
-        metadata.prefer_existing_git_info(&existing_metadata);
+    let existing_metadata = ctx.get_thread(metadata.id).await.ok().flatten();
+    // Filesystem repair may seed a missing row, but it must not change an existing row's
+    // selected rollout path. After `thread/revert`, a scan can find multiple immutable
+    // rollouts for one thread and cannot know which one SQLite selected.
+    if existing_metadata
+        .as_ref()
+        .is_some_and(|existing| existing.rollout_path.as_path() != rollout_path)
+    {
+        return;
+    }
+    // Paginated metadata updates are SQLite-only. Use the rollout mode to seed a
+    // missing row, then keep the value from SQLite.
+    let restore_memory_mode_from_rollout =
+        existing_metadata.is_none() || matches!(metadata.history_mode, ThreadHistoryMode::Legacy);
+    if let Some(existing_metadata) = existing_metadata.as_ref() {
+        metadata.prefer_existing_git_info(existing_metadata);
+        metadata.prefer_existing_explicit_title(existing_metadata);
     }
     match archived_only {
         Some(true) if metadata.archived_at.is_none() => {
@@ -408,27 +587,13 @@ pub async fn reconcile_rollout(
         );
         return;
     }
-    if let Err(err) = ctx
-        .set_thread_memory_mode(metadata.id, memory_mode.as_str())
-        .await
+    if restore_memory_mode_from_rollout
+        && let Err(err) = ctx
+            .set_thread_memory_mode(metadata.id, memory_mode.as_str())
+            .await
     {
         warn!(
             "state db reconcile_rollout memory_mode update failed {}: {err}",
-            rollout_path.display()
-        );
-        return;
-    }
-    if let Ok(meta_line) = crate::list::read_session_meta_line(rollout_path).await {
-        persist_dynamic_tools(
-            Some(ctx),
-            meta_line.meta.id,
-            meta_line.meta.dynamic_tools.as_deref(),
-            "reconcile_rollout",
-        )
-        .await;
-    } else {
-        warn!(
-            "state db reconcile_rollout missing session meta {}",
             rollout_path.display()
         );
     }
@@ -451,6 +616,12 @@ pub async fn read_repair_rollout_path(
     if let Some(thread_id) = thread_id
         && let Ok(Some(metadata)) = ctx.get_thread(thread_id).await
     {
+        // Filesystem repair may seed a missing row, but it must not change an existing row's
+        // selected rollout path. After `thread/revert`, a scan can find multiple immutable
+        // rollouts for one thread and cannot know which one SQLite selected.
+        if metadata.rollout_path.as_path() != rollout_path {
+            return;
+        }
         saw_existing_metadata = true;
         let mut repaired = metadata.clone();
         repaired.rollout_path = rollout_path.to_path_buf();

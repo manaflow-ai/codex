@@ -1,6 +1,10 @@
 use super::*;
 use crate::agent::status::is_final;
-use codex_protocol::error::CodexErr;
+use crate::session::session::Session;
+use crate::tools::handlers::multi_agents_spec::WaitAgentTimeoutOptions;
+use crate::tools::handlers::multi_agents_spec::create_wait_agent_tool_v1;
+use codex_protocol::error::CodexErrorDetails;
+use codex_tools::ToolSpec;
 use futures::FutureExt;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
@@ -12,20 +16,43 @@ use tokio::time::Instant;
 
 use tokio::time::timeout_at;
 
-pub(crate) struct Handler;
+#[derive(Default)]
+pub(crate) struct Handler {
+    options: WaitAgentTimeoutOptions,
+}
 
-impl ToolHandler for Handler {
-    type Output = WaitAgentResult;
+impl Handler {
+    pub(crate) fn new(options: WaitAgentTimeoutOptions) -> Self {
+        Self { options }
+    }
+}
 
-    fn kind(&self) -> ToolKind {
-        ToolKind::Function
+impl ToolExecutor<ToolInvocation> for Handler {
+    fn tool_name(&self) -> ToolName {
+        ToolName::namespaced(MULTI_AGENT_V1_NAMESPACE, "wait_agent")
     }
 
-    fn matches_kind(&self, payload: &ToolPayload) -> bool {
-        matches!(payload, ToolPayload::Function { .. })
+    fn spec(&self) -> ToolSpec {
+        create_wait_agent_tool_v1(self.options)
     }
 
-    async fn handle(&self, invocation: ToolInvocation) -> Result<Self::Output, FunctionCallError> {
+    fn search_info(&self) -> Option<ToolSearchInfo> {
+        multi_agent_tool_search_info(
+            "wait_agent wait agent subagent status final result complete timeout targets",
+            self.spec(),
+        )
+    }
+
+    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+        Box::pin(self.handle_call(invocation))
+    }
+}
+
+impl Handler {
+    async fn handle_call(
+        &self,
+        invocation: ToolInvocation,
+    ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let ToolInvocation {
             session,
             turn,
@@ -70,15 +97,20 @@ impl ToolHandler for Handler {
         };
 
         session
-            .send_event(
+            .emit_turn_item_started(
                 &turn,
-                CollabWaitingBeginEvent {
-                    sender_thread_id: session.conversation_id,
+                &TurnItem::CollabAgentToolCall(CollabAgentToolCallItem {
+                    id: call_id.clone(),
+                    tool: CollabAgentTool::Wait,
+                    status: CollabAgentToolCallStatus::InProgress,
+                    sender_thread_id: session.thread_id,
                     receiver_thread_ids: receiver_thread_ids.clone(),
                     receiver_agents: receiver_agents.clone(),
-                    call_id: call_id.clone(),
-                }
-                .into(),
+                    prompt: None,
+                    model: None,
+                    reasoning_effort: None,
+                    agents_states: Default::default(),
+                }),
             )
             .await;
 
@@ -93,25 +125,27 @@ impl ToolHandler for Handler {
                     }
                     status_rxs.push((*id, rx));
                 }
-                Err(CodexErr::ThreadNotFound(_)) => {
+                Err(err) if matches!(err.details(), CodexErrorDetails::ThreadNotFound(_)) => {
                     initial_final_statuses.push((*id, AgentStatus::NotFound));
                 }
                 Err(err) => {
                     let mut statuses = HashMap::with_capacity(1);
                     statuses.insert(*id, session.services.agent_control.get_status(*id).await);
                     session
-                        .send_event(
+                        .emit_turn_item_completed(
                             &turn,
-                            CollabWaitingEndEvent {
-                                sender_thread_id: session.conversation_id,
-                                call_id: call_id.clone(),
-                                agent_statuses: build_wait_agent_statuses(
-                                    &statuses,
-                                    &receiver_agents,
-                                ),
-                                statuses,
-                            }
-                            .into(),
+                            TurnItem::CollabAgentToolCall(CollabAgentToolCallItem {
+                                id: call_id.clone(),
+                                tool: CollabAgentTool::Wait,
+                                status: wait_tool_call_status(&statuses),
+                                sender_thread_id: session.thread_id,
+                                receiver_thread_ids: statuses.keys().copied().collect(),
+                                receiver_agents: wait_receiver_agents(&statuses, &receiver_agents),
+                                prompt: None,
+                                model: None,
+                                reasoning_effort: None,
+                                agents_states: statuses,
+                            }),
                         )
                         .await;
                     return Err(collab_agent_error(*id, err));
@@ -153,7 +187,6 @@ impl ToolHandler for Handler {
 
         let timed_out = statuses.is_empty();
         let statuses_by_id = statuses.clone().into_iter().collect::<HashMap<_, _>>();
-        let agent_statuses = build_wait_agent_statuses(&statuses_by_id, &receiver_agents);
         let result = WaitAgentResult {
             status: statuses
                 .into_iter()
@@ -168,19 +201,72 @@ impl ToolHandler for Handler {
         };
 
         session
-            .send_event(
+            .emit_turn_item_completed(
                 &turn,
-                CollabWaitingEndEvent {
-                    sender_thread_id: session.conversation_id,
-                    call_id,
-                    agent_statuses,
-                    statuses: statuses_by_id,
-                }
-                .into(),
+                TurnItem::CollabAgentToolCall(CollabAgentToolCallItem {
+                    id: call_id,
+                    tool: CollabAgentTool::Wait,
+                    status: wait_tool_call_status(&statuses_by_id),
+                    sender_thread_id: session.thread_id,
+                    receiver_thread_ids: statuses_by_id.keys().copied().collect(),
+                    receiver_agents: wait_receiver_agents(&statuses_by_id, &receiver_agents),
+                    prompt: None,
+                    model: None,
+                    reasoning_effort: None,
+                    agents_states: statuses_by_id,
+                }),
             )
             .await;
 
-        Ok(result)
+        Ok(boxed_tool_output(result))
+    }
+}
+
+fn wait_tool_call_status(statuses: &HashMap<ThreadId, AgentStatus>) -> CollabAgentToolCallStatus {
+    if statuses
+        .values()
+        .any(|status| matches!(status, AgentStatus::Errored(_) | AgentStatus::NotFound))
+    {
+        CollabAgentToolCallStatus::Failed
+    } else {
+        CollabAgentToolCallStatus::Completed
+    }
+}
+
+fn wait_receiver_agents(
+    statuses: &HashMap<ThreadId, AgentStatus>,
+    receiver_agents: &[CollabAgentRef],
+) -> Vec<CollabAgentRef> {
+    if statuses.is_empty() {
+        return Vec::new();
+    }
+
+    let mut agents = Vec::with_capacity(statuses.len());
+    let mut seen = HashMap::with_capacity(receiver_agents.len());
+    for receiver_agent in receiver_agents {
+        seen.insert(receiver_agent.thread_id, ());
+        if statuses.contains_key(&receiver_agent.thread_id) {
+            agents.push(receiver_agent.clone());
+        }
+    }
+
+    let mut extras = statuses
+        .keys()
+        .filter(|thread_id| !seen.contains_key(thread_id))
+        .map(|thread_id| CollabAgentRef {
+            thread_id: *thread_id,
+            agent_nickname: None,
+            agent_role: None,
+        })
+        .collect::<Vec<_>>();
+    extras.sort_by_key(|agent| agent.thread_id.to_string());
+    agents.extend(extras);
+    agents
+}
+
+impl CoreToolRuntime for Handler {
+    fn matches_kind(&self, payload: &ToolPayload) -> bool {
+        matches!(payload, ToolPayload::Function { .. })
     }
 }
 

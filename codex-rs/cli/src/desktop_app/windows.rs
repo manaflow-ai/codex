@@ -11,54 +11,42 @@ pub async fn run_windows_app_open_or_install(
     workspace: PathBuf,
     download_url_override: Option<String>,
 ) -> anyhow::Result<()> {
-    if let Some(app_id) = find_codex_app_id().await? {
-        eprintln!("Opening Codex Desktop...");
-        open_installed_codex_app(&app_id).await?;
-        eprintln!(
-            "In Codex Desktop, open workspace {workspace}.",
-            workspace = display_workspace_path(&workspace)
-        );
+    let workspace_path = workspace.display().to_string();
+    let display_workspace = display_workspace_path(&workspace);
+    if codex_app_is_installed().await? {
+        eprintln!("Opening workspace {display_workspace} in the Desktop app...");
+        open_url(&codex_new_thread_url(&workspace_path)).await?;
         return Ok(());
     }
 
-    eprintln!("Codex Desktop not found; opening Windows installer...");
+    eprintln!("Desktop app not found; opening Windows installer...");
     let download_url = download_url_override
         .as_deref()
         .unwrap_or(CODEX_WINDOWS_INSTALLER_URL);
     if open_url(download_url).await.is_err() && download_url_override.is_none() {
         open_url(CODEX_MICROSOFT_STORE_WEB_URL).await?;
     }
-    eprintln!(
-        "After installing Codex Desktop, open workspace {workspace}.",
-        workspace = display_workspace_path(&workspace)
-    );
+    eprintln!("After installing the Desktop app, open workspace {display_workspace}.");
     Ok(())
 }
 
-async fn find_codex_app_id() -> anyhow::Result<Option<String>> {
+async fn codex_app_is_installed() -> anyhow::Result<bool> {
+    // This package identity is stable across Codex- and ChatGPT-branded builds.
     let output = Command::new("powershell.exe")
         .arg("-NoProfile")
         .arg("-Command")
-        .arg("Get-StartApps -Name 'Codex' | Select-Object -First 1 -ExpandProperty AppID")
+        .arg(
+            "Get-StartApps | Where-Object AppID -Like 'OpenAI.Codex_*!App' | Select-Object -First 1 -ExpandProperty AppID",
+        )
         .output()
         .await
         .context("failed to invoke `powershell.exe`")?;
 
     if !output.status.success() {
-        return Ok(None);
+        return Ok(false);
     }
 
-    let app_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if app_id.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(app_id))
-    }
-}
-
-async fn open_installed_codex_app(app_id: &str) -> anyhow::Result<()> {
-    let target = format!("shell:AppsFolder\\{app_id}");
-    open_shell_target(&target).await
+    Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
 }
 
 async fn open_url(url: &str) -> anyhow::Result<()> {
@@ -78,15 +66,11 @@ async fn open_url(url: &str) -> anyhow::Result<()> {
     }
 }
 
-async fn open_shell_target(target: &str) -> anyhow::Result<()> {
-    // Explorer can successfully hand off shell targets and still return exit code 1.
-    let _status = Command::new("explorer.exe")
-        .arg(target)
-        .status()
-        .await
-        .with_context(|| format!("failed to open {target}"))?;
-
-    Ok(())
+fn codex_new_thread_url(workspace: &str) -> String {
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    serializer.append_pair("path", workspace);
+    let query = serializer.finish();
+    format!("codex://threads/new?{query}")
 }
 
 fn display_workspace_path(workspace: &Path) -> String {
@@ -102,6 +86,7 @@ fn display_workspace_path(workspace: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::codex_new_thread_url;
     use super::display_workspace_path;
     use pretty_assertions::assert_eq;
     use std::path::Path;
@@ -127,6 +112,22 @@ mod tests {
         assert_eq!(
             display_workspace_path(Path::new(r"C:\Users\fcoury\code\codex")),
             r"C:\Users\fcoury\code\codex"
+        );
+    }
+
+    #[test]
+    fn codex_new_thread_url_encodes_windows_workspace_path() {
+        assert_eq!(
+            codex_new_thread_url(r"C:\Users\akuma\repos\koba"),
+            r"codex://threads/new?path=C%3A%5CUsers%5Cakuma%5Crepos%5Ckoba"
+        );
+    }
+
+    #[test]
+    fn codex_new_thread_url_preserves_verbatim_workspace_path() {
+        assert_eq!(
+            codex_new_thread_url(r"\\?\C:\Users\akuma\repos\koba"),
+            r"codex://threads/new?path=%5C%5C%3F%5CC%3A%5CUsers%5Cakuma%5Crepos%5Ckoba"
         );
     }
 }

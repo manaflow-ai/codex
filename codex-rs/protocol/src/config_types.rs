@@ -9,7 +9,10 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fmt;
 use std::num::NonZeroU64;
+use std::ops::Deref;
+use std::str::FromStr;
 use std::time::Duration;
 use strum_macros::Display;
 use strum_macros::EnumIter;
@@ -17,6 +20,21 @@ use ts_rs::TS;
 use wildmatch::WildMatchPattern;
 
 use crate::openai_models::ReasoningEffort;
+
+/// Selects which part of the active context is charged against
+/// `model_auto_compact_token_limit`.
+#[derive(
+    Debug, Serialize, Deserialize, Default, Clone, Copy, PartialEq, Eq, Display, JsonSchema, TS,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum AutoCompactTokenLimitScope {
+    /// Count the full active context against the limit.
+    #[default]
+    Total,
+    /// Count sampled output and later growth after the carried window prefix.
+    BodyAfterPrefix,
+}
 
 /// A summary of the reasoning performed by the model. This can be useful for
 /// debugging and understanding the model's reasoning process.
@@ -77,6 +95,65 @@ pub enum SandboxMode {
     DangerFullAccess,
 }
 
+/// Validated plain profile-v2 name used to select `$CODEX_HOME/<name>.config.toml`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProfileV2Name(String);
+
+impl ProfileV2Name {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ProfileV2NameParseError {
+    value: String,
+}
+
+impl fmt::Display for ProfileV2NameParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "invalid --profile value `{}`; pass a plain name such as `work`",
+            self.value
+        )
+    }
+}
+
+impl std::error::Error for ProfileV2NameParseError {}
+
+impl FromStr for ProfileV2Name {
+    type Err = ProfileV2NameParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.is_empty()
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err(ProfileV2NameParseError {
+                value: value.to_string(),
+            });
+        }
+
+        Ok(Self(value.to_string()))
+    }
+}
+
+impl Deref for ProfileV2Name {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for ProfileV2Name {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Display, TS)]
 #[strum(serialize_all = "snake_case")]
 #[ts(type = r#""user" | "auto_review" | "guardian_subagent""#)]
@@ -89,8 +166,8 @@ pub enum ApprovalsReviewer {
     #[default]
     #[serde(rename = "user")]
     User,
-    #[serde(rename = "guardian_subagent", alias = "auto_review")]
-    #[strum(serialize = "guardian_subagent")]
+    #[serde(rename = "auto_review", alias = "guardian_subagent")]
+    #[strum(serialize = "auto_review")]
     AutoReview,
 }
 
@@ -120,6 +197,16 @@ pub enum ShellEnvironmentPolicyInherit {
 
     /// Do not inherit any environment variables from the parent process.
     None,
+}
+
+/// Assigns a shell environment variable pattern to the include-only or exclude
+/// set. Includes do not re-add variables removed by another exclude pattern.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export_to = "v2/")]
+pub enum ShellEnvironmentPolicyFilter {
+    Include,
+    Exclude,
 }
 
 pub type EnvironmentVariablePattern = WildMatchPattern<'*', '?'>;
@@ -196,6 +283,16 @@ pub enum WindowsSandboxLevel {
     Elevated,
 }
 
+/// Controls whether a Windows sandbox launch reconciles persistent proxy settings or preserves
+/// the settings established by another launch.
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WindowsSandboxProxySettingsMode {
+    #[default]
+    Reconcile,
+    Preserve,
+}
+
 #[derive(
     Debug,
     Serialize,
@@ -219,16 +316,75 @@ pub enum Personality {
     Pragmatic,
 }
 
+/// Controls the effective multi-agent delegation instructions for a turn. `custom` means the
+/// configured mode hint defines the policy instead of a built-in policy.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Display, JsonSchema, TS, Default)]
+#[serde(rename_all = "camelCase", from = "MultiAgentModeWire")]
+#[ts(rename_all = "camelCase")]
+#[strum(serialize_all = "camelCase")]
+pub enum MultiAgentMode {
+    Custom(String),
+    #[default]
+    ExplicitRequestOnly,
+    Proactive,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum MultiAgentModeWire {
+    None,
+    Custom(String),
+    ExplicitRequestOnly,
+    Proactive,
+}
+
+impl From<MultiAgentModeWire> for MultiAgentMode {
+    fn from(value: MultiAgentModeWire) -> Self {
+        match value {
+            MultiAgentModeWire::None => Self::Custom(String::new()),
+            MultiAgentModeWire::Custom(hint_text) => Self::Custom(hint_text),
+            MultiAgentModeWire::ExplicitRequestOnly => Self::ExplicitRequestOnly,
+            MultiAgentModeWire::Proactive => Self::Proactive,
+        }
+    }
+}
+
 #[derive(
     Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Display, JsonSchema, TS, Default,
 )]
-#[serde(rename_all = "lowercase")]
-#[strum(serialize_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum WebSearchMode {
     Disabled,
     #[default]
     Cached,
+    Indexed,
     Live,
+}
+
+impl WebSearchMode {
+    /// Restricts search to the access permitted by both modes.
+    pub fn restrict_to(self, requested: Self) -> Self {
+        match (self, requested) {
+            (Self::Disabled, _) | (_, Self::Disabled) => Self::Disabled,
+            (Self::Cached, _) | (_, Self::Cached) => Self::Cached,
+            (Self::Indexed, _) | (_, Self::Indexed) => Self::Indexed,
+            (Self::Live, Self::Live) => Self::Live,
+        }
+    }
+}
+
+/// A model-facing surface on which a tool can be exposed.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Display, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ToolExposureSurface {
+    /// Nested tools available to Code Mode scripts.
+    CodeMode,
+    /// Tools discovered later through tool search.
+    Deferred,
+    /// Tools present in the model's initial tool list.
+    Direct,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Display, JsonSchema, TS)]
@@ -355,6 +511,29 @@ pub enum ServiceTier {
     Flex,
 }
 
+/// Request/config sentinel for explicit standard routing.
+///
+/// This is not a catalog service tier id. It means the user intentionally
+/// selected no service tier, so model catalog defaults should not apply.
+pub const SERVICE_TIER_DEFAULT_REQUEST_VALUE: &str = "default";
+
+impl ServiceTier {
+    pub const fn request_value(self) -> &'static str {
+        match self {
+            Self::Fast => "priority",
+            Self::Flex => "flex",
+        }
+    }
+
+    pub fn from_request_value(value: &str) -> Option<Self> {
+        match value {
+            "fast" | "priority" => Some(Self::Fast),
+            "flex" => Some(Self::Flex),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Display, JsonSchema, TS)]
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]
@@ -448,22 +627,9 @@ pub enum TrustLevel {
 
 /// Controls whether the TUI uses the terminal's alternate screen buffer.
 ///
-/// **Background:** The alternate screen buffer provides a cleaner fullscreen experience
-/// without polluting the terminal's scrollback history. However, it conflicts with terminal
-/// multiplexers like Zellij that strictly follow the xterm specification, which defines
-/// that alternate screen buffers should not have scrollback.
-///
-/// **Zellij's behavior:** Zellij intentionally disables scrollback in alternate screen mode
-/// (see https://github.com/zellij-org/zellij/pull/1032) to comply with the xterm spec. This
-/// is by design and not configurable in Zellij—there is no option to enable scrollback in
-/// alternate screen mode.
-///
-/// **Solution:** This setting provides a pragmatic workaround:
-/// - `auto` (default): Automatically detect the terminal multiplexer. If running in Zellij,
-///   disable alternate screen to preserve scrollback. Enable it everywhere else.
-/// - `always`: Always use alternate screen mode (original behavior before this fix).
-/// - `never`: Never use alternate screen mode. Runs in inline mode, preserving scrollback
-///   in all multiplexers.
+/// - `auto` (default): Use alternate screen mode.
+/// - `always`: Always use alternate screen mode.
+/// - `never`: Never use alternate screen mode. Runs in inline mode, preserving scrollback.
 ///
 /// The CLI flag `--no-alt-screen` can override this setting at runtime.
 #[derive(
@@ -472,10 +638,10 @@ pub enum TrustLevel {
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]
 pub enum AltScreenMode {
-    /// Auto-detect: disable alternate screen in Zellij, enable elsewhere.
+    /// Use alternate screen mode.
     #[default]
     Auto,
-    /// Always use alternate screen (original behavior).
+    /// Always use alternate screen mode.
     Always,
     /// Never use alternate screen (inline mode only).
     Never,
@@ -496,16 +662,6 @@ pub enum ModeKind {
         alias = "custom"
     )]
     Default,
-    #[doc(hidden)]
-    #[serde(skip_serializing, skip_deserializing)]
-    #[schemars(skip)]
-    #[ts(skip)]
-    PairProgramming,
-    #[doc(hidden)]
-    #[serde(skip_serializing, skip_deserializing)]
-    #[schemars(skip)]
-    #[ts(skip)]
-    Execute,
 }
 
 pub const TUI_VISIBLE_COLLABORATION_MODES: [ModeKind; 2] = [ModeKind::Default, ModeKind::Plan];
@@ -515,8 +671,6 @@ impl ModeKind {
         match self {
             Self::Plan => "Plan",
             Self::Default => "Default",
-            Self::PairProgramming => "Pair Programming",
-            Self::Execute => "Execute",
         }
     }
 
@@ -548,7 +702,7 @@ impl CollaborationMode {
     }
 
     pub fn reasoning_effort(&self) -> Option<ReasoningEffort> {
-        self.settings_ref().reasoning_effort
+        self.settings_ref().reasoning_effort.clone()
     }
 
     /// Updates the collaboration mode with new model and/or effort values.
@@ -567,7 +721,7 @@ impl CollaborationMode {
         let settings = self.settings_ref();
         let updated_settings = Settings {
             model: model.unwrap_or_else(|| settings.model.clone()),
-            reasoning_effort: effort.unwrap_or(settings.reasoning_effort),
+            reasoning_effort: effort.unwrap_or_else(|| settings.reasoning_effort.clone()),
             developer_instructions: developer_instructions
                 .unwrap_or_else(|| settings.developer_instructions.clone()),
         };
@@ -589,7 +743,10 @@ impl CollaborationMode {
             mode: mask.mode.unwrap_or(self.mode),
             settings: Settings {
                 model: mask.model.clone().unwrap_or_else(|| settings.model.clone()),
-                reasoning_effort: mask.reasoning_effort.unwrap_or(settings.reasoning_effort),
+                reasoning_effort: mask
+                    .reasoning_effort
+                    .clone()
+                    .unwrap_or_else(|| settings.reasoning_effort.clone()),
                 developer_instructions: mask
                     .developer_instructions
                     .clone()
@@ -622,6 +779,32 @@ pub struct CollaborationModeMask {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn web_search_mode_restrictions_never_expand_either_mode() {
+        use WebSearchMode::Cached;
+        use WebSearchMode::Disabled;
+        use WebSearchMode::Indexed;
+        use WebSearchMode::Live;
+
+        let modes = [Disabled, Cached, Indexed, Live];
+        let expected = [
+            [Disabled, Disabled, Disabled, Disabled],
+            [Disabled, Cached, Cached, Cached],
+            [Disabled, Cached, Indexed, Indexed],
+            [Disabled, Cached, Indexed, Live],
+        ];
+
+        for (parent_index, parent) in modes.into_iter().enumerate() {
+            for (requested_index, requested) in modes.into_iter().enumerate() {
+                assert_eq!(
+                    parent.restrict_to(requested),
+                    expected[parent_index][requested_index],
+                    "parent: {parent:?}, requested: {requested:?}",
+                );
+            }
+        }
+    }
 
     #[test]
     fn apply_mask_can_clear_optional_fields() {
@@ -670,7 +853,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_string(&ApprovalsReviewer::AutoReview).expect("serialize reviewer"),
-            "\"guardian_subagent\""
+            "\"auto_review\""
         );
 
         for value in ["user", "auto_review", "guardian_subagent"] {
@@ -687,6 +870,24 @@ mod tests {
     }
 
     #[test]
+    fn profile_v2_name_rejects_paths_and_empty_names() {
+        assert_eq!(
+            ProfileV2Name::from_str("../foo"),
+            Err(ProfileV2NameParseError {
+                value: "../foo".to_string(),
+            }),
+            "dots and slashes are disallowed to prevent reading arbitrary files"
+        );
+        assert_eq!(
+            ProfileV2Name::from_str(""),
+            Err(ProfileV2NameParseError {
+                value: String::new(),
+            }),
+            "profile name cannot be empty"
+        );
+    }
+
+    #[test]
     fn tui_visible_collaboration_modes_match_mode_kind_visibility() {
         let expected = [ModeKind::Default, ModeKind::Plan];
         assert_eq!(expected, TUI_VISIBLE_COLLABORATION_MODES);
@@ -694,9 +895,6 @@ mod tests {
         for mode in TUI_VISIBLE_COLLABORATION_MODES {
             assert!(mode.is_tui_visible());
         }
-
-        assert!(!ModeKind::PairProgramming.is_tui_visible());
-        assert!(!ModeKind::Execute.is_tui_visible());
     }
 
     #[test]

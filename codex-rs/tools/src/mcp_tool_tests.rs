@@ -1,4 +1,5 @@
 use super::mcp_call_tool_result_output_schema;
+use super::parse_agent_plugin_mcp_tool;
 use super::parse_mcp_tool;
 use crate::JsonSchema;
 use crate::ToolDefinition;
@@ -6,17 +7,11 @@ use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
 
 fn mcp_tool(name: &str, description: &str, input_schema: serde_json::Value) -> rmcp::model::Tool {
-    rmcp::model::Tool {
-        name: name.to_string().into(),
-        title: None,
-        description: Some(description.to_string().into()),
-        input_schema: std::sync::Arc::new(rmcp::model::object(input_schema)),
-        output_schema: None,
-        annotations: None,
-        execution: None,
-        icons: None,
-        meta: None,
-    }
+    rmcp::model::Tool::new(
+        name.to_string(),
+        description.to_string(),
+        std::sync::Arc::new(rmcp::model::object(input_schema)),
+    )
 }
 
 #[test]
@@ -42,6 +37,40 @@ fn parse_mcp_tool_inserts_empty_properties() {
             output_schema: Some(mcp_call_tool_result_output_schema(serde_json::json!({}))),
             defer_loading: false,
         }
+    );
+}
+
+#[test]
+fn agent_plugin_mcp_tool_bounds_model_visible_description() {
+    let description = format!("{}é", "a".repeat(super::MAX_MCP_TOOL_DESCRIPTION_BYTES - 1));
+    let tool = mcp_tool(
+        "bounded_description",
+        &description,
+        serde_json::json!({"type": "object"}),
+    );
+
+    let parsed = parse_agent_plugin_mcp_tool(&tool).expect("parse Agent Plugin MCP tool");
+
+    assert_eq!(
+        parsed.description.len(),
+        super::MAX_MCP_TOOL_DESCRIPTION_BYTES - 1
+    );
+}
+
+#[test]
+fn legacy_mcp_tool_preserves_long_description() {
+    let description = "a".repeat(super::MAX_MCP_TOOL_DESCRIPTION_BYTES + 100);
+    let tool = mcp_tool(
+        "legacy_description",
+        &description,
+        serde_json::json!({"type": "object"}),
+    );
+
+    assert_eq!(
+        parse_mcp_tool(&tool)
+            .expect("parse legacy MCP tool")
+            .description,
+        description
     );
 }
 

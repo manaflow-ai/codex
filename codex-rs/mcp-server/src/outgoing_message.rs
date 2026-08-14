@@ -79,18 +79,27 @@ impl OutgoingMessageSender {
         }
     }
 
-    pub(crate) async fn send_response<T: Serialize>(&self, id: RequestId, response: T) {
-        let result = match serde_json::to_value(response) {
+    pub(crate) fn send_response<T: Serialize>(&self, id: RequestId, response: T) {
+        let mut result = match serde_json::to_value(response) {
             Ok(result) => result,
             Err(err) => {
                 self.send_error(
                     id,
                     ErrorData::internal_error(format!("failed to serialize response: {err}"), None),
-                )
-                .await;
+                );
                 return;
             }
         };
+
+        // rmcp result constructors include the modern discriminator by default.
+        // This legacy server serializes responses directly, bypassing rmcp's
+        // protocol-aware response handling, so preserve the historical wire shape:
+        // https://github.com/modelcontextprotocol/rust-sdk/issues/1036
+        if let Value::Object(object) = &mut result
+            && object.get("resultType").and_then(Value::as_str) == Some("complete")
+        {
+            object.remove("resultType");
+        }
 
         let outgoing_message = OutgoingMessage::Response(OutgoingResponse { id, result });
         let _ = self.sender.send(outgoing_message);
@@ -99,7 +108,7 @@ impl OutgoingMessageSender {
     /// This is used with the MCP server, but not the more general JSON-RPC app
     /// server. Prefer [`OutgoingMessageSender::send_server_notification`] where
     /// possible.
-    pub(crate) async fn send_event_as_notification(
+    pub(crate) fn send_event_as_notification(
         &self,
         event: &Event,
         meta: Option<OutgoingNotificationMeta>,
@@ -119,17 +128,16 @@ impl OutgoingMessageSender {
 
         self.send_notification(OutgoingNotification {
             method: "codex/event".to_string(),
-            params: Some(params.clone()),
-        })
-        .await;
+            params: Some(params),
+        });
     }
 
-    pub(crate) async fn send_notification(&self, notification: OutgoingNotification) {
+    pub(crate) fn send_notification(&self, notification: OutgoingNotification) {
         let outgoing_message = OutgoingMessage::Notification(notification);
         let _ = self.sender.send(outgoing_message);
     }
 
-    pub(crate) async fn send_error(&self, id: RequestId, error: ErrorData) {
+    pub(crate) fn send_error(&self, id: RequestId, error: ErrorData) {
         let outgoing_message = OutgoingMessage::Error(OutgoingError { id, error });
         let _ = self.sender.send(outgoing_message);
     }
@@ -169,7 +177,7 @@ impl From<OutgoingMessage> for OutgoingJsonRpcMessage {
             }
             Error(OutgoingError { id, error }) => JsonRpcMessage::Error(JsonRpcError {
                 jsonrpc: JsonRpcVersion2_0,
-                id,
+                id: Some(id),
                 error,
             }),
         }
@@ -287,6 +295,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn outgoing_tool_response_preserves_legacy_wire_format() {
+        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<OutgoingMessage>();
+        let outgoing_message_sender = OutgoingMessageSender::new(outgoing_tx);
+
+        outgoing_message_sender.send_response(
+            RequestId::Number(1),
+            rmcp::model::CallToolResult::success(Vec::new()),
+        );
+
+        let Some(OutgoingMessage::Response(response)) = outgoing_rx.recv().await else {
+            panic!("expected a tool-call response");
+        };
+        assert_eq!(response.id, RequestId::Number(1));
+        assert_eq!(response.result, json!({ "content": [], "isError": false }));
+    }
+
+    #[tokio::test]
     async fn test_send_event_as_notification() -> Result<()> {
         let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<OutgoingMessage>();
         let outgoing_message_sender = OutgoingMessageSender::new(outgoing_tx);
@@ -296,8 +321,11 @@ mod tests {
         let event = Event {
             id: "1".to_string(),
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
-                session_id: thread_id,
+                session_id: codex_protocol::SessionId::new(),
+                thread_id,
                 forked_from_id: None,
+                parent_thread_id: None,
+                thread_source: None,
                 thread_name: None,
                 model: "gpt-4o".to_string(),
                 model_provider_id: "test-provider".to_string(),
@@ -308,17 +336,13 @@ mod tests {
                 active_permission_profile: None,
                 cwd: test_path_buf("/home/user/project").abs(),
                 reasoning_effort: Some(ReasoningEffort::default()),
-                history_log_id: 1,
-                history_entry_count: 1000,
                 initial_messages: None,
                 network_proxy: None,
                 rollout_path: Some(rollout_file.path().to_path_buf()),
             }),
         };
 
-        outgoing_message_sender
-            .send_event_as_notification(&event, /*meta*/ None)
-            .await;
+        outgoing_message_sender.send_event_as_notification(&event, /*meta*/ None);
 
         let result = outgoing_rx.recv().await.unwrap();
         let OutgoingMessage::Notification(OutgoingNotification { method, params }) = result else {
@@ -338,11 +362,14 @@ mod tests {
         let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<OutgoingMessage>();
         let outgoing_message_sender = OutgoingMessageSender::new(outgoing_tx);
 
-        let conversation_id = ThreadId::new();
+        let thread_id = ThreadId::new();
         let rollout_file = NamedTempFile::new()?;
         let session_configured_event = SessionConfiguredEvent {
-            session_id: conversation_id,
+            session_id: codex_protocol::SessionId::new(),
+            thread_id,
             forked_from_id: None,
+            parent_thread_id: None,
+            thread_source: None,
             thread_name: None,
             model: "gpt-4o".to_string(),
             model_provider_id: "test-provider".to_string(),
@@ -353,8 +380,6 @@ mod tests {
             active_permission_profile: None,
             cwd: test_path_buf("/home/user/project").abs(),
             reasoning_effort: Some(ReasoningEffort::default()),
-            history_log_id: 1,
-            history_entry_count: 1000,
             initial_messages: None,
             network_proxy: None,
             rollout_path: Some(rollout_file.path().to_path_buf()),
@@ -368,9 +393,7 @@ mod tests {
             thread_id: None,
         };
 
-        outgoing_message_sender
-            .send_event_as_notification(&event, Some(meta))
-            .await;
+        outgoing_message_sender.send_event_as_notification(&event, Some(meta));
 
         let result = outgoing_rx.recv().await.unwrap();
         let OutgoingMessage::Notification(OutgoingNotification { method, params }) = result else {
@@ -385,6 +408,7 @@ mod tests {
             "msg": {
                 "type": "session_configured",
                 "session_id": session_configured_event.session_id,
+                "thread_id": session_configured_event.thread_id,
                 "model": "gpt-4o",
                 "model_provider_id": "test-provider",
                 "approval_policy": "never",
@@ -392,8 +416,6 @@ mod tests {
                 "permission_profile": session_configured_event.permission_profile,
                 "cwd": test_path_buf("/home/user/project"),
                 "reasoning_effort": session_configured_event.reasoning_effort,
-                "history_log_id": session_configured_event.history_log_id,
-                "history_entry_count": session_configured_event.history_entry_count,
                 "rollout_path": rollout_file.path().to_path_buf(),
             }
         });
@@ -409,8 +431,11 @@ mod tests {
         let thread_id = ThreadId::new();
         let rollout_file = NamedTempFile::new()?;
         let session_configured_event = SessionConfiguredEvent {
-            session_id: thread_id,
+            session_id: codex_protocol::SessionId::new(),
+            thread_id,
             forked_from_id: None,
+            parent_thread_id: None,
+            thread_source: None,
             thread_name: None,
             model: "gpt-4o".to_string(),
             model_provider_id: "test-provider".to_string(),
@@ -421,8 +446,6 @@ mod tests {
             active_permission_profile: None,
             cwd: test_path_buf("/home/user/project").abs(),
             reasoning_effort: Some(ReasoningEffort::default()),
-            history_log_id: 1,
-            history_entry_count: 1000,
             initial_messages: None,
             network_proxy: None,
             rollout_path: Some(rollout_file.path().to_path_buf()),
@@ -436,9 +459,7 @@ mod tests {
             thread_id: Some(thread_id),
         };
 
-        outgoing_message_sender
-            .send_event_as_notification(&event, Some(meta))
-            .await;
+        outgoing_message_sender.send_event_as_notification(&event, Some(meta));
 
         let result = outgoing_rx.recv().await.unwrap();
         let OutgoingMessage::Notification(OutgoingNotification { method, params }) = result else {
@@ -454,6 +475,7 @@ mod tests {
             "msg": {
                 "type": "session_configured",
                 "session_id": session_configured_event.session_id,
+                "thread_id": session_configured_event.thread_id,
                 "model": "gpt-4o",
                 "model_provider_id": "test-provider",
                 "approval_policy": "never",
@@ -461,8 +483,6 @@ mod tests {
                 "permission_profile": session_configured_event.permission_profile,
                 "cwd": test_path_buf("/home/user/project"),
                 "reasoning_effort": session_configured_event.reasoning_effort,
-                "history_log_id": session_configured_event.history_log_id,
-                "history_entry_count": session_configured_event.history_entry_count,
                 "rollout_path": rollout_file.path().to_path_buf(),
             }
         });

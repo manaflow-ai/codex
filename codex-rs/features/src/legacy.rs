@@ -22,20 +22,16 @@ const ALIASES: &[Alias] = &[
         feature: Feature::UnifiedExec,
     },
     Alias {
-        legacy_key: "experimental_use_freeform_apply_patch",
-        feature: Feature::ApplyPatchFreeform,
-    },
-    Alias {
-        legacy_key: "include_apply_patch_tool",
-        feature: Feature::ApplyPatchFreeform,
-    },
-    Alias {
         legacy_key: "request_permissions",
         feature: Feature::ExecPermissionApprovals,
     },
     Alias {
         legacy_key: "web_search",
         feature: Feature::WebSearchRequest,
+    },
+    Alias {
+        legacy_key: "imagegenext",
+        feature: Feature::ImageGeneration,
     },
     Alias {
         legacy_key: "collab",
@@ -71,25 +67,11 @@ pub(crate) fn feature_for_key(key: &str) -> Option<Feature> {
 
 #[derive(Debug, Default)]
 pub(crate) struct LegacyFeatureToggles {
-    pub include_apply_patch_tool: Option<bool>,
-    pub experimental_use_freeform_apply_patch: Option<bool>,
     pub experimental_use_unified_exec_tool: Option<bool>,
 }
 
 impl LegacyFeatureToggles {
     pub fn apply(self, features: &mut Features) {
-        set_if_some(
-            features,
-            Feature::ApplyPatchFreeform,
-            self.include_apply_patch_tool,
-            "include_apply_patch_tool",
-        );
-        set_if_some(
-            features,
-            Feature::ApplyPatchFreeform,
-            self.experimental_use_freeform_apply_patch,
-            "experimental_use_freeform_apply_patch",
-        );
         set_if_some(
             features,
             Feature::UnifiedExec,

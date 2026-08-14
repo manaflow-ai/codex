@@ -31,6 +31,13 @@ pub struct RateLimitStatusPayload {
     )]
     pub credits: Option<Option<Box<models::CreditStatusDetails>>>,
     #[serde(
+        rename = "spend_control",
+        default,
+        with = "::serde_with::rust::double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub spend_control: Option<Option<Box<models::SpendControlStatusDetails>>>,
+    #[serde(
         rename = "additional_rate_limits",
         default,
         with = "::serde_with::rust::double_option",
@@ -52,6 +59,7 @@ impl RateLimitStatusPayload {
             plan_type,
             rate_limit: None,
             credits: None,
+            spend_control: None,
             additional_rate_limits: None,
             rate_limit_reached_type: None,
         }
@@ -104,10 +112,16 @@ pub enum PlanType {
     FreeWorkspace,
     #[serde(rename = "team")]
     Team,
+    #[serde(rename = "self_serve_business_prolite")]
+    SelfServeBusinessProLite,
     #[serde(rename = "self_serve_business_usage_based")]
     SelfServeBusinessUsageBased,
     #[serde(rename = "business")]
     Business,
+    #[serde(rename = "ent26")]
+    Ent26,
+    #[serde(rename = "enterprise_cbp_automation")]
+    EnterpriseCbpAutomation,
     #[serde(rename = "enterprise_cbp_usage_based")]
     EnterpriseCbpUsageBased,
     #[serde(rename = "education")]

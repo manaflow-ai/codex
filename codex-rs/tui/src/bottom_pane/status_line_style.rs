@@ -30,20 +30,28 @@ enum StatusLineAccent {
 impl StatusLineAccent {
     fn for_item(item: StatusLineItem) -> Self {
         match item {
-            StatusLineItem::ModelName | StatusLineItem::ModelWithReasoning => Self::Model,
+            StatusLineItem::ModelName
+            | StatusLineItem::ModelWithReasoning
+            | StatusLineItem::Reasoning => Self::Model,
             StatusLineItem::CurrentDir | StatusLineItem::ProjectRoot => Self::Path,
-            StatusLineItem::GitBranch => Self::Branch,
+            StatusLineItem::GitBranch
+            | StatusLineItem::PullRequestNumber
+            | StatusLineItem::BranchChanges => Self::Branch,
             StatusLineItem::Status => Self::State,
             StatusLineItem::ContextRemaining
             | StatusLineItem::ContextUsed
             | StatusLineItem::ContextWindowSize
             | StatusLineItem::UsedTokens
             | StatusLineItem::TotalInputTokens
-            | StatusLineItem::TotalOutputTokens => Self::Usage,
+            | StatusLineItem::TotalOutputTokens
+            | StatusLineItem::ThreadCredits
+            | StatusLineItem::EstimatedThreadCost => Self::Usage,
             StatusLineItem::FiveHourLimit | StatusLineItem::WeeklyLimit => Self::Limit,
             StatusLineItem::CodexVersion | StatusLineItem::SessionId => Self::Metadata,
-            StatusLineItem::FastMode => Self::Mode,
-            StatusLineItem::ThreadTitle => Self::Thread,
+            StatusLineItem::FastMode | StatusLineItem::RawOutput => Self::Mode,
+            StatusLineItem::Permissions => Self::Mode,
+            StatusLineItem::ApprovalMode => Self::Mode,
+            StatusLineItem::ThreadTitle | StatusLineItem::WorkspaceHeadline => Self::Thread,
             StatusLineItem::TaskProgress => Self::Progress,
         }
     }
@@ -105,6 +113,11 @@ where
             )
         } else {
             Style::default().dim()
+        };
+        let style = if item == StatusLineItem::PullRequestNumber {
+            style.underlined()
+        } else {
+            style
         };
         spans.push(Span::styled(text, style));
     }
@@ -223,6 +236,23 @@ mod tests {
     }
 
     #[test]
+    fn thread_usage_items_share_an_accent_and_dim_separator() {
+        let line = status_line_from_segments_with_resolver(
+            [
+                (StatusLineItem::ThreadCredits, "5.2 credits".to_string()),
+                (StatusLineItem::EstimatedThreadCost, "~$0.21".to_string()),
+            ],
+            /*use_theme_colors*/ true,
+            |_| None,
+        )
+        .expect("thread usage status line");
+
+        assert_eq!(line_text(&line), "5.2 credits · ~$0.21");
+        assert_eq!(line.spans[0].style, line.spans[2].style);
+        assert!(line.spans[1].style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
     #[allow(clippy::disallowed_methods)]
     fn status_line_segments_soften_rgb_theme_styles_without_dimming_text() {
         let line = status_line_from_segments_with_resolver(
@@ -254,6 +284,25 @@ mod tests {
         assert!(line.spans[1].style.add_modifier.contains(Modifier::DIM));
         assert_eq!(line.spans[2].style.fg, None);
         assert!(line.spans[2].style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn pull_request_number_uses_link_style() {
+        let line = status_line_from_segments_with_resolver(
+            [(StatusLineItem::PullRequestNumber, "PR #20252".to_string())],
+            /*use_theme_colors*/ false,
+            |_| None,
+        )
+        .expect("status line");
+
+        assert_eq!(line.spans[0].style.fg, None);
+        assert!(line.spans[0].style.add_modifier.contains(Modifier::DIM));
+        assert!(
+            line.spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::UNDERLINED)
+        );
     }
 
     #[test]

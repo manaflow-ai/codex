@@ -23,6 +23,13 @@ impl ChatWidget {
         };
         self.bottom_pane.set_placeholder_text(placeholder);
         self.bottom_pane.set_side_conversation_active(active);
+        if self.blocks_direct_input && !active {
+            self.bottom_pane.set_parent_owned_thread();
+        }
+    }
+
+    pub(crate) fn side_conversation_active(&self) -> bool {
+        self.active_side_conversation
     }
 
     pub(crate) fn set_side_conversation_context_label(&mut self, label: Option<String>) {

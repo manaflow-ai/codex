@@ -1,11 +1,12 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used)]
 
 use codex_config::CONFIG_TOML_FILE;
 use codex_core::NewThread;
 use codex_features::Feature;
+use codex_history::InitialHistory;
 use codex_login::CodexAuth;
+use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::WarningEvent;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use core::time::Duration;
@@ -21,15 +22,18 @@ async fn emits_warning_when_unstable_features_enabled_via_config() {
     let mut config = load_default_config_for_test(&home).await;
     config
         .features
-        .enable(Feature::ChildAgentsMd)
+        .enable(Feature::ApplyPatchStreamingEvents)
         .expect("test config should allow feature update");
     let user_config_path =
         AbsolutePathBuf::from_absolute_path(config.codex_home.join(CONFIG_TOML_FILE))
             .expect("absolute user config path");
-    config.config_layer_stack = config.config_layer_stack.with_user_config(
-        &user_config_path,
-        toml! { features = { child_agents_md = true } }.into(),
-    );
+    config.config_layer_stack = config
+        .config_layer_stack
+        .with_user_config(
+            &user_config_path,
+            toml! { features = { apply_patch_streaming_events = true } }.into(),
+        )
+        .expect("feature user config should be valid");
 
     let thread_manager = codex_core::test_support::thread_manager_with_models_provider(
         CodexAuth::from_api_key("test"),
@@ -46,8 +50,8 @@ async fn emits_warning_when_unstable_features_enabled_via_config() {
             config.clone(),
             InitialHistory::New,
             auth_manager,
-            /*persist_extended_history*/ false,
             /*parent_trace*/ None,
+            ClientMcpExtensions::default(),
         )
         .await
         .expect("spawn conversation");
@@ -56,7 +60,7 @@ async fn emits_warning_when_unstable_features_enabled_via_config() {
     let EventMsg::Warning(WarningEvent { message }) = warning else {
         panic!("expected warning event");
     };
-    assert!(message.contains("child_agents_md"));
+    assert!(message.contains("apply_patch_streaming_events"));
     assert!(message.contains("Under-development features enabled"));
     assert!(message.contains("suppress_unstable_features_warning = true"));
 }
@@ -67,16 +71,19 @@ async fn suppresses_warning_when_configured() {
     let mut config = load_default_config_for_test(&home).await;
     config
         .features
-        .enable(Feature::ChildAgentsMd)
+        .enable(Feature::ApplyPatchStreamingEvents)
         .expect("test config should allow feature update");
     config.suppress_unstable_features_warning = true;
     let user_config_path =
         AbsolutePathBuf::from_absolute_path(config.codex_home.join(CONFIG_TOML_FILE))
             .expect("absolute user config path");
-    config.config_layer_stack = config.config_layer_stack.with_user_config(
-        &user_config_path,
-        toml! { features = { child_agents_md = true } }.into(),
-    );
+    config.config_layer_stack = config
+        .config_layer_stack
+        .with_user_config(
+            &user_config_path,
+            toml! { features = { apply_patch_streaming_events = true } }.into(),
+        )
+        .expect("feature user config should be valid");
 
     let thread_manager = codex_core::test_support::thread_manager_with_models_provider(
         CodexAuth::from_api_key("test"),
@@ -93,8 +100,8 @@ async fn suppresses_warning_when_configured() {
             config.clone(),
             InitialHistory::New,
             auth_manager,
-            /*persist_extended_history*/ false,
             /*parent_trace*/ None,
+            ClientMcpExtensions::default(),
         )
         .await
         .expect("spawn conversation");
