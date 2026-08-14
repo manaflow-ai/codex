@@ -133,7 +133,7 @@ async fn connection_failure_pauses_retry_budget_until_provider_is_reachable() ->
     };
     assert_eq!(
         connection_error.message,
-        "Reconnecting... waiting for network"
+        "Network error. Retrying in 5.0s (attempt 1/1)"
     );
 
     let recovered_server = MockServer::builder()
@@ -151,7 +151,18 @@ async fn connection_failure_pauses_retry_budget_until_provider_is_reachable() ->
     else {
         unreachable!("predicate guarantees a stream error event");
     };
-    assert_eq!(stream_error.message, "Reconnecting... 1/1");
+    assert!(
+        stream_error
+            .message
+            .starts_with("Request failed. Retrying in "),
+        "retry status should include its backoff: {}",
+        stream_error.message
+    );
+    assert!(
+        stream_error.message.ends_with("(attempt 1/1)"),
+        "retry status should include its attempt: {}",
+        stream_error.message
+    );
 
     let EventMsg::TurnComplete(completed) =
         wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await

@@ -4,11 +4,14 @@ use super::log_retry;
 use super::should_retry_response_stream_error;
 use crate::session::tests::make_session_and_context;
 use codex_protocol::error::CodexErr;
+use codex_protocol::error::RetryLimitReachedError;
+use codex_protocol::error::UnexpectedResponseError;
+use http::StatusCode;
 use std::time::Duration;
 use tracing_test::internal::MockWriter;
 
 #[test]
-fn sampling_overloads_are_persistent_without_changing_compaction_retryability() {
+fn overloads_are_retryable_for_sampling_and_remote_compaction() {
     let err = CodexErr::ServerOverloaded;
 
     assert!(!err.is_retryable());
@@ -16,9 +19,49 @@ fn sampling_overloads_are_persistent_without_changing_compaction_retryability() 
         ResponsesStreamRequest::Sampling,
         &err
     ));
-    assert!(!should_retry_response_stream_error(
+    assert!(should_retry_response_stream_error(
         ResponsesStreamRequest::RemoteCompactionV2,
         &err
+    ));
+}
+
+#[test]
+fn exhausted_transient_http_retries_remain_retryable_at_the_request_layer() {
+    let err = CodexErr::RetryLimit(RetryLimitReachedError {
+        status: StatusCode::TOO_MANY_REQUESTS,
+        request_id: Some("request-1".to_string()),
+    });
+
+    assert!(should_retry_response_stream_error(
+        ResponsesStreamRequest::Sampling,
+        &err
+    ));
+    assert!(should_retry_response_stream_error(
+        ResponsesStreamRequest::RemoteCompactionV2,
+        &err
+    ));
+}
+
+#[test]
+fn permanent_http_status_and_user_cancellation_are_not_retried() {
+    let bad_request = CodexErr::UnexpectedStatus(UnexpectedResponseError {
+        status: StatusCode::BAD_REQUEST,
+        body: "bad request".to_string(),
+        user_message: None,
+        url: None,
+        cf_ray: None,
+        request_id: None,
+        identity_authorization_error: None,
+        identity_error_code: None,
+    });
+
+    assert!(!should_retry_response_stream_error(
+        ResponsesStreamRequest::Sampling,
+        &bad_request
+    ));
+    assert!(!should_retry_response_stream_error(
+        ResponsesStreamRequest::Sampling,
+        &CodexErr::TurnAborted
     ));
 }
 

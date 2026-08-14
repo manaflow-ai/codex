@@ -128,7 +128,7 @@ async fn websocket_fallback_switches_to_http_after_retries_exhausted() -> Result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn websocket_fallback_hides_first_websocket_retry_stream_error() -> Result<()> {
+async fn websocket_fallback_reports_each_websocket_retry_stream_error() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -195,12 +195,17 @@ async fn websocket_fallback_hides_first_websocket_retry_stream_error() -> Result
         }
     }
 
-    let expected_stream_errors = if cfg!(debug_assertions) {
-        vec!["Reconnecting... 1/2", "Reconnecting... 2/2"]
-    } else {
-        vec!["Reconnecting... 2/2"]
-    };
-    assert_eq!(stream_error_messages, expected_stream_errors);
+    assert_eq!(stream_error_messages.len(), 2);
+    for (index, message) in stream_error_messages.iter().enumerate() {
+        assert!(
+            message.starts_with("Request failed. Retrying in "),
+            "retry status should include its backoff: {message}"
+        );
+        assert!(
+            message.ends_with(&format!("(attempt {}/2)", index + 1)),
+            "retry status should include its attempt: {message}"
+        );
+    }
     assert_eq!(response_mock.requests().len(), 1);
 
     Ok(())
