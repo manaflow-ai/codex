@@ -1,4 +1,5 @@
-use super::*;
+use codex_client::RetryOn;
+use codex_client::TransportError;
 use http::StatusCode;
 
 fn http_error(status: StatusCode) -> TransportError {
@@ -74,4 +75,23 @@ fn retries_timeout_and_network_errors() {
         0,
         1
     ));
+}
+
+#[test]
+fn does_not_retry_usage_limit_429_responses() {
+    let retry_on = RetryOn {
+        retry_429: true,
+        retry_5xx: true,
+        retry_transport: true,
+    };
+    let error = TransportError::Http {
+        status: StatusCode::TOO_MANY_REQUESTS,
+        url: None,
+        headers: None,
+        body: Some(
+            r#"{"error":{"type":"usage_limit_reached","message":"limit"}}"#.to_string(),
+        ),
+    };
+
+    assert!(!retry_on.should_retry(&error, 0, 1));
 }

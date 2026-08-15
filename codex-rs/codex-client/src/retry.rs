@@ -1,5 +1,6 @@
 use codex_http_client::Request;
 use codex_http_client::TransportError;
+use http::StatusCode;
 use rand::Rng;
 use std::future::Future;
 use std::time::Duration;
@@ -26,16 +27,44 @@ impl RetryOn {
             return false;
         }
         match err {
-            TransportError::Http { status, .. } => {
-                (self.retry_429 && status.as_u16() == 429)
-                    || (self.retry_5xx && status.is_server_error())
-            }
+            TransportError::Http { status, body, .. } => match *status {
+                StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_EARLY => self.retry_transport,
+                StatusCode::TOO_MANY_REQUESTS => {
+                    self.retry_429 && !is_permanent_rate_limit_body(body.as_deref())
+                }
+                _ if status.is_server_error() => self.retry_5xx,
+                _ => false,
+            },
             TransportError::Timeout
             | TransportError::Connection(_)
             | TransportError::Network(_) => self.retry_transport,
             _ => false,
         }
     }
+}
+
+fn is_permanent_rate_limit_body(body: Option<&str>) -> bool {
+    let Some(body) = body else {
+        return false;
+    };
+    let compact = body
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .collect::<String>();
+    [
+        "\"code\":\"insufficient_quota\"",
+        "\"type\":\"insufficient_quota\"",
+        "\"code\":\"usage_limit_reached\"",
+        "\"type\":\"usage_limit_reached\"",
+        "\"code\":\"usage_not_included\"",
+        "\"type\":\"usage_not_included\"",
+        "\"code\":\"billing_hard_limit_reached\"",
+        "\"type\":\"billing_hard_limit_reached\"",
+        "\"code\":\"account_deactivated\"",
+        "\"type\":\"account_deactivated\"",
+    ]
+    .iter()
+    .any(|marker| compact.contains(marker))
 }
 
 pub fn backoff(base: Duration, attempt: u64) -> Duration {
@@ -54,6 +83,7 @@ pub fn backoff(base: Duration, attempt: u64) -> Duration {
 pub enum RetryOperation {
     HttpRequest,
     Sampling,
+    LocalCompaction,
     RemoteCompactionV1,
     RemoteCompactionV2,
 }
@@ -65,6 +95,7 @@ macro_rules! record_retry {
         let (layer, operation) = match $operation {
             $crate::RetryOperation::HttpRequest => ("http", "request"),
             $crate::RetryOperation::Sampling => ("stream", "sampling"),
+            $crate::RetryOperation::LocalCompaction => ("stream", "local_compaction"),
             $crate::RetryOperation::RemoteCompactionV1 => ("request", "remote_compaction_v1"),
             $crate::RetryOperation::RemoteCompactionV2 => ("stream", "remote_compaction_v2"),
         };
@@ -101,6 +132,14 @@ where
             {
                 let retry_attempt = attempt + 1;
                 let delay = backoff(policy.base_delay, retry_attempt);
+                tracing::warn!(
+                    target: "codex_client::retry",
+                    attempt = retry_attempt,
+                    max_attempts = policy.max_attempts,
+                    delay_ms = delay.as_millis() as u64,
+                    error = %retry_error_kind(&err),
+                    "transient HTTP request failed; retrying"
+                );
                 crate::record_retry!(retry_attempt, delay, RetryOperation::HttpRequest);
                 tokio::time::sleep(delay).await;
             }
@@ -110,6 +149,13 @@ where
     Err(TransportError::RetryLimit)
 }
 
-#[cfg(test)]
-#[path = "retry_tests.rs"]
-mod tests;
+fn retry_error_kind(error: &TransportError) -> String {
+    match error {
+        TransportError::Http { status, .. } => format!("http {status}"),
+        TransportError::RetryLimit => "retry limit".to_string(),
+        TransportError::Timeout => "timeout".to_string(),
+        TransportError::Connection(_) => "connection".to_string(),
+        TransportError::Network(_) => "network".to_string(),
+        TransportError::Build(_) => "build".to_string(),
+    }
+}
