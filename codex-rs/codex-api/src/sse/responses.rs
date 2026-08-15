@@ -1077,6 +1077,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn known_permanent_failed_response_does_not_become_retryable() {
+        let raw_error = json!({
+            "type": "response.failed",
+            "response": {
+                "id": "resp_invalid",
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "model_not_found",
+                    "message": "The model does not exist."
+                }
+            }
+        })
+        .to_string();
+        let sse = format!("event: response.failed\ndata: {raw_error}\n\n");
+        let events = collect_events(&[sse.as_bytes()]).await;
+
+        assert_matches!(
+            events.as_slice(),
+            [Err(ApiError::InvalidRequest { message })]
+                if message == "The model does not exist."
+        );
+    }
+
+    #[tokio::test]
+    async fn known_permanent_incomplete_response_does_not_become_retryable() {
+        let event = json!({
+            "type": "response.incomplete",
+            "response": {
+                "incomplete_details": { "reason": "max_output_tokens" }
+            }
+        })
+        .to_string();
+        let sse = format!("event: response.incomplete\ndata: {event}\n\n");
+        let events = collect_events(&[sse.as_bytes()]).await;
+
+        assert_matches!(
+            events.as_slice(),
+            [Err(ApiError::InvalidRequest { message })]
+                if message.contains("max_output_tokens")
+        );
+    }
+
+    #[tokio::test]
     async fn context_window_error_is_fatal() {
         let raw_error = r#"{"type":"response.failed","sequence_number":3,"response":{"id":"resp_5c66275b97b9baef1ed95550adb3b7ec13b17aafd1d2f11b","object":"response","created_at":1759510079,"status":"failed","background":false,"error":{"code":"context_length_exceeded","message":"Your input exceeds the context window of this model. Please adjust your input and try again."},"usage":null,"user":null,"metadata":{}}}"#;
 

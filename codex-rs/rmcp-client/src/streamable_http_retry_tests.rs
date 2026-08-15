@@ -62,6 +62,11 @@ fn retryable_streamable_http_error_includes_remote_body_stream_failure() {
 }
 
 #[test]
+fn too_early_http_responses_are_retryable() {
+    assert!(is_retryable_http_status(StatusCode::TOO_EARLY));
+}
+
+#[test]
 fn startup_http_authentication_challenges_require_reauthorization() {
     let transport_error = || {
         DynamicTransportError::from_parts(

@@ -25,6 +25,18 @@ fn map_api_error_preserves_retry_delay() {
 }
 
 #[test]
+fn map_api_error_keeps_request_build_failures_permanent() {
+    let err = map_api_error(ApiError::Transport(TransportError::Build(
+        "failed to serialize request".to_string(),
+    )));
+
+    assert!(matches!(
+        err.details(),
+        CodexErrorDetails::InvalidRequest(message) if message == "failed to serialize request"
+    ));
+}
+
+#[test]
 fn map_api_error_maps_server_overloaded_from_503_body() {
     let body = serde_json::json!({
         "error": {

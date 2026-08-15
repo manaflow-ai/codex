@@ -109,3 +109,7 @@ where
     }
     Err(TransportError::RetryLimit)
 }
+
+#[cfg(test)]
+#[path = "retry_tests.rs"]
+mod tests;
