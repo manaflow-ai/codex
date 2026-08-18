@@ -44,7 +44,6 @@ use codex_client::UNLIMITED_RETRIES;
 use codex_client::classify_provider_error_text;
 use codex_client::format_retry_budget;
 use codex_client::is_capacity_error_body;
-use codex_client::is_permanent_error_text;
 use codex_config::McpServerAuth;
 use codex_config::McpServerConfig;
 use codex_config::McpServerTransportConfig;
@@ -254,44 +253,40 @@ impl CodexAppsStartupReconnect {
                         );
                         (false, None)
                     }
-                    Err(StartupOutcomeError::Failed { error, .. })
-                        if is_permanent_error_text(&error) && !is_capacity_error_body(&error) =>
-                    {
-                        state.consecutive_failures = 0;
-                        state.retry_not_before = None;
-                        warn!(
-                            error = %error,
-                            "Apps MCP startup reconnect stopped for a permanent error"
-                        );
-                        (false, None)
-                    }
                     Err(error) => {
-                        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
-                        let retry_after = codex_apps_reconnect_backoff(state.consecutive_failures);
-                        state.retry_not_before = Some(TokioInstant::now() + retry_after);
                         let error_text = error.to_string();
-                        let disposition = match if is_capacity_error_body(&error_text) {
+                        let disposition = if is_capacity_error_body(&error_text) {
                             RetryDisposition::Capacity
                         } else {
                             classify_provider_error_text(&error_text)
-                        } {
-                            RetryDisposition::Capacity => RetryDisposition::Capacity,
-                            RetryDisposition::Transient | RetryDisposition::DoNotRetry => {
-                                RetryDisposition::Transient
-                            }
                         };
-                        let retry_status = (
-                            state.consecutive_failures as u64,
-                            retry_after,
-                            disposition,
-                            error_text,
-                        );
-                        warn!(
-                            error = %error,
-                            retry_after_ms = retry_after.as_millis(),
-                            "Apps MCP startup reconnect failed; continuing with cached tools"
-                        );
-                        (false, Some(retry_status))
+                        if disposition == RetryDisposition::DoNotRetry {
+                            state.consecutive_failures = 0;
+                            state.retry_not_before = None;
+                            warn!(
+                                error = %error,
+                                "Apps MCP startup reconnect stopped for an unclassified or permanent error"
+                            );
+                            (false, None)
+                        } else {
+                            state.consecutive_failures =
+                                state.consecutive_failures.saturating_add(1);
+                            let retry_after =
+                                codex_apps_reconnect_backoff(state.consecutive_failures);
+                            state.retry_not_before = Some(TokioInstant::now() + retry_after);
+                            let retry_status = (
+                                state.consecutive_failures as u64,
+                                retry_after,
+                                disposition,
+                                error_text,
+                            );
+                            warn!(
+                                error = %error,
+                                retry_after_ms = retry_after.as_millis(),
+                                "Apps MCP startup reconnect failed; continuing with cached tools"
+                            );
+                            (false, Some(retry_status))
+                        }
                     }
                 }
             };
