@@ -348,7 +348,10 @@ async fn capacity_budget_guard_is_terminal_when_state_is_already_over_limit() {
         result,
         Err(error) if matches!(error.details(), codex_protocol::error::CodexErrorDetails::ServerOverloaded)
     ));
-    assert_eq!(retry_state.capacity_retries, super::MAX_CAPACITY_RETRIES + 1);
+    assert_eq!(
+        retry_state.capacity_retries,
+        super::MAX_CAPACITY_RETRIES + 1
+    );
 }
 
 #[test]
