@@ -101,6 +101,7 @@ pub(crate) const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub(crate) const CODEX_APPS_RECONNECT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const CODEX_APPS_RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(30);
+const CODEX_APPS_RECONNECT_TRANSIENT_MAX_RETRIES: u64 = 2;
 
 const UNTRUSTED_CONNECTOR_META_KEYS: &[&str] = &[
     "connector_id",
@@ -157,6 +158,9 @@ struct CodexAppsStartupReconnectState {
     current_client: Option<ManagedClient>,
     reconnect_in_flight: bool,
     consecutive_failures: u32,
+    transient_retries: u64,
+    capacity_retries: u64,
+    retry_exhausted: bool,
     retry_not_before: Option<TokioInstant>,
 }
 
@@ -210,7 +214,8 @@ impl CodexAppsStartupReconnect {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.current_client.is_some() || state.reconnect_in_flight {
+            if state.current_client.is_some() || state.reconnect_in_flight || state.retry_exhausted
+            {
                 return;
             }
             if state
@@ -236,16 +241,25 @@ impl CodexAppsStartupReconnect {
                     Ok(client) => {
                         state.current_client = Some(client);
                         state.consecutive_failures = 0;
+                        state.transient_retries = 0;
+                        state.capacity_retries = 0;
+                        state.retry_exhausted = false;
                         state.retry_not_before = None;
                         (true, None)
                     }
                     Err(StartupOutcomeError::Cancelled) => {
                         state.consecutive_failures = 0;
+                        state.transient_retries = 0;
+                        state.capacity_retries = 0;
+                        state.retry_exhausted = false;
                         state.retry_not_before = None;
                         (false, None)
                     }
                     Err(error) if error.is_authentication_required() => {
                         state.consecutive_failures = 0;
+                        state.transient_retries = 0;
+                        state.capacity_retries = 0;
+                        state.retry_exhausted = false;
                         state.retry_not_before = None;
                         warn!(
                             error = %error,
@@ -268,6 +282,9 @@ impl CodexAppsStartupReconnect {
                         };
                         if disposition == RetryDisposition::DoNotRetry {
                             state.consecutive_failures = 0;
+                            state.transient_retries = 0;
+                            state.capacity_retries = 0;
+                            state.retry_exhausted = false;
                             state.retry_not_before = None;
                             warn!(
                                 error = %error,
@@ -275,29 +292,71 @@ impl CodexAppsStartupReconnect {
                             );
                             (false, None)
                         } else {
-                            state.consecutive_failures =
-                                state.consecutive_failures.saturating_add(1);
-                            let retry_after =
-                                codex_apps_reconnect_backoff(state.consecutive_failures);
-                            state.retry_not_before = Some(TokioInstant::now() + retry_after);
-                            let retry_status = (
-                                state.consecutive_failures as u64,
-                                retry_after,
-                                disposition,
-                                error_text,
-                            );
-                            warn!(
-                                error = %error,
-                                retry_after_ms = retry_after.as_millis(),
-                                "Apps MCP startup reconnect failed; continuing with cached tools"
-                            );
-                            (false, Some(retry_status))
+                            let (retry_count, max_retries, exhausted) = match disposition {
+                                RetryDisposition::Capacity => {
+                                    let max_retries = PERSISTENT_CAPACITY_MAX_RETRIES;
+                                    if state.capacity_retries >= max_retries
+                                        || u64::from(state.consecutive_failures) >= max_retries
+                                    {
+                                        (state.capacity_retries, max_retries, true)
+                                    } else {
+                                        state.capacity_retries =
+                                            state.capacity_retries.saturating_add(1);
+                                        (state.capacity_retries, max_retries, false)
+                                    }
+                                }
+                                RetryDisposition::Transient => {
+                                    let max_retries = CODEX_APPS_RECONNECT_TRANSIENT_MAX_RETRIES;
+                                    if state.transient_retries >= max_retries
+                                        || u64::from(state.consecutive_failures) >= max_retries
+                                    {
+                                        (state.transient_retries, max_retries, true)
+                                    } else {
+                                        state.transient_retries =
+                                            state.transient_retries.saturating_add(1);
+                                        (state.transient_retries, max_retries, false)
+                                    }
+                                }
+                                RetryDisposition::DoNotRetry => unreachable!(),
+                            };
+                            if exhausted {
+                                state.retry_exhausted = true;
+                                state.retry_not_before = None;
+                                warn!(
+                                    error = %error,
+                                    retries = retry_count,
+                                    max_retries,
+                                    "Apps MCP startup reconnect retry budget exhausted"
+                                );
+                                (false, None)
+                            } else {
+                                state.consecutive_failures =
+                                    state.consecutive_failures.saturating_add(1);
+                                let retry_after =
+                                    codex_apps_reconnect_backoff(state.consecutive_failures);
+                                state.retry_not_before = Some(TokioInstant::now() + retry_after);
+                                let retry_status = (
+                                    retry_count,
+                                    max_retries,
+                                    retry_after,
+                                    disposition,
+                                    error_text,
+                                );
+                                warn!(
+                                    error = %error,
+                                    retry_after_ms = retry_after.as_millis(),
+                                    retries = retry_count,
+                                    max_retries,
+                                    "Apps MCP startup reconnect failed; continuing with cached tools"
+                                );
+                                (false, Some(retry_status))
+                            }
                         }
                     }
                 }
             };
 
-            if let Some((attempt, delay, disposition, error)) = retry_status
+            if let Some((attempt, max_retries, delay, disposition, error)) = retry_status
                 && let Some(context) = startup_status_context.clone()
             {
                 let retry_kind = match disposition {
@@ -318,7 +377,7 @@ impl CodexAppsStartupReconnect {
                             message: format!(
                                 "MCP server {} startup {retry_kind}. Retrying in {delay_text} (attempt {attempt}/{})",
                                 context.server_name,
-                                format_retry_budget(PERSISTENT_CAPACITY_MAX_RETRIES),
+                                format_retry_budget(max_retries),
                             ),
                             codex_error_info: None,
                             additional_details: Some(error),
