@@ -26,11 +26,11 @@ use crate::error::is_server_overloaded_error;
 use crate::error::map_websocket_close_error;
 use crate::error::map_websocket_operation_error;
 use crate::provider::Provider;
+use codex_client::PERSISTENT_CAPACITY_MAX_RETRIES;
 use codex_client::RetryDisposition;
 use codex_client::RetryNotifier;
 use codex_client::RetryStatus;
 use codex_client::TransportError;
-use codex_client::UNLIMITED_RETRIES;
 use codex_client::backoff;
 use codex_client::classify_provider_error_text;
 use codex_client::is_capacity_error_body;
@@ -992,12 +992,12 @@ impl RealtimeWebsocketClient {
     ) -> Option<(RetryDisposition, u64, u64)> {
         let disposition = error.retry_disposition();
         match disposition {
-            RetryDisposition::Capacity if *capacity_retries < UNLIMITED_RETRIES => {
+            RetryDisposition::Capacity if *capacity_retries < PERSISTENT_CAPACITY_MAX_RETRIES => {
                 *capacity_retries += 1;
                 Some((
                     RetryDisposition::Capacity,
                     *capacity_retries,
-                    UNLIMITED_RETRIES,
+                    PERSISTENT_CAPACITY_MAX_RETRIES,
                 ))
             }
             RetryDisposition::Transient

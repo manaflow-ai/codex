@@ -168,7 +168,7 @@ fn default_retry_limits_bound_transient_requests_but_keep_capacity_persistent() 
     assert_eq!(retry_policy.max_attempts, 4);
     assert_eq!(
         retry_policy.capacity_max_attempts,
-        codex_api::UNLIMITED_RETRIES
+        codex_api::PERSISTENT_CAPACITY_MAX_RETRIES
     );
 }
 

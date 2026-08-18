@@ -40,7 +40,7 @@ use async_channel::Sender;
 use codex_api::SharedAuthProvider;
 use codex_async_utils::CancelErr;
 use codex_async_utils::OrCancelExt;
-use codex_client::UNLIMITED_RETRIES;
+use codex_client::PERSISTENT_CAPACITY_MAX_RETRIES;
 use codex_client::classify_provider_error_text;
 use codex_client::format_retry_budget;
 use codex_client::is_capacity_error_body;
@@ -318,7 +318,7 @@ impl CodexAppsStartupReconnect {
                             message: format!(
                                 "MCP server {} startup {retry_kind}. Retrying in {delay_text} (attempt {attempt}/{})",
                                 context.server_name,
-                                format_retry_budget(UNLIMITED_RETRIES),
+                                format_retry_budget(PERSISTENT_CAPACITY_MAX_RETRIES),
                             ),
                             codex_error_info: None,
                             additional_details: Some(error),

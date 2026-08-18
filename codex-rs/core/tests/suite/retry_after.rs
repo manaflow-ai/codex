@@ -270,7 +270,7 @@ async fn wait_for_capacity_retry_success(test: &TestCodex, expected_retries: usi
             event.message.ends_with(&format!("(attempt {})", index + 1))
                 || event
                     .message
-                    .contains(&format!("(HTTP attempt {}/unlimited)", index + 1)),
+                    .contains(&format!("(HTTP attempt {}/100)", index + 1)),
             "retry status should expose its attempt and budget: {}",
             event.message
         );

@@ -13,10 +13,10 @@ use codex_api::ResponsesWebsocketConnection;
 use codex_api::ResponsesWsRequest;
 use codex_api::build_session_headers;
 use codex_api::create_text_param_for_request;
+use codex_client::PERSISTENT_CAPACITY_MAX_RETRIES;
 use codex_client::RetryDisposition;
 use codex_client::RetryNotifier;
 use codex_client::RetryStatus;
-use codex_client::UNLIMITED_RETRIES;
 use codex_client::backoff;
 use codex_client::classify_connection_error;
 use codex_client::classify_http_response;
@@ -156,9 +156,9 @@ async fn wait_for_sampling_retry(
 ) -> bool {
     let disposition = classify_sampling_error(error);
     let (retry_attempt, max_retries) = match disposition {
-        RetryDisposition::Capacity if *capacity_retries < UNLIMITED_RETRIES => {
+        RetryDisposition::Capacity if *capacity_retries < PERSISTENT_CAPACITY_MAX_RETRIES => {
             *capacity_retries = capacity_retries.saturating_add(1);
-            (*capacity_retries, UNLIMITED_RETRIES)
+            (*capacity_retries, PERSISTENT_CAPACITY_MAX_RETRIES)
         }
         RetryDisposition::Transient if *transient_retries < SAMPLING_MAX_RETRIES => {
             *transient_retries = transient_retries.saturating_add(1);

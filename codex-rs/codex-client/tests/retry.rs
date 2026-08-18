@@ -13,9 +13,9 @@ use http::HeaderMap;
 use http::Method;
 use http::StatusCode;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::sync::Mutex;
 use std::time::Duration;
 
 fn http_error(status: StatusCode) -> TransportError {

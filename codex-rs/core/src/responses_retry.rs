@@ -26,7 +26,7 @@ use tracing::warn;
 
 const INITIAL_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(5);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
-const MAX_CAPACITY_RETRIES: u64 = codex_client::UNLIMITED_RETRIES;
+const MAX_CAPACITY_RETRIES: u64 = codex_client::PERSISTENT_CAPACITY_MAX_RETRIES;
 
 pub(crate) fn retry_status_notifier(
     sess: std::sync::Arc<Session>,

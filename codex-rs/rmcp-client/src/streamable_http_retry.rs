@@ -32,7 +32,7 @@ const MCP_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 // unbounded transient loop unsafe. Capacity remains persistent because it is detected before the
 // remote operation is accepted.
 pub(super) const MCP_TRANSIENT_MAX_RETRIES: u64 = 2;
-pub(super) const MCP_CAPACITY_MAX_RETRIES: u64 = codex_client::UNLIMITED_RETRIES;
+pub(super) const MCP_CAPACITY_MAX_RETRIES: u64 = codex_client::PERSISTENT_CAPACITY_MAX_RETRIES;
 
 pub(super) fn mcp_retry_delay(attempt: u64) -> Duration {
     backoff(MCP_RETRY_BASE_DELAY, attempt).min(Duration::from_secs(60))

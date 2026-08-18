@@ -6,10 +6,10 @@ use std::time::UNIX_EPOCH;
 
 use anyhow::Context;
 use anyhow::Result;
+use codex_client::PERSISTENT_CAPACITY_MAX_RETRIES;
 use codex_client::RetryDisposition;
 use codex_client::RetryNotifier;
 use codex_client::RetryStatus;
-use codex_client::UNLIMITED_RETRIES;
 use codex_client::backoff;
 use codex_client::classify_provider_error_text;
 use codex_client::format_retry_budget;
@@ -38,7 +38,7 @@ use super::token_needs_refresh;
 
 const REFRESH_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
 const OAUTH_TRANSIENT_MAX_RETRIES: u64 = 2;
-const OAUTH_CAPACITY_MAX_RETRIES: u64 = UNLIMITED_RETRIES;
+const OAUTH_CAPACITY_MAX_RETRIES: u64 = PERSISTENT_CAPACITY_MAX_RETRIES;
 const OAUTH_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 const OAUTH_MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 

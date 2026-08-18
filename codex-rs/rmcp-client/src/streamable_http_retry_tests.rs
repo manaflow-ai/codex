@@ -217,9 +217,13 @@ fn mcp_retry_delay_is_exponential_and_capped_at_one_minute() {
 }
 
 #[test]
-fn mcp_transient_budget_is_bounded_but_capacity_is_persistent() {
+fn mcp_transient_and_capacity_budgets_are_bounded() {
     assert_eq!(MCP_TRANSIENT_MAX_RETRIES, 2);
-    assert_eq!(MCP_CAPACITY_MAX_RETRIES, codex_client::UNLIMITED_RETRIES);
+    assert_eq!(
+        MCP_CAPACITY_MAX_RETRIES,
+        codex_client::PERSISTENT_CAPACITY_MAX_RETRIES
+    );
+    assert_eq!(MCP_CAPACITY_MAX_RETRIES, 100);
 }
 
 #[test]

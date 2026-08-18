@@ -8,10 +8,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
-/// Sentinel used by built-in providers for a retry budget with no attempt limit.
+/// Sentinel for callers that explicitly opt into an unbounded retry budget.
 pub const UNLIMITED_RETRIES: u64 = u64::MAX;
-/// Backwards-compatible name for the persistent capacity budget. Capacity is now unlimited.
-pub const PERSISTENT_CAPACITY_MAX_RETRIES: u64 = UNLIMITED_RETRIES;
+/// Persistent capacity retries remain available for a long provider outage, but stop after a
+/// bounded number of attempts so a dead provider cannot keep a turn alive forever.
+pub const PERSISTENT_CAPACITY_MAX_RETRIES: u64 = 100;
 
 pub fn format_retry_budget(max_retries: u64) -> String {
     if max_retries == UNLIMITED_RETRIES {
