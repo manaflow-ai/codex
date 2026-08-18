@@ -321,6 +321,36 @@ async fn exhausted_outer_rate_limit_budget_is_terminal() {
     ));
 }
 
+#[tokio::test]
+async fn capacity_budget_guard_is_terminal_when_state_is_already_over_limit() {
+    let (session, turn_context) = make_session_and_context().await;
+    let mut client_session = session.services.model_client.new_session();
+    let mut retry_state = super::ResponsesStreamRetryState::default();
+    retry_state.capacity_retries = super::MAX_CAPACITY_RETRIES + 1;
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        handle_retryable_response_stream_error_with_cancellation(
+            &mut retry_state,
+            /*max_retries*/ 0,
+            CodexErr::ServerOverloaded,
+            &mut client_session,
+            &session,
+            &turn_context,
+            ResponsesStreamRequest::Sampling,
+            &CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("an over-budget capacity state must not sleep or retry");
+
+    assert!(matches!(
+        result,
+        Err(error) if matches!(error.details(), codex_protocol::error::CodexErrorDetails::ServerOverloaded)
+    ));
+    assert_eq!(retry_state.capacity_retries, super::MAX_CAPACITY_RETRIES + 1);
+}
+
 #[test]
 fn capacity_retry_delay_uses_exponential_backoff_with_a_sixty_second_cap() {
     let first = capacity_retry_delay(1);

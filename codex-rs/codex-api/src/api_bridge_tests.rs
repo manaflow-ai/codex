@@ -25,6 +25,20 @@ fn map_api_error_preserves_retry_delay() {
 }
 
 #[test]
+fn map_api_error_keeps_permanent_text_terminal_even_when_retry_marked() {
+    let err = map_api_error(ApiError::Retryable {
+        message: "invalid request: account suspended".to_string(),
+        delay: Some(std::time::Duration::from_secs(1)),
+    });
+
+    assert!(matches!(
+        err.details(),
+        CodexErrorDetails::InvalidRequest(message) if message == "invalid request: account suspended"
+    ));
+    assert!(!err.is_explicitly_retryable());
+}
+
+#[test]
 fn map_api_error_promotes_wrapped_capacity_retryable_errors_to_overload() {
     let err = map_api_error(ApiError::Retryable {
         message: r#"{"error":{"type":"invalid_request_error","message":"Selected model is at capacity. Please try a different model."}}"#
