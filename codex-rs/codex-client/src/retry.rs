@@ -208,6 +208,7 @@ pub fn is_capacity_error_text(text: &str) -> bool {
         "temporarily overloaded",
         "too many connections",
         "websocket connection limit",
+        "slow down",
     ];
     CAPACITY_MARKERS
         .iter()
