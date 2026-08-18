@@ -270,6 +270,11 @@ pub fn is_transient_error_text(text: &str) -> bool {
         "refused stream",
         "service unavailable",
         "slow down",
+        // Startup/reconnect layers use this phrase for a failed connection attempt. It is
+        // narrower than a bare "failed" marker, which would replay permanent configuration
+        // errors that happen to contain that word.
+        "startup failed",
+        "startup failure",
         "temporarily unavailable",
     ];
     TRANSIENT_MARKERS

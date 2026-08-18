@@ -254,7 +254,13 @@ impl CodexAppsStartupReconnect {
                         (false, None)
                     }
                     Err(error) => {
-                        let error_text = error.to_string();
+                        // Classify the original startup failure. The Display wrapper adds
+                        // "MCP startup failed", which would turn an otherwise permanent route
+                        // error into a false transient match.
+                        let error_text = match &error {
+                            StartupOutcomeError::Failed { error, .. } => error.clone(),
+                            StartupOutcomeError::Cancelled => "MCP startup cancelled".to_string(),
+                        };
                         let disposition = if is_capacity_error_body(&error_text) {
                             RetryDisposition::Capacity
                         } else {
