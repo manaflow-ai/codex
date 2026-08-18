@@ -410,6 +410,10 @@ fn local_cancellation_and_permanent_model_or_tls_errors_are_terminal() {
         "operation cancelled",
         // Hyper uses this exact message when a caller cancellation drops an in-flight request.
         "operation was canceled",
+        "request canceled",
+        "request cancelled",
+        "context canceled",
+        "context cancelled",
     ] {
         assert!(!retry_on.should_retry(&TransportError::Network(message.to_string()), 0, 1,));
         assert_eq!(
