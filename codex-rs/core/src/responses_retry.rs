@@ -287,29 +287,33 @@ async fn handle_retryable_response_error_inner(
         return Ok(());
     }
 
-    // A low-level request can still return a 429 after its configured transport budget. Keep
-    // that provider rate limit in the same unlimited outer retry loop instead of surfacing
-    // `exceeded retry limit` to the user.
+    // A low-level request can still return a 429 after its configured transport budget. Give
+    // that provider rate limit the same bounded outer budget as the stream request instead of
+    // surfacing it immediately, but do not turn it into an unbounded loop.
     if matches!(
         err.details(),
         CodexErrorDetails::RetryLimit(error) if error.status == StatusCode::TOO_MANY_REQUESTS
     ) {
+        if retry_state.rate_limit_retries >= max_retries {
+            return Err(err);
+        }
         retry_state.rate_limit_retries = retry_state.rate_limit_retries.saturating_add(1);
         let retry_count = retry_state.rate_limit_retries;
         let delay = backoff(retry_count).min(MAX_RETRY_DELAY);
         warn!(
             turn_id = %turn_context.sub_id,
             retries = retry_count,
-            max_retries = "unlimited",
+            max_retries = format_retry_budget(max_retries),
             ?delay,
             "rate limit exhausted a transport retry budget; waiting to retry Responses request"
         );
         sess.notify_stream_error(
             turn_context,
             format!(
-                "Rate limited. Retrying in {} (attempt {}/unlimited)",
+                "Rate limited. Retrying in {} (attempt {}/{})",
                 format_retry_delay(delay),
                 retry_count,
+                format_retry_budget(max_retries),
             ),
             err,
         )
