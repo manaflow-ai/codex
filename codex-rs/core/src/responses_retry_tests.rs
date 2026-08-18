@@ -289,6 +289,38 @@ async fn cancelled_turn_stops_before_retry_backoff() {
     assert_eq!(retry_state.capacity_retries, 0);
 }
 
+#[tokio::test]
+async fn exhausted_outer_rate_limit_budget_is_terminal() {
+    let (session, turn_context) = make_session_and_context().await;
+    let mut client_session = session.services.model_client.new_session();
+    let mut retry_state = super::ResponsesStreamRetryState::default();
+    let error = CodexErr::RetryLimit(RetryLimitReachedError {
+        status: StatusCode::TOO_MANY_REQUESTS,
+        request_id: None,
+    });
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        handle_retryable_response_stream_error_with_cancellation(
+            &mut retry_state,
+            /*max_retries*/ 0,
+            error,
+            &mut client_session,
+            &session,
+            &turn_context,
+            ResponsesStreamRequest::Sampling,
+            &CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("an exhausted rate-limit budget must not loop forever");
+
+    assert!(matches!(
+        result,
+        Err(error) if matches!(error.details(), codex_protocol::error::CodexErrorDetails::RetryLimit(_))
+    ));
+}
+
 #[test]
 fn capacity_retry_delay_uses_exponential_backoff_with_a_sixty_second_cap() {
     let first = capacity_retry_delay(1);
