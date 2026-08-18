@@ -257,7 +257,7 @@ async fn handle_retryable_response_error_inner(
     }
 
     if response_error_retry_disposition(&err) == RetryDisposition::Capacity {
-        if retry_state.capacity_retries == MAX_CAPACITY_RETRIES {
+        if retry_state.capacity_retries >= MAX_CAPACITY_RETRIES {
             return Err(err);
         }
         retry_state.capacity_retries = retry_state.capacity_retries.saturating_add(1);

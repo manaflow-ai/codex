@@ -29,6 +29,9 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
             if is_capacity_error_body(&message) {
                 return CodexErr::ServerOverloaded;
             }
+            if is_permanent_error_message(&message) {
+                return CodexErr::InvalidRequest(message);
+            }
             let error = CodexErr::Stream(message).with_explicit_retryable();
             match delay {
                 Some(delay) => error.with_retry_delay(delay),
