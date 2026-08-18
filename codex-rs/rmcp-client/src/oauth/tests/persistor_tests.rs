@@ -1,5 +1,7 @@
 use std::sync::Arc;
 use std::sync::mpsc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -277,6 +279,51 @@ async fn transient_refresh_failure_does_not_require_reauthorization() -> Result<
     let stored = load_oauth_tokens_from_file(&initial.server_name, &initial.url)?
         .expect("a transient refresh failure must preserve durable credentials");
     assert_tokens_match_without_expiry(&stored, &initial);
+    server.verify().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn transient_refresh_failure_retries_before_succeeding() -> Result<()> {
+    let (_env, server, initial) = test_context().await?;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_for_responder = Arc::clone(&attempts);
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .and(body_string_contains("grant_type=refresh_token"))
+        .and(body_string_contains("refresh_token=refresh-token"))
+        .respond_with(move |_request: &wiremock::Request| {
+            let attempt = attempts_for_responder.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                ResponseTemplate::new(503).set_body_json(serde_json::json!({
+                    "error": "temporarily_unavailable",
+                    "error_description": "provider is temporarily unavailable",
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "retried-access-token",
+                    "token_type": "Bearer",
+                    "expires_in": 3600,
+                }))
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    save_oauth_tokens_to_file(&initial)?;
+    let persistor = persistor_for(&initial).await?;
+
+    persistor
+        .refresh_if_needed()
+        .await
+        .expect("a transient OAuth refresh failure should be retried");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    let stored = load_oauth_tokens_from_file(&initial.server_name, &initial.url)?
+        .expect("successful retry should persist refreshed credentials");
+    assert_eq!(
+        stored.token_response.0.access_token().secret(),
+        "retried-access-token"
+    );
     server.verify().await;
     Ok(())
 }
