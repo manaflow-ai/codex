@@ -15,6 +15,7 @@ use std::time::Instant;
 use anyhow::Result;
 use anyhow::anyhow;
 use codex_api::SharedAuthProvider;
+use codex_client::RetryDisposition;
 use codex_config::types::AuthKeyringBackendKind;
 use codex_config::types::McpServerEnvVar;
 use codex_exec_server::HttpClient;
@@ -95,7 +96,10 @@ use codex_config::types::OAuthCredentialsStoreMode;
 mod streamable_http_retry;
 
 use self::streamable_http_retry::HandshakeError;
-use self::streamable_http_retry::STREAMABLE_HTTP_RETRY_DELAYS_MS;
+use self::streamable_http_retry::MCP_CAPACITY_MAX_RETRIES;
+use self::streamable_http_retry::MCP_TRANSIENT_MAX_RETRIES;
+use self::streamable_http_retry::classify_mcp_error;
+use self::streamable_http_retry::mcp_retry_delay;
 use self::streamable_http_retry::sleep_with_retry_deadline;
 
 enum PendingTransport {
@@ -335,6 +339,10 @@ pub type SendElicitation = Box<
     dyn Fn(RequestId, Elicitation) -> BoxFuture<'static, Result<ElicitationResponse>> + Send + Sync,
 >;
 
+/// MCP-specific names for the shared retry status contract.
+pub type McpRetryStatus = codex_client::RetryStatus;
+pub type McpRetryNotifier = codex_client::RetryNotifier;
+
 pub struct ToolWithConnectorId {
     pub tool: Tool,
     pub connector_id: Option<String>,
@@ -363,12 +371,20 @@ pub struct RmcpClient {
     initialize_context: Mutex<Option<InitializeContext>>,
     session_recovery_lock: Semaphore,
     elicitation_pause_state: ElicitationPauseState,
+    retry_notifier: Option<McpRetryNotifier>,
 }
 
 impl RmcpClient {
     /// Returns the protocol compatibility policy captured when this client was created.
     pub fn protocol_mode(&self) -> McpProtocolMode {
         self.protocol_mode
+    }
+
+    /// Adds a status sink for bounded retries. Status is sent to the UI only and is not part of
+    /// MCP request content or model history.
+    pub fn with_retry_notifier(mut self, retry_notifier: McpRetryNotifier) -> Self {
+        self.retry_notifier = Some(retry_notifier);
+        self
     }
 
     pub async fn new_in_process_client(
@@ -389,6 +405,7 @@ impl RmcpClient {
             initialize_context: Mutex::new(None),
             session_recovery_lock: Semaphore::new(/*permits*/ 1),
             elicitation_pause_state: ElicitationPauseState::new(),
+            retry_notifier: None,
         })
     }
 
@@ -461,6 +478,7 @@ impl RmcpClient {
             initialize_context: Mutex::new(None),
             session_recovery_lock: Semaphore::new(/*permits*/ 1),
             elicitation_pause_state: ElicitationPauseState::new(),
+            retry_notifier: None,
         })
     }
 
@@ -560,6 +578,7 @@ impl RmcpClient {
             initialize_context: Mutex::new(None),
             session_recovery_lock: Semaphore::new(/*permits*/ 1),
             elicitation_pause_state: ElicitationPauseState::new(),
+            retry_notifier: None,
         })
     }
 
@@ -973,6 +992,7 @@ impl RmcpClient {
     /// OAuth uses independent lock/request bounds and completes before the operation timeout starts.
     async fn refresh_oauth_if_needed(&self) -> Result<()> {
         if let Some(runtime) = self.oauth_persistor().await {
+            runtime.set_retry_notifier(self.retry_notifier.clone());
             runtime.refresh_if_needed().await?;
         }
         Ok(())
@@ -1256,20 +1276,21 @@ impl RmcpClient {
         Fut: std::future::Future<Output = std::result::Result<T, rmcp::service::ServiceError>>,
     {
         let service = self.service().await?;
-        match Self::run_service_operation_with_transient_retries(
-            Arc::clone(&service),
-            label,
-            timeout,
-            self.elicitation_pause_state.clone(),
-            &operation,
-        )
-        .await
+        match self
+            .run_service_operation_with_transient_retries(
+                Arc::clone(&service),
+                label,
+                timeout,
+                self.elicitation_pause_state.clone(),
+                &operation,
+            )
+            .await
         {
             Ok(result) => Ok(result),
             Err(error) if Self::is_session_expired_404(&error) => {
                 self.reinitialize_after_session_expiry(&service).await?;
                 let recovered_service = self.service().await?;
-                Self::run_service_operation_with_transient_retries(
+                self.run_service_operation_with_transient_retries(
                     recovered_service,
                     label,
                     timeout,
@@ -1284,6 +1305,7 @@ impl RmcpClient {
     }
 
     async fn run_service_operation_with_transient_retries<T, F, Fut>(
+        &self,
         service: Arc<RunningService<RoleClient, ElicitationClientService>>,
         label: &str,
         timeout: Option<Duration>,
@@ -1295,13 +1317,9 @@ impl RmcpClient {
         Fut: std::future::Future<Output = std::result::Result<T, rmcp::service::ServiceError>>,
     {
         let retry_deadline = timeout.map(|duration| Instant::now() + duration);
-        for (attempt, retry_delay_ms) in STREAMABLE_HTTP_RETRY_DELAYS_MS
-            .iter()
-            .copied()
-            .map(Some)
-            .chain(std::iter::once(None))
-            .enumerate()
-        {
+        let mut transient_retries = 0;
+        let mut capacity_retries = 0;
+        loop {
             let attempt_timeout = remaining_operation_timeout(label, timeout, retry_deadline)?;
             match Self::run_service_operation_once(
                 Arc::clone(&service),
@@ -1313,18 +1331,44 @@ impl RmcpClient {
             .await
             {
                 Ok(result) => return Ok(result),
-                Err(error) if Self::is_retryable_tools_list_error(label, &error) => {
-                    let Some(retry_delay_ms) = retry_delay_ms else {
-                        return Err(error);
+                Err(error) => {
+                    let disposition = Self::classify_service_operation_error(label, &error);
+                    let (retry_count, max_retries) = match disposition {
+                        RetryDisposition::Capacity
+                            if capacity_retries < MCP_CAPACITY_MAX_RETRIES =>
+                        {
+                            capacity_retries += 1;
+                            (capacity_retries, MCP_CAPACITY_MAX_RETRIES)
+                        }
+                        RetryDisposition::Transient
+                            if transient_retries < MCP_TRANSIENT_MAX_RETRIES =>
+                        {
+                            transient_retries += 1;
+                            (transient_retries, MCP_TRANSIENT_MAX_RETRIES)
+                        }
+                        RetryDisposition::DoNotRetry
+                        | RetryDisposition::Transient
+                        | RetryDisposition::Capacity => return Err(error),
                     };
-                    let delay = Duration::from_millis(retry_delay_ms);
+                    let delay = mcp_retry_delay(retry_count);
                     warn!(
-                        attempt = attempt + 1,
-                        max_attempts = STREAMABLE_HTTP_RETRY_DELAYS_MS.len() + 1,
+                        attempt = retry_count,
+                        max_retries,
                         delay_ms = delay.as_millis(),
                         error = %error,
-                        "streamable HTTP MCP tools/list failed with a retryable error; retrying"
+                        operation = label,
+                        retry_disposition = ?disposition,
+                        "streamable HTTP MCP operation failed with a retryable error; retrying"
                     );
+                    self.emit_retry_status(McpRetryStatus {
+                        operation: label.to_string(),
+                        disposition,
+                        attempt: retry_count,
+                        max_retries,
+                        delay,
+                        error: error.to_string(),
+                    })
+                    .await;
                     if !sleep_with_retry_deadline(delay, retry_deadline).await {
                         return Err(ClientOperationError::Timeout {
                             label: label.to_string(),
@@ -1332,11 +1376,85 @@ impl RmcpClient {
                         });
                     }
                 }
-                Err(error) => return Err(error),
             }
         }
+    }
 
-        unreachable!("service operation retry loop should return on success or final error")
+    async fn emit_retry_status(&self, status: McpRetryStatus) {
+        if let Some(retry_notifier) = self.retry_notifier.as_ref() {
+            retry_notifier(status).await;
+        }
+    }
+
+    fn classify_service_operation_error(
+        label: &str,
+        error: &ClientOperationError,
+    ) -> RetryDisposition {
+        // MCP calls can have side effects, so only listed operations and explicit transient
+        // classes are replayed. Unknown SDK variants fail closed.
+        if !matches!(
+            label,
+            "tools/list"
+                | "tools/call"
+                | "resources/list"
+                | "resources/templates/list"
+                | "resources/read"
+        ) {
+            return RetryDisposition::DoNotRetry;
+        }
+        match error {
+            // This is the caller's total operation deadline. No time remains for another
+            // attempt. SDK and transport timeouts below can still retry inside that deadline.
+            ClientOperationError::Timeout { .. } => RetryDisposition::DoNotRetry,
+            ClientOperationError::Service(rmcp::service::ServiceError::TransportClosed)
+            | ClientOperationError::Service(rmcp::service::ServiceError::Timeout { .. })
+            | ClientOperationError::Service(rmcp::service::ServiceError::SubscriptionLagged {
+                ..
+            }) => RetryDisposition::Transient,
+            ClientOperationError::Service(rmcp::service::ServiceError::TransportSend(error)) => {
+                error
+                    .error
+                    .downcast_ref::<StreamableHttpError<StreamableHttpClientAdapterError>>()
+                    .map(Self::classify_streamable_http_error)
+                    .unwrap_or(RetryDisposition::DoNotRetry)
+            }
+            ClientOperationError::Service(rmcp::service::ServiceError::McpError(error)) => {
+                classify_mcp_error(error)
+            }
+            // On the client side, rmcp creates this variant only after the peer sends a
+            // notifications/cancelled message for the active request. Local user cancellation
+            // drops the operation future instead and does not enter this retry loop.
+            ClientOperationError::Service(rmcp::service::ServiceError::Cancelled { reason }) => {
+                match reason.as_deref() {
+                    Some(reason) if codex_client::is_capacity_error_body(reason) => {
+                        RetryDisposition::Capacity
+                    }
+                    Some(reason) if codex_client::is_permanent_error_text(reason) => {
+                        RetryDisposition::DoNotRetry
+                    }
+                    Some(reason) => match codex_client::classify_provider_error_text(reason) {
+                        RetryDisposition::Capacity => RetryDisposition::Capacity,
+                        RetryDisposition::Transient | RetryDisposition::DoNotRetry => {
+                            RetryDisposition::Transient
+                        }
+                    },
+                    None => RetryDisposition::Transient,
+                }
+            }
+            ClientOperationError::Service(rmcp::service::ServiceError::UnexpectedResponse)
+            | ClientOperationError::Service(
+                rmcp::service::ServiceError::InputRequiredRoundsExceeded { .. },
+            ) => RetryDisposition::DoNotRetry,
+            ClientOperationError::Service(_) => RetryDisposition::DoNotRetry,
+        }
+    }
+
+    #[cfg(test)]
+    fn is_retryable_service_operation_error(label: &str, error: &ClientOperationError) -> bool {
+        !matches!(
+            Self::classify_service_operation_error(label, error),
+            RetryDisposition::DoNotRetry
+        )
     }
 
     async fn run_service_operation_once<T, F, Fut>(
@@ -1362,22 +1480,6 @@ impl RmcpClient {
             }
             None => operation(service).await.map_err(ClientOperationError::from),
         }
-    }
-
-    fn is_retryable_tools_list_error(label: &str, error: &ClientOperationError) -> bool {
-        if label != "tools/list" {
-            return false;
-        }
-        let ClientOperationError::Service(rmcp::service::ServiceError::TransportSend(error)) =
-            error
-        else {
-            return false;
-        };
-
-        error
-            .error
-            .downcast_ref::<StreamableHttpError<StreamableHttpClientAdapterError>>()
-            .is_some_and(Self::is_retryable_streamable_http_error)
     }
 
     fn is_session_expired_404(error: &ClientOperationError) -> bool {
@@ -1554,6 +1656,96 @@ mod tests {
         };
 
         assert_eq!(error.to_string(), "timed out awaiting tools/list after 30s");
+    }
+
+    #[test]
+    fn caller_deadlines_are_terminal_but_server_timeouts_retry_for_read_and_tool_calls() {
+        let caller_deadline = ClientOperationError::Timeout {
+            label: "operation".to_string(),
+            duration: Duration::from_secs(1),
+        };
+        let server_timeout = ClientOperationError::Service(rmcp::service::ServiceError::Timeout {
+            timeout: Duration::from_secs(1),
+        });
+
+        for label in [
+            "tools/list",
+            "resources/list",
+            "resources/templates/list",
+            "resources/read",
+            "tools/call",
+        ] {
+            assert!(
+                !RmcpClient::is_retryable_service_operation_error(label, &caller_deadline),
+                "did not expect exhausted caller deadline for {label} to retry"
+            );
+            assert!(
+                RmcpClient::is_retryable_service_operation_error(label, &server_timeout),
+                "expected {label} server timeout to retry"
+            );
+        }
+        assert!(!RmcpClient::is_retryable_service_operation_error(
+            "requests/custom",
+            &server_timeout
+        ));
+    }
+
+    #[test]
+    fn mcp_internal_errors_and_server_cancellation_retry_but_permanent_errors_do_not() {
+        let internal = ClientOperationError::Service(rmcp::service::ServiceError::McpError(
+            rmcp::model::ErrorData::new(
+                rmcp::model::ErrorCode(-32603),
+                "temporary server error",
+                None,
+            ),
+        ));
+        assert!(RmcpClient::is_retryable_service_operation_error(
+            "tools/call",
+            &internal
+        ));
+
+        let invalid = ClientOperationError::Service(rmcp::service::ServiceError::McpError(
+            rmcp::model::ErrorData::new(rmcp::model::ErrorCode(-32602), "invalid request", None),
+        ));
+        assert!(!RmcpClient::is_retryable_service_operation_error(
+            "tools/call",
+            &invalid
+        ));
+
+        let cancelled = ClientOperationError::Service(rmcp::service::ServiceError::Cancelled {
+            reason: Some("server overloaded".to_string()),
+        });
+        assert!(RmcpClient::is_retryable_service_operation_error(
+            "tools/call",
+            &cancelled
+        ));
+
+        let permanent_cancellation =
+            ClientOperationError::Service(rmcp::service::ServiceError::Cancelled {
+                reason: Some("invalid request".to_string()),
+            });
+        assert!(!RmcpClient::is_retryable_service_operation_error(
+            "tools/call",
+            &permanent_cancellation,
+        ));
+
+        let unclassified_cancellation =
+            ClientOperationError::Service(rmcp::service::ServiceError::Cancelled {
+                reason: Some("server rejected the configured route".to_string()),
+            });
+        assert!(!RmcpClient::is_retryable_service_operation_error(
+            "tools/call",
+            &unclassified_cancellation,
+        ));
+
+        let lagged =
+            ClientOperationError::Service(rmcp::service::ServiceError::SubscriptionLagged {
+                capacity: 10,
+            });
+        assert!(RmcpClient::is_retryable_service_operation_error(
+            "resources/read",
+            &lagged,
+        ));
     }
 
     #[tokio::test]
