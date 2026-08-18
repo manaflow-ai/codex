@@ -8,6 +8,7 @@ use codex_client::Request;
 use codex_client::RequestBody;
 use codex_client::RequestTelemetry;
 use codex_client::Response;
+use codex_client::RetryNotifier;
 use codex_client::StreamResponse;
 use codex_client::TransportError;
 use http::HeaderMap;
@@ -21,6 +22,8 @@ pub(crate) struct EndpointSession<T: HttpTransport> {
     provider: Provider,
     auth: SharedAuthProvider,
     request_telemetry: Option<Arc<dyn RequestTelemetry>>,
+    retry_notifier: Option<RetryNotifier>,
+    capacity_max_attempts: Option<u64>,
 }
 
 impl<T: HttpTransport> EndpointSession<T> {
@@ -30,6 +33,8 @@ impl<T: HttpTransport> EndpointSession<T> {
             provider,
             auth,
             request_telemetry: None,
+            retry_notifier: None,
+            capacity_max_attempts: None,
         }
     }
 
@@ -38,6 +43,16 @@ impl<T: HttpTransport> EndpointSession<T> {
         request: Option<Arc<dyn RequestTelemetry>>,
     ) -> Self {
         self.request_telemetry = request;
+        self
+    }
+
+    pub(crate) fn with_retry_notifier(mut self, retry_notifier: Option<RetryNotifier>) -> Self {
+        self.retry_notifier = retry_notifier;
+        self
+    }
+
+    pub(crate) fn with_capacity_max_attempts(mut self, max_attempts: u64) -> Self {
+        self.capacity_max_attempts = Some(max_attempts);
         self
     }
 
@@ -95,8 +110,13 @@ impl<T: HttpTransport> EndpointSession<T> {
             req
         };
 
+        let mut retry_policy = self.provider.retry.to_policy();
+        retry_policy.retry_notifier = self.retry_notifier.clone();
+        if let Some(max_attempts) = self.capacity_max_attempts {
+            retry_policy.capacity_max_attempts = max_attempts;
+        }
         let response = run_with_request_telemetry(
-            self.provider.retry.to_policy(),
+            retry_policy,
             self.request_telemetry.clone(),
             make_request,
             |req| {
@@ -136,8 +156,13 @@ impl<T: HttpTransport> EndpointSession<T> {
         let request = request.into_prepared().map_err(TransportError::Build)?;
         let make_request = || request.clone();
 
+        let mut retry_policy = self.provider.retry.to_policy();
+        retry_policy.retry_notifier = self.retry_notifier.clone();
+        if let Some(max_attempts) = self.capacity_max_attempts {
+            retry_policy.capacity_max_attempts = max_attempts;
+        }
         let stream = run_with_request_telemetry(
-            self.provider.retry.to_policy(),
+            retry_policy,
             self.request_telemetry.clone(),
             make_request,
             |req| {

@@ -7,12 +7,18 @@ use crate::client::CompactConversationRequestSettings;
 use crate::compact::CompactionAnalyticsDetails;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::CompactionTurnMetadata;
+use crate::responses_retry::ResponsesStreamRequest;
+use crate::responses_retry::ResponsesStreamRetryState;
+use crate::responses_retry::handle_retryable_response_error_with_cancellation;
+use crate::responses_retry::retry_status_notifier;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
+use codex_async_utils::OrCancelExt;
 use codex_protocol::auth::AuthMode;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::ResponseItem;
 use codex_rollout_trace::CompactionTraceContext;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 pub(super) struct RemoteCompactAttempt {
@@ -27,7 +33,11 @@ pub(super) async fn run_remote_compact_attempt(
     compaction_trace: &CompactionTraceContext,
     compaction_metadata: CompactionTurnMetadata,
     analytics_details: &mut CompactionAnalyticsDetails,
+    cancellation_token: &CancellationToken,
 ) -> CodexResult<RemoteCompactAttempt> {
+    if cancellation_token.is_cancelled() {
+        return Err(codex_protocol::error::CodexErr::TurnAborted);
+    }
     let turn_context = &step_context.turn;
     let mut history = sess.clone_history().await;
     let base_instructions = sess.get_base_instructions().await;
@@ -74,27 +84,57 @@ pub(super) async fn run_remote_compact_attempt(
         window_id,
         CodexResponsesRequestKind::Compaction(compaction_metadata),
     );
-    let new_history = sess
-        .services
-        .model_client
-        .compact_conversation_history(
-            &prompt,
-            &turn_context.model_info,
-            turn_state,
-            CompactConversationRequestSettings {
-                effort: turn_context.reasoning_effort.clone(),
-                summary: turn_context.reasoning_summary,
-                service_tier: if sess.services.auth_manager.auth_mode() == Some(AuthMode::ApiKey) {
-                    None
-                } else {
-                    turn_context.config.service_tier.clone()
+    let max_retries = turn_context.provider.info().stream_max_retries();
+    let mut retry_state = ResponsesStreamRetryState::default();
+    let new_history = loop {
+        if cancellation_token.is_cancelled() {
+            return Err(codex_protocol::error::CodexErr::TurnAborted);
+        }
+        let result = sess
+            .services
+            .model_client
+            .compact_conversation_history(
+                &prompt,
+                &turn_context.model_info,
+                turn_state.clone(),
+                CompactConversationRequestSettings {
+                    effort: turn_context.reasoning_effort.clone(),
+                    summary: turn_context.reasoning_summary,
+                    service_tier: if sess.services.auth_manager.auth_mode()
+                        == Some(AuthMode::ApiKey)
+                    {
+                        None
+                    } else {
+                        turn_context.config.service_tier.clone()
+                    },
                 },
-            },
-            &turn_context.session_telemetry,
-            compaction_trace,
-            &responses_metadata,
-        )
-        .await?;
+                &turn_context.session_telemetry,
+                Some(retry_status_notifier(
+                    Arc::clone(sess),
+                    Arc::clone(turn_context),
+                )),
+                compaction_trace,
+                &responses_metadata,
+            )
+            .or_cancel(cancellation_token)
+            .await
+            .map_err(|_| codex_protocol::error::CodexErr::TurnAborted)?;
+        match result {
+            Ok(new_history) => break new_history,
+            Err(err) => {
+                handle_retryable_response_error_with_cancellation(
+                    &mut retry_state,
+                    max_retries,
+                    err,
+                    sess,
+                    turn_context,
+                    ResponsesStreamRequest::RemoteCompactionV1,
+                    cancellation_token,
+                )
+                .await?;
+            }
+        }
+    };
     Ok(RemoteCompactAttempt {
         new_history,
         trace_input_history,

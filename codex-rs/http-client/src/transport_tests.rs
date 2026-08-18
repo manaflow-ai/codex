@@ -50,6 +50,17 @@ async fn connection_failures_are_classified_without_exposing_request_urls() {
     assert!(!error.to_string().contains("url-secret"));
 }
 
+#[tokio::test]
+async fn invalid_request_urls_are_build_errors_and_are_not_network_retries() {
+    let transport = ReqwestTransport::from_http_client(HttpClient::new(test_reqwest_client()));
+    let error = transport
+        .execute(Request::new(Method::GET, "not a valid URL".to_string()))
+        .await
+        .expect_err("invalid URL should fail");
+
+    assert!(matches!(error, TransportError::Build(_)));
+}
+
 fn test_reqwest_client() -> reqwest::Client {
     reqwest::Client::builder()
         .no_proxy()

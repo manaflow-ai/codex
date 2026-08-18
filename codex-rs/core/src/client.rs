@@ -63,6 +63,7 @@ use codex_api::auth_header_telemetry;
 use codex_api::build_session_headers;
 use codex_api::create_text_param_for_request;
 use codex_api::response_create_client_metadata;
+use codex_client::RetryNotifier;
 use codex_http_client::ClientRouteClass;
 use codex_http_client::HttpClientFactory;
 use codex_login::AuthManager;
@@ -285,6 +286,7 @@ pub struct ModelClientSession {
     /// keep sending it unchanged between turn requests (e.g., for retries, incremental
     /// appends, or continuation requests), and must not send it between different turns.
     turn_state: Arc<OnceLock<String>>,
+    retry_notifier: Option<RetryNotifier>,
 }
 
 #[derive(Debug, Clone)]
@@ -496,6 +498,7 @@ impl ModelClient {
             client: self.clone(),
             websocket_session: self.take_cached_websocket_session(),
             turn_state: Arc::new(OnceLock::new()),
+            retry_notifier: None,
         }
     }
 
@@ -556,6 +559,7 @@ impl ModelClient {
         turn_state: Option<Arc<OnceLock<String>>>,
         settings: CompactConversationRequestSettings,
         session_telemetry: &SessionTelemetry,
+        retry_notifier: Option<RetryNotifier>,
         compaction_trace: &CompactionTraceContext,
         responses_metadata: &CodexResponsesMetadata,
     ) -> Result<Vec<ResponseItem>> {
@@ -640,7 +644,8 @@ impl ModelClient {
             .saturating_mul(COMPACT_REQUEST_TIMEOUT_IDLE_MULTIPLIER);
         let client =
             ApiCompactClient::new(transport, client_setup.api_provider, client_setup.api_auth)
-                .with_telemetry(Some(request_telemetry));
+                .with_telemetry(Some(request_telemetry))
+                .with_retry_notifier(retry_notifier);
         let trace_attempt = compaction_trace.start_attempt(&payload);
         let result = client
             .compact_input(
@@ -661,6 +666,7 @@ impl ModelClient {
         session_config: ApiRealtimeSessionConfig,
         mut extra_headers: ApiHeaderMap,
         api_provider_override: Option<ApiProvider>,
+        retry_notifier: Option<RetryNotifier>,
     ) -> Result<RealtimeWebrtcCallStart> {
         // Create the media call over HTTP first, then retain matching auth so realtime can attach
         // the server-side control WebSocket to the call id from that HTTP response.
@@ -675,6 +681,7 @@ impl ModelClient {
         let api_provider = api_provider_override.unwrap_or(client_setup.api_provider);
         let transport = self.build_api_transport(&api_provider, REALTIME_CALLS_ENDPOINT)?;
         let response = ApiRealtimeCallClient::new(transport, api_provider, client_setup.api_auth)
+            .with_retry_notifier(retry_notifier)
             .create_with_session_and_headers(sdp, session_config, extra_headers)
             .await
             .map_err(|error| self.state.provider.map_api_error(error))?;
@@ -1165,6 +1172,10 @@ impl Drop for ModelClientSession {
 }
 
 impl ModelClientSession {
+    pub(crate) fn set_retry_notifier(&mut self, retry_notifier: RetryNotifier) {
+        self.retry_notifier = Some(retry_notifier);
+    }
+
     pub(crate) fn turn_state(&self) -> Arc<OnceLock<String>> {
         Arc::clone(&self.turn_state)
     }
@@ -1311,11 +1322,13 @@ impl ModelClientSession {
             return Ok(());
         }
 
-        let client_setup = self.client.current_client_setup().await.map_err(|err| {
-            ApiError::Stream(format!(
-                "failed to build websocket prewarm client setup: {err}"
-            ))
-        })?;
+        let client_setup =
+            self.client
+                .current_client_setup()
+                .await
+                .map_err(|err| ApiError::InvalidRequest {
+                    message: format!("failed to build websocket prewarm client setup: {err}"),
+                })?;
         let auth_context = AuthRequestTelemetryContext::new(
             client_setup.auth.as_ref().map(CodexAuth::auth_mode),
             client_setup.api_auth.as_ref(),
@@ -1403,9 +1416,10 @@ impl ModelClientSession {
         self.websocket_session
             .connection
             .as_ref()
-            .ok_or(ApiError::Stream(
-                "websocket connection is unavailable".to_string(),
-            ))
+            .ok_or(ApiError::Retryable {
+                message: "websocket connection is unavailable".to_string(),
+                delay: None,
+            })
     }
 
     fn responses_request_compression(&self, auth: Option<&CodexAuth>) -> Compression {
@@ -1507,7 +1521,8 @@ impl ModelClientSession {
                 client_setup.api_provider,
                 client_setup.api_auth,
             )
-            .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
+            .with_telemetry(Some(request_telemetry), Some(sse_telemetry))
+            .with_retry_notifier(self.retry_notifier.clone());
             let stream_result = client.stream_request(request, options).await;
 
             match stream_result {
@@ -1712,9 +1727,13 @@ impl ModelClientSession {
 
             let websocket_connection =
                 self.websocket_session.connection.as_ref().ok_or_else(|| {
-                    self.client.state.provider.map_api_error(ApiError::Stream(
-                        "websocket connection is unavailable".to_string(),
-                    ))
+                    self.client
+                        .state
+                        .provider
+                        .map_api_error(ApiError::Retryable {
+                            message: "websocket connection is unavailable".to_string(),
+                            delay: None,
+                        })
                 })?;
             let stream_result = websocket_connection
                 .stream_request(
@@ -2302,7 +2321,7 @@ async fn handle_unauthorized(
                     debug.auth_error.as_deref(),
                     debug.auth_error_code.as_deref(),
                 );
-                Err(CodexErr::Io(other))
+                Err(CodexErr::Io(other).with_explicit_retryable())
             }
         };
     }

@@ -40,6 +40,10 @@ use async_channel::Sender;
 use codex_api::SharedAuthProvider;
 use codex_async_utils::CancelErr;
 use codex_async_utils::OrCancelExt;
+use codex_client::PERSISTENT_CAPACITY_MAX_RETRIES;
+use codex_client::classify_provider_error_text;
+use codex_client::format_retry_budget;
+use codex_client::is_capacity_error_body;
 use codex_config::McpServerAuth;
 use codex_config::McpServerConfig;
 use codex_config::McpServerTransportConfig;
@@ -54,9 +58,13 @@ use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::McpStartupStatus;
 use codex_protocol::protocol::McpStartupUpdateEvent;
+use codex_protocol::protocol::StreamErrorEvent;
 use codex_rmcp_client::ExecutorStdioServerLauncher;
 use codex_rmcp_client::LocalStdioServerLauncher;
 use codex_rmcp_client::McpProtocolMode;
+use codex_rmcp_client::McpRetryNotifier;
+use codex_rmcp_client::McpRetryStatus;
+use codex_rmcp_client::RetryDisposition;
 use codex_rmcp_client::RmcpClient;
 use codex_rmcp_client::StdioServerLauncher;
 use codex_rmcp_client::StreamableHttpRedirectMode;
@@ -93,6 +101,7 @@ pub(crate) const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub(crate) const CODEX_APPS_RECONNECT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const CODEX_APPS_RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(30);
+const CODEX_APPS_RECONNECT_TRANSIENT_MAX_RETRIES: u64 = 2;
 
 const UNTRUSTED_CONNECTOR_META_KEYS: &[&str] = &[
     "connector_id",
@@ -149,6 +158,9 @@ struct CodexAppsStartupReconnectState {
     current_client: Option<ManagedClient>,
     reconnect_in_flight: bool,
     consecutive_failures: u32,
+    transient_retries: u64,
+    capacity_retries: u64,
+    retry_exhausted: bool,
     retry_not_before: Option<TokioInstant>,
 }
 
@@ -202,7 +214,8 @@ impl CodexAppsStartupReconnect {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.current_client.is_some() || state.reconnect_in_flight {
+            if state.current_client.is_some() || state.reconnect_in_flight || state.retry_exhausted
+            {
                 return;
             }
             if state
@@ -218,7 +231,7 @@ impl CodexAppsStartupReconnect {
         tokio::spawn(async move {
             let result = (reconnect.factory)().await;
             let startup_status_context = reconnect.startup_status_context.clone();
-            let recovered = {
+            let (recovered, retry_status) = {
                 let mut state = reconnect
                     .state
                     .lock()
@@ -228,24 +241,150 @@ impl CodexAppsStartupReconnect {
                     Ok(client) => {
                         state.current_client = Some(client);
                         state.consecutive_failures = 0;
+                        state.transient_retries = 0;
+                        state.capacity_retries = 0;
+                        state.retry_exhausted = false;
                         state.retry_not_before = None;
-                        true
+                        (true, None)
                     }
-                    Err(error) => {
-                        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
-                        let retry_after = codex_apps_reconnect_backoff(state.consecutive_failures);
-                        state.retry_not_before = Some(TokioInstant::now() + retry_after);
+                    Err(StartupOutcomeError::Cancelled) => {
+                        state.consecutive_failures = 0;
+                        state.transient_retries = 0;
+                        state.capacity_retries = 0;
+                        state.retry_exhausted = false;
+                        state.retry_not_before = None;
+                        (false, None)
+                    }
+                    Err(error) if error.is_authentication_required() => {
+                        state.consecutive_failures = 0;
+                        state.transient_retries = 0;
+                        state.capacity_retries = 0;
+                        state.retry_exhausted = false;
+                        state.retry_not_before = None;
                         warn!(
                             error = %error,
-                            retry_after_ms = retry_after.as_millis(),
-                            "Apps MCP startup reconnect failed; continuing with cached tools"
+                            "Apps MCP startup reconnect stopped because authentication is required"
                         );
-                        false
+                        (false, None)
+                    }
+                    Err(error) => {
+                        // Classify the original startup failure. The Display wrapper adds
+                        // "MCP startup failed", which would turn an otherwise permanent route
+                        // error into a false transient match.
+                        let error_text = match &error {
+                            StartupOutcomeError::Failed { error, .. } => error.clone(),
+                            StartupOutcomeError::Cancelled => "MCP startup cancelled".to_string(),
+                        };
+                        let disposition = if is_capacity_error_body(&error_text) {
+                            RetryDisposition::Capacity
+                        } else {
+                            classify_provider_error_text(&error_text)
+                        };
+                        if disposition == RetryDisposition::DoNotRetry {
+                            state.consecutive_failures = 0;
+                            state.transient_retries = 0;
+                            state.capacity_retries = 0;
+                            state.retry_exhausted = false;
+                            state.retry_not_before = None;
+                            warn!(
+                                error = %error,
+                                "Apps MCP startup reconnect stopped for an unclassified or permanent error"
+                            );
+                            (false, None)
+                        } else {
+                            let (retry_count, max_retries, exhausted) = match disposition {
+                                RetryDisposition::Capacity => {
+                                    let max_retries = PERSISTENT_CAPACITY_MAX_RETRIES;
+                                    if state.capacity_retries >= max_retries
+                                        || u64::from(state.consecutive_failures) >= max_retries
+                                    {
+                                        (state.capacity_retries, max_retries, true)
+                                    } else {
+                                        state.capacity_retries =
+                                            state.capacity_retries.saturating_add(1);
+                                        (state.capacity_retries, max_retries, false)
+                                    }
+                                }
+                                RetryDisposition::Transient => {
+                                    let max_retries = CODEX_APPS_RECONNECT_TRANSIENT_MAX_RETRIES;
+                                    if state.transient_retries >= max_retries
+                                        || u64::from(state.consecutive_failures) >= max_retries
+                                    {
+                                        (state.transient_retries, max_retries, true)
+                                    } else {
+                                        state.transient_retries =
+                                            state.transient_retries.saturating_add(1);
+                                        (state.transient_retries, max_retries, false)
+                                    }
+                                }
+                                RetryDisposition::DoNotRetry => unreachable!(),
+                            };
+                            if exhausted {
+                                state.retry_exhausted = true;
+                                state.retry_not_before = None;
+                                warn!(
+                                    error = %error,
+                                    retries = retry_count,
+                                    max_retries,
+                                    "Apps MCP startup reconnect retry budget exhausted"
+                                );
+                                (false, None)
+                            } else {
+                                state.consecutive_failures =
+                                    state.consecutive_failures.saturating_add(1);
+                                let retry_after =
+                                    codex_apps_reconnect_backoff(state.consecutive_failures);
+                                state.retry_not_before = Some(TokioInstant::now() + retry_after);
+                                let retry_status = (
+                                    retry_count,
+                                    max_retries,
+                                    retry_after,
+                                    disposition,
+                                    error_text,
+                                );
+                                warn!(
+                                    error = %error,
+                                    retry_after_ms = retry_after.as_millis(),
+                                    retries = retry_count,
+                                    max_retries,
+                                    "Apps MCP startup reconnect failed; continuing with cached tools"
+                                );
+                                (false, Some(retry_status))
+                            }
+                        }
                     }
                 }
             };
 
-            if recovered && let Some(context) = startup_status_context {
+            if let Some((attempt, max_retries, delay, disposition, error)) = retry_status
+                && let Some(context) = startup_status_context.clone()
+            {
+                let retry_kind = match disposition {
+                    RetryDisposition::Capacity => "is at capacity",
+                    RetryDisposition::Transient => "request failed",
+                    RetryDisposition::DoNotRetry => return,
+                };
+                let delay_text = if delay < Duration::from_secs(1) {
+                    format!("{}ms", delay.as_millis().max(1))
+                } else {
+                    format!("{:.1}s", delay.as_secs_f64())
+                };
+                let _ = context
+                    .tx_event
+                    .send(Event {
+                        id: context.submit_id,
+                        msg: EventMsg::StreamError(StreamErrorEvent {
+                            message: format!(
+                                "MCP server {} startup {retry_kind}. Retrying in {delay_text} (attempt {attempt}/{})",
+                                context.server_name,
+                                format_retry_budget(max_retries),
+                            ),
+                            codex_error_info: None,
+                            additional_details: Some(error),
+                        }),
+                    })
+                    .await;
+            } else if recovered && let Some(context) = startup_status_context {
                 let _ = context
                     .tx_event
                     .send(Event {
@@ -268,8 +407,49 @@ fn codex_apps_reconnect_backoff(consecutive_failures: u32) -> Duration {
         .min(CODEX_APPS_RECONNECT_MAX_BACKOFF)
 }
 
+fn mcp_retry_notifier(
+    submit_id: String,
+    server_name: String,
+    tx_event: Sender<Event>,
+) -> McpRetryNotifier {
+    Arc::new(move |status: McpRetryStatus| {
+        let submit_id = submit_id.clone();
+        let server_name = server_name.clone();
+        let tx_event = tx_event.clone();
+        async move {
+            let retry_kind = match status.disposition {
+                RetryDisposition::Capacity => "is at capacity",
+                RetryDisposition::Transient => "request failed",
+                RetryDisposition::DoNotRetry => return,
+            };
+            let delay = if status.delay < Duration::from_secs(1) {
+                format!("{}ms", status.delay.as_millis().max(1))
+            } else {
+                format!("{:.1}s", status.delay.as_secs_f64())
+            };
+            let _ = tx_event
+                .send(Event {
+                    id: submit_id,
+                    msg: EventMsg::StreamError(StreamErrorEvent {
+                        message: format!(
+                            "MCP server {server_name} {retry_kind}. Retrying {} in {delay} (attempt {}/{})",
+                            status.operation,
+                            status.attempt,
+                            format_retry_budget(status.max_retries),
+                        ),
+                        codex_error_info: None,
+                        additional_details: Some(status.error),
+                    }),
+                })
+                .await;
+        }
+        .boxed()
+    })
+}
+
 #[derive(Clone)]
 struct ManagedClientStartup {
+    startup_submit_id: String,
     server_name: String,
     server: EffectiveMcpServer,
     store_mode: OAuthCredentialsStoreMode,
@@ -292,6 +472,7 @@ struct ManagedClientStartup {
 impl ManagedClientStartup {
     fn start(&self) -> ManagedClientFuture {
         let Self {
+            startup_submit_id,
             server_name,
             server,
             store_mode,
@@ -341,7 +522,18 @@ impl ManagedClientStartup {
                 )
                 .await
                 {
-                    Ok(result) => Arc::new(result?),
+                    Ok(result) => {
+                        let client = result?;
+                        let client = match tx_event.as_ref() {
+                            Some(tx_event) => client.with_retry_notifier(mcp_retry_notifier(
+                                startup_submit_id.clone(),
+                                server_name.clone(),
+                                tx_event.clone(),
+                            )),
+                            None => client,
+                        };
+                        Arc::new(client)
+                    }
                     Err(_) => {
                         return Err(StartupOutcomeError::from(anyhow!(
                             "MCP client startup timed out after {startup_timeout:?}"
@@ -439,6 +631,7 @@ impl AsyncManagedClient {
         };
         let startup_complete = Arc::new(AtomicBool::new(false));
         let startup = Arc::new(ManagedClientStartup {
+            startup_submit_id: startup_submit_id.clone(),
             server_name,
             server,
             store_mode,
@@ -1136,6 +1329,190 @@ mod tests {
     use rmcp::model::JsonObject;
     use rmcp::model::MetaObject;
     use rmcp::transport::auth::AuthError;
+
+    #[tokio::test]
+    async fn mcp_retry_status_is_sent_as_a_ui_only_stream_event() {
+        let (tx_event, rx_event) = async_channel::bounded(1);
+        let notifier = mcp_retry_notifier("turn-1".to_string(), "tools".to_string(), tx_event);
+
+        notifier(McpRetryStatus {
+            operation: "tools/call".to_string(),
+            disposition: RetryDisposition::Capacity,
+            attempt: 2,
+            max_retries: 100,
+            delay: Duration::from_secs(1),
+            error: "Selected model is at capacity".to_string(),
+        })
+        .await;
+
+        let event = rx_event.recv().await.expect("retry event should be sent");
+        assert_eq!(event.id, "turn-1");
+        let EventMsg::StreamError(status) = event.msg else {
+            panic!("expected a stream status event");
+        };
+        assert_eq!(
+            status.message,
+            "MCP server tools is at capacity. Retrying tools/call in 1.0s (attempt 2/100)"
+        );
+        assert_eq!(
+            status.additional_details.as_deref(),
+            Some("Selected model is at capacity")
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_apps_reconnect_does_not_schedule_another_retry() {
+        let reconnect = Arc::new(CodexAppsStartupReconnect::new(Arc::new(|| {
+            async { Err(StartupOutcomeError::Cancelled) }
+                .boxed()
+                .shared()
+        })));
+
+        reconnect.reconnect_in_background();
+
+        for _ in 0..100 {
+            let finished = {
+                let state = reconnect
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                !state.reconnect_in_flight
+            };
+            if finished {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let state = reconnect
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!state.reconnect_in_flight);
+        assert_eq!(state.consecutive_failures, 0);
+        assert_eq!(state.retry_not_before, None);
+    }
+
+    #[tokio::test]
+    async fn permanent_apps_reconnect_error_does_not_schedule_another_retry() {
+        let reconnect = Arc::new(CodexAppsStartupReconnect::new(Arc::new(|| {
+            async {
+                Err(StartupOutcomeError::Failed {
+                    error: "model does not exist".to_string(),
+                    is_authentication_required: false,
+                })
+            }
+            .boxed()
+            .shared()
+        })));
+
+        reconnect.reconnect_in_background();
+
+        for _ in 0..100 {
+            let finished = {
+                let state = reconnect
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                !state.reconnect_in_flight
+            };
+            if finished {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let state = reconnect
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!state.reconnect_in_flight);
+        assert_eq!(state.consecutive_failures, 0);
+        assert_eq!(state.retry_not_before, None);
+    }
+
+    #[tokio::test]
+    async fn unclassified_apps_reconnect_error_does_not_schedule_another_retry() {
+        let reconnect = Arc::new(CodexAppsStartupReconnect::new(Arc::new(|| {
+            async {
+                Err(StartupOutcomeError::Failed {
+                    error: "server rejected the configured route".to_string(),
+                    is_authentication_required: false,
+                })
+            }
+            .boxed()
+            .shared()
+        })));
+
+        reconnect.reconnect_in_background();
+
+        for _ in 0..100 {
+            let finished = {
+                let state = reconnect
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                !state.reconnect_in_flight
+            };
+            if finished {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let state = reconnect
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!state.reconnect_in_flight);
+        assert_eq!(state.consecutive_failures, 0);
+        assert_eq!(state.retry_not_before, None);
+    }
+
+    #[tokio::test]
+    async fn exhausted_apps_reconnect_capacity_budget_does_not_schedule_another_retry() {
+        let reconnect = Arc::new(CodexAppsStartupReconnect::new(Arc::new(|| {
+            async {
+                Err(StartupOutcomeError::Failed {
+                    error: "Selected model is at capacity. Please try a different model."
+                        .to_string(),
+                    is_authentication_required: false,
+                })
+            }
+            .boxed()
+            .shared()
+        })));
+        {
+            let mut state = reconnect
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.consecutive_failures = PERSISTENT_CAPACITY_MAX_RETRIES as u32;
+        }
+
+        reconnect.reconnect_in_background();
+
+        for _ in 0..100 {
+            let finished = {
+                let state = reconnect
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                !state.reconnect_in_flight
+            };
+            if finished {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let state = reconnect
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!state.reconnect_in_flight);
+        assert_eq!(state.retry_not_before, None);
+    }
 
     #[test]
     fn startup_outcome_error_identifies_authentication_required() {

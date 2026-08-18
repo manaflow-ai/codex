@@ -12,6 +12,10 @@ use crate::hook_runtime::run_pre_compact_hooks;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::CompactionTurnMetadata;
+use crate::responses_retry::ResponsesStreamRequest;
+use crate::responses_retry::ResponsesStreamRetryState;
+use crate::responses_retry::handle_retryable_response_stream_error_with_cancellation;
+use crate::responses_retry::retry_status_notifier;
 #[cfg(test)]
 use crate::session::PreviousTurnSettings;
 use crate::session::session::Session;
@@ -19,7 +23,6 @@ use crate::session::step_context::StepContext;
 use crate::session::turn::get_last_assistant_message_from_turn;
 use crate::session::turn_context::TurnContext;
 use crate::state::AutoCompactWindowIds;
-use crate::util::backoff;
 use codex_analytics::CodexCompactionEvent;
 use codex_analytics::CompactionImplementation;
 use codex_analytics::CompactionPhase;
@@ -28,6 +31,7 @@ use codex_analytics::CompactionStatus;
 use codex_analytics::CompactionStrategy;
 use codex_analytics::CompactionTrigger;
 use codex_analytics::now_unix_seconds;
+use codex_async_utils::OrCancelExt;
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
 use codex_protocol::error::CodexErr;
@@ -114,6 +118,7 @@ pub(crate) async fn run_inline_auto_compact_task(
     initial_context_injection: InitialContextInjection,
     reason: CompactionReason,
     phase: CompactionPhase,
+    cancellation_token: &tokio_util::sync::CancellationToken,
 ) -> CodexResult<()> {
     let prompt = turn_context
         .config
@@ -135,6 +140,7 @@ pub(crate) async fn run_inline_auto_compact_task(
         CompactionTrigger::Auto,
         reason,
         phase,
+        cancellation_token,
     )
     .await?;
     Ok(())
@@ -144,6 +150,7 @@ pub(crate) async fn run_compact_task(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
     input: Vec<UserInput>,
+    cancellation_token: &tokio_util::sync::CancellationToken,
 ) -> CodexResult<()> {
     let start_event = EventMsg::TurnStarted(TurnStartedEvent {
         turn_id: turn_context.sub_id.clone(),
@@ -161,6 +168,7 @@ pub(crate) async fn run_compact_task(
         CompactionTrigger::Manual,
         CompactionReason::UserRequested,
         CompactionPhase::StandaloneTurn,
+        cancellation_token,
     )
     .await?;
     Ok(())
@@ -174,6 +182,7 @@ async fn run_compact_task_inner(
     trigger: CompactionTrigger,
     reason: CompactionReason,
     phase: CompactionPhase,
+    cancellation_token: &tokio_util::sync::CancellationToken,
 ) -> CodexResult<()> {
     let compaction_metadata =
         CompactionTurnMetadata::new(trigger, reason, CompactionImplementation::Responses, phase);
@@ -208,6 +217,7 @@ async fn run_compact_task_inner(
         input,
         initial_context_injection,
         compaction_metadata,
+        cancellation_token,
     )
     .await;
     let status = compaction_status_from_result(&result);
@@ -243,6 +253,7 @@ async fn run_compact_task_inner_impl(
     input: Vec<UserInput>,
     initial_context_injection: InitialContextInjection,
     compaction_metadata: CompactionTurnMetadata,
+    cancellation_token: &tokio_util::sync::CancellationToken,
 ) -> CodexResult<String> {
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
     sess.emit_turn_item_started(&turn_context, &compaction_item)
@@ -256,8 +267,12 @@ async fn run_compact_task_inner_impl(
     );
 
     let max_retries = turn_context.provider.info().stream_max_retries();
-    let mut retries = 0;
+    let mut retry_state = ResponsesStreamRetryState::default();
     let mut client_session = sess.services.model_client.new_session();
+    client_session.set_retry_notifier(retry_status_notifier(
+        Arc::clone(&sess),
+        Arc::clone(&turn_context),
+    ));
     // Reuse one client session so turn-scoped state (sticky routing, websocket incremental
     // request tracking)
     // survives retries within this compact turn.
@@ -285,6 +300,7 @@ async fn run_compact_task_inner_impl(
             &mut client_session,
             &responses_metadata,
             &prompt,
+            cancellation_token,
         )
         .await;
 
@@ -313,7 +329,7 @@ async fn run_compact_task_inner_impl(
                         "Context window exceeded while compacting; removing oldest history item. Error: {e}"
                     );
                     history.remove_first_item();
-                    retries = 0;
+                    retry_state = ResponsesStreamRetryState::default();
                     continue;
                 }
                 sess.set_total_tokens_full(turn_context.as_ref()).await;
@@ -323,22 +339,25 @@ async fn run_compact_task_inner_impl(
                 return Err(e);
             }
             Err(e) => {
-                if retries < max_retries {
-                    retries += 1;
-                    let delay = backoff(retries);
-                    sess.notify_stream_error(
-                        turn_context.as_ref(),
-                        format!("Reconnecting... {retries}/{max_retries}"),
-                        e,
-                    )
-                    .await;
-                    tokio::time::sleep(delay).await;
-                    continue;
-                } else {
-                    sess.track_turn_codex_error(turn_context.as_ref(), &e);
-                    let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
-                    sess.send_event(&turn_context, event).await;
-                    return Err(e);
+                match handle_retryable_response_stream_error_with_cancellation(
+                    &mut retry_state,
+                    max_retries,
+                    e,
+                    &mut client_session,
+                    &sess,
+                    &turn_context,
+                    ResponsesStreamRequest::LocalCompaction,
+                    cancellation_token,
+                )
+                .await
+                {
+                    Ok(()) => continue,
+                    Err(e) => {
+                        sess.track_turn_codex_error(turn_context.as_ref(), &e);
+                        let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
+                        sess.send_event(&turn_context, event).await;
+                        return Err(e);
+                    }
                 }
             }
         }
@@ -722,6 +741,7 @@ async fn drain_to_completed(
     client_session: &mut ModelClientSession,
     responses_metadata: &CodexResponsesMetadata,
     prompt: &Prompt,
+    cancellation_token: &tokio_util::sync::CancellationToken,
 ) -> CodexResult<()> {
     let mut stream = client_session
         .stream(
@@ -736,13 +756,15 @@ async fn drain_to_completed(
             // are left untraced until the reducer has a first-class local compaction lifecycle.
             &InferenceTraceContext::disabled(),
         )
-        .await?;
+        .or_cancel(cancellation_token)
+        .await??;
     loop {
-        let maybe_event = stream.next().await;
+        let maybe_event = stream.next().or_cancel(cancellation_token).await?;
         let Some(event) = maybe_event else {
-            return Err(CodexErr::Stream(
-                "stream closed before response.completed".into(),
-            ));
+            return Err(
+                CodexErr::Stream("stream closed before response.completed".into())
+                    .with_explicit_retryable(),
+            );
         };
         match event {
             Ok(ResponseEvent::OutputItemDone(item)) => {

@@ -25,6 +25,153 @@ fn map_api_error_preserves_retry_delay() {
 }
 
 #[test]
+fn map_api_error_keeps_permanent_text_terminal_even_when_retry_marked() {
+    let err = map_api_error(ApiError::Retryable {
+        message: "invalid request: account suspended".to_string(),
+        delay: Some(std::time::Duration::from_secs(1)),
+    });
+
+    assert!(matches!(
+        err.details(),
+        CodexErrorDetails::InvalidRequest(message) if message == "invalid request: account suspended"
+    ));
+    assert!(!err.is_explicitly_retryable());
+}
+
+#[test]
+fn map_api_error_promotes_wrapped_capacity_retryable_errors_to_overload() {
+    let err = map_api_error(ApiError::Retryable {
+        message: r#"{"error":{"type":"invalid_request_error","message":"Selected model is at capacity. Please try a different model."}}"#
+            .to_string(),
+        delay: None,
+    });
+
+    assert!(matches!(err.details(), CodexErrorDetails::ServerOverloaded));
+}
+
+#[test]
+fn map_api_error_promotes_capacity_rate_limit_errors_to_overload() {
+    let err = map_api_error(ApiError::RateLimit(
+        r#"{"error":{"type":"invalid_request_error","message":"Selected model is at capacity. Please try a different model."}}"#
+            .to_string(),
+    ));
+
+    assert!(matches!(err.details(), CodexErrorDetails::ServerOverloaded));
+}
+
+#[test]
+fn map_api_error_keeps_request_build_failures_permanent() {
+    let err = map_api_error(ApiError::Transport(TransportError::Build(
+        "failed to serialize request".to_string(),
+    )));
+
+    assert!(matches!(
+        err.details(),
+        CodexErrorDetails::InvalidRequest(message) if message == "failed to serialize request"
+    ));
+}
+
+#[test]
+fn map_api_error_does_not_mark_permanent_network_failures_retryable() {
+    let err = map_api_error(ApiError::Transport(TransportError::Network(
+        "certificate verification failed".to_string(),
+    )));
+
+    assert!(matches!(
+        err.details(),
+        CodexErrorDetails::Stream(message) if message == "certificate verification failed"
+    ));
+    assert!(!err.is_explicitly_retryable());
+}
+
+#[test]
+fn map_api_error_marks_unclassified_network_failures_retryable() {
+    let err = map_api_error(ApiError::Transport(TransportError::Network(
+        "malformed local frame".to_string(),
+    )));
+
+    assert!(err.is_explicitly_retryable());
+}
+
+#[test]
+fn sideband_does_not_retry_unclassified_stream_errors() {
+    let retry_on = codex_client::RetryOn {
+        retry_429: true,
+        retry_5xx: true,
+        retry_transport: true,
+    };
+    assert!(
+        !ApiError::Stream("malformed request".to_string())
+            .is_retryable_for_attempt(&retry_on, 0, 1,)
+    );
+    assert!(
+        ApiError::Retryable {
+            message: "connection closed".to_string(),
+            delay: None,
+        }
+        .is_retryable_for_attempt(&retry_on, 0, 1)
+    );
+}
+
+#[test]
+fn sideband_retries_capacity_but_not_permanent_rate_limit_messages() {
+    let retry_on = codex_client::RetryOn {
+        retry_429: true,
+        retry_5xx: true,
+        retry_transport: true,
+    };
+    assert!(
+        ApiError::Api {
+            status: http::StatusCode::BAD_REQUEST,
+            message: "Selected model is at capacity. Please try a different model.".to_string(),
+        }
+        .is_retryable_for_attempt(&retry_on, 0, 1)
+    );
+    assert!(
+        !ApiError::RateLimit("account_suspended".to_string())
+            .is_retryable_for_attempt(&retry_on, 0, 1)
+    );
+    assert!(
+        !ApiError::Api {
+            status: http::StatusCode::UNAUTHORIZED,
+            message: "Selected model is at capacity. Please try a different model.".to_string(),
+        }
+        .is_retryable_for_attempt(&retry_on, 0, 1)
+    );
+}
+
+#[test]
+fn api_error_message_semantics_override_transient_http_status() {
+    let capacity = map_api_error(ApiError::Api {
+        status: http::StatusCode::BAD_REQUEST,
+        message: "Selected model is at capacity. Please try a different model.".to_string(),
+    });
+    assert!(matches!(
+        capacity.details(),
+        CodexErrorDetails::ServerOverloaded
+    ));
+
+    let permanent = map_api_error(ApiError::Api {
+        status: http::StatusCode::SERVICE_UNAVAILABLE,
+        message: "account_suspended".to_string(),
+    });
+    assert!(matches!(
+        permanent.details(),
+        CodexErrorDetails::InvalidRequest(_)
+    ));
+
+    let auth = map_api_error(ApiError::Api {
+        status: http::StatusCode::UNAUTHORIZED,
+        message: "Selected model is at capacity. Please try a different model.".to_string(),
+    });
+    assert!(matches!(
+        auth.details(),
+        CodexErrorDetails::UnexpectedStatus(error)
+            if error.status == http::StatusCode::UNAUTHORIZED
+    ));
+}
+
+#[test]
 fn map_api_error_maps_server_overloaded_from_503_body() {
     let body = serde_json::json!({
         "error": {
@@ -40,6 +187,202 @@ fn map_api_error_maps_server_overloaded_from_503_body() {
     }));
 
     assert!(matches!(err.details(), CodexErrorDetails::ServerOverloaded));
+}
+
+#[test]
+fn map_api_error_maps_rate_limit_overload_bodies_to_server_overloaded() {
+    let body = serde_json::json!({
+        "error": {
+            "type": "server_overloaded",
+            "message": "Selected model is at capacity. Please try a different model."
+        }
+    })
+    .to_string();
+    let err = map_api_error(ApiError::Transport(TransportError::Http {
+        status: http::StatusCode::TOO_MANY_REQUESTS,
+        url: None,
+        headers: None,
+        body: Some(body),
+    }));
+
+    assert!(matches!(err.details(), CodexErrorDetails::ServerOverloaded));
+}
+
+#[test]
+fn map_api_error_keeps_latest_capacity_message_retryable_when_gateway_wraps_it() {
+    let body = serde_json::json!({
+        "error": {
+            "type": "invalid_request_error",
+            "message": "Selected model is at capacity. Please try a different model."
+        }
+    })
+    .to_string();
+    let err = map_api_error(ApiError::Transport(TransportError::Http {
+        status: http::StatusCode::BAD_REQUEST,
+        url: None,
+        headers: None,
+        body: Some(body),
+    }));
+
+    assert!(matches!(err.details(), CodexErrorDetails::ServerOverloaded));
+}
+
+#[test]
+fn map_api_error_maps_top_level_capacity_fields() {
+    for body in [
+        serde_json::json!({
+            "code": "MODEL_AT_CAPACITY",
+            "message": "The selected model is temporarily unavailable"
+        }),
+        serde_json::json!({
+            "type": "server_overloaded",
+            "message": "high demand"
+        }),
+    ] {
+        let err = map_api_error(ApiError::Transport(TransportError::Http {
+            status: http::StatusCode::BAD_GATEWAY,
+            url: None,
+            headers: None,
+            body: Some(body.to_string()),
+        }));
+        assert!(
+            matches!(err.details(), CodexErrorDetails::ServerOverloaded),
+            "expected capacity body to map to overload: {body}"
+        );
+    }
+}
+
+#[test]
+fn map_api_error_maps_plain_text_capacity_failures_for_any_http_status() {
+    let body = "Selected model is at capacity. Please try a different model.".to_string();
+    for status in [
+        http::StatusCode::BAD_REQUEST,
+        http::StatusCode::TOO_MANY_REQUESTS,
+        http::StatusCode::SERVICE_UNAVAILABLE,
+    ] {
+        let err = map_api_error(ApiError::Transport(TransportError::Http {
+            status,
+            url: None,
+            headers: None,
+            body: Some(body.clone()),
+        }));
+        assert!(
+            matches!(err.details(), CodexErrorDetails::ServerOverloaded),
+            "expected plain capacity response to retry for {status}: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn map_api_error_maps_nested_capacity_failures() {
+    let body = serde_json::json!({
+        "gateway": {
+            "details": {
+                "error": {
+                    "code": "model_at_capacity",
+                    "message": "Selected model is at capacity. Please try a different model."
+                }
+            }
+        }
+    })
+    .to_string();
+    let err = map_api_error(ApiError::Transport(TransportError::Http {
+        status: http::StatusCode::BAD_GATEWAY,
+        url: None,
+        headers: None,
+        body: Some(body),
+    }));
+
+    assert!(matches!(err.details(), CodexErrorDetails::ServerOverloaded));
+}
+
+#[test]
+fn map_api_error_does_not_retry_permanent_semantics_hidden_in_5xx() {
+    for (body, expected) in [
+        (
+            serde_json::json!({ "error": { "code": "insufficient_quota" } }),
+            "quota",
+        ),
+        (
+            serde_json::json!({ "code": "context_length_exceeded" }),
+            "context",
+        ),
+        (
+            serde_json::json!({ "error": { "type": "invalid_request_error", "message": "bad" } }),
+            "invalid",
+        ),
+    ] {
+        let err = map_api_error(ApiError::Transport(TransportError::Http {
+            status: http::StatusCode::SERVICE_UNAVAILABLE,
+            url: None,
+            headers: None,
+            body: Some(body.to_string()),
+        }));
+        match expected {
+            "quota" => assert!(matches!(err.details(), CodexErrorDetails::QuotaExceeded)),
+            "context" => assert!(matches!(
+                err.details(),
+                CodexErrorDetails::ContextWindowExceeded
+            )),
+            "invalid" => assert!(matches!(
+                err.details(),
+                CodexErrorDetails::InvalidRequest(message) if message == "bad"
+            )),
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn map_api_error_keeps_plain_and_array_wrapped_permanent_5xx_terminal() {
+    let plain = map_api_error(ApiError::Transport(TransportError::Http {
+        status: http::StatusCode::SERVICE_UNAVAILABLE,
+        url: None,
+        headers: None,
+        body: Some("account_suspended".to_string()),
+    }));
+    assert!(matches!(
+        plain.details(),
+        CodexErrorDetails::InvalidRequest(_)
+    ));
+
+    let array_wrapped = map_api_error(ApiError::Transport(TransportError::Http {
+        status: http::StatusCode::SERVICE_UNAVAILABLE,
+        url: None,
+        headers: None,
+        body: Some(
+            serde_json::json!({
+                "errors": [{ "code": "insufficient_quota" }]
+            })
+            .to_string(),
+        ),
+    }));
+    assert!(matches!(
+        array_wrapped.details(),
+        CodexErrorDetails::QuotaExceeded
+    ));
+}
+
+#[test]
+fn map_api_error_keeps_misdirected_request_transient() {
+    let api_error = ApiError::Transport(TransportError::Http {
+        status: http::StatusCode::MISDIRECTED_REQUEST,
+        url: None,
+        headers: None,
+        body: None,
+    });
+    let retry_on = codex_client::RetryOn {
+        retry_429: true,
+        retry_5xx: true,
+        retry_transport: true,
+    };
+    assert!(api_error.is_retryable_for_attempt(&retry_on, 0, 1));
+    let err = map_api_error(api_error);
+    assert!(matches!(
+        err.details(),
+        CodexErrorDetails::UnexpectedStatus(error)
+            if error.status == http::StatusCode::MISDIRECTED_REQUEST
+    ));
 }
 
 #[test]

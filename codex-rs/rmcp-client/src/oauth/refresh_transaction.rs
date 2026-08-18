@@ -6,6 +6,15 @@ use std::time::UNIX_EPOCH;
 
 use anyhow::Context;
 use anyhow::Result;
+use codex_client::PERSISTENT_CAPACITY_MAX_RETRIES;
+use codex_client::RetryDisposition;
+use codex_client::RetryNotifier;
+use codex_client::RetryStatus;
+use codex_client::backoff;
+use codex_client::classify_provider_error_text;
+use codex_client::format_retry_budget;
+use codex_client::is_capacity_error_body;
+use codex_client::is_permanent_error_text;
 use codex_keyring_store::DefaultKeyringStore;
 use codex_keyring_store::KeyringStore;
 use oauth2::TokenResponse;
@@ -28,6 +37,10 @@ use super::refresh_lock::RefreshCredentialLock;
 use super::token_needs_refresh;
 
 const REFRESH_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
+const OAUTH_TRANSIENT_MAX_RETRIES: u64 = 2;
+const OAUTH_CAPACITY_MAX_RETRIES: u64 = PERSISTENT_CAPACITY_MAX_RETRIES;
+const OAUTH_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
+const OAUTH_MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 
 impl OAuthPersistor {
     pub(crate) async fn refresh_if_needed(&self) -> Result<()> {
@@ -170,46 +183,109 @@ impl OAuthPersistor {
             timeout_ms = refresh_request_timeout.as_millis(),
             "requesting refreshed MCP OAuth credentials from the provider"
         );
-        let refreshed = match timeout(refresh_request_timeout, guard.refresh_token()).await {
-            Ok(Ok(token_response)) => {
-                debug!("received refreshed MCP OAuth credentials from the provider");
-                refreshed_tokens(token_response, &latest, &self.inner)
-            }
-            Ok(Err(error @ AuthError::TokenRefreshRejected(_))) => {
-                // RMCP 3 distinguishes definitive refresh-token rejection from transient
-                // provider failures. Only a rejected token requires a fresh authorization.
-                warn!(
-                    error = %error,
-                    "MCP OAuth refresh token was rejected; reauthorization required"
-                );
-                return Err(AuthError::AuthorizationRequired).with_context(|| {
-                    format!(
-                        "failed to refresh OAuth tokens for server {}: {error}",
-                        self.inner.server_name
+        let retry_notifier = self
+            .inner
+            .retry_notifier
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let mut transient_retries = 0u64;
+        let mut capacity_retries = 0u64;
+        let refreshed = loop {
+            match timeout(refresh_request_timeout, guard.refresh_token()).await {
+                Ok(Ok(token_response)) => {
+                    debug!("received refreshed MCP OAuth credentials from the provider");
+                    break refreshed_tokens(token_response, &latest, &self.inner);
+                }
+                Ok(Err(error @ AuthError::TokenRefreshRejected(_))) => {
+                    // RMCP 3 distinguishes definitive refresh-token rejection from transient
+                    // provider failures. Only a rejected token requires a fresh authorization.
+                    warn!(
+                        error = %error,
+                        "MCP OAuth refresh token was rejected; reauthorization required"
+                    );
+                    return Err(AuthError::AuthorizationRequired).with_context(|| {
+                        format!(
+                            "failed to refresh OAuth tokens for server {}: {error}",
+                            self.inner.server_name
+                        )
+                    });
+                }
+                Ok(Err(error)) => {
+                    let disposition = classify_refresh_error(&error);
+                    let Some((retry_count, max_retries)) = claim_refresh_retry(
+                        disposition,
+                        &mut transient_retries,
+                        &mut capacity_retries,
+                    ) else {
+                        warn!(
+                            error = %error,
+                            "MCP OAuth provider refresh failed"
+                        );
+                        return Err(error).with_context(|| {
+                            format!(
+                                "failed to refresh OAuth tokens for server {}",
+                                self.inner.server_name
+                            )
+                        });
+                    };
+                    let delay =
+                        backoff(OAUTH_RETRY_BASE_DELAY, retry_count).min(OAUTH_MAX_RETRY_DELAY);
+                    emit_refresh_retry_status(
+                        retry_notifier.as_ref(),
+                        disposition,
+                        retry_count,
+                        max_retries,
+                        delay,
+                        error.to_string(),
                     )
-                });
-            }
-            Ok(Err(error)) => {
-                warn!(
-                    error = %error,
-                    "MCP OAuth provider refresh failed"
-                );
-                return Err(error).with_context(|| {
-                    format!(
-                        "failed to refresh OAuth tokens for server {}",
-                        self.inner.server_name
+                    .await;
+                    warn!(
+                        error = %error,
+                        attempt = retry_count,
+                        max_retries,
+                        delay_ms = delay.as_millis(),
+                        retry_disposition = ?disposition,
+                        "MCP OAuth provider refresh failed; retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Err(_) => {
+                    let disposition = RetryDisposition::Transient;
+                    let Some((retry_count, max_retries)) = claim_refresh_retry(
+                        disposition,
+                        &mut transient_retries,
+                        &mut capacity_retries,
+                    ) else {
+                        warn!(
+                            timeout_ms = refresh_request_timeout.as_millis(),
+                            "MCP OAuth provider refresh timed out; the outcome is unknown and a later serialized retry is permitted"
+                        );
+                        anyhow::bail!(
+                            "timed out after {refresh_request_timeout:?} refreshing OAuth tokens for server {}",
+                            self.inner.server_name
+                        );
+                    };
+                    let delay =
+                        backoff(OAUTH_RETRY_BASE_DELAY, retry_count).min(OAUTH_MAX_RETRY_DELAY);
+                    emit_refresh_retry_status(
+                        retry_notifier.as_ref(),
+                        disposition,
+                        retry_count,
+                        max_retries,
+                        delay,
+                        format!("timed out after {refresh_request_timeout:?}"),
                     )
-                });
-            }
-            Err(_) => {
-                warn!(
-                    timeout_ms = refresh_request_timeout.as_millis(),
-                    "MCP OAuth provider refresh timed out; the outcome is unknown and a later serialized retry is permitted"
-                );
-                anyhow::bail!(
-                    "timed out after {refresh_request_timeout:?} refreshing OAuth tokens for server {}",
-                    self.inner.server_name
-                );
+                    .await;
+                    warn!(
+                        timeout_ms = refresh_request_timeout.as_millis(),
+                        attempt = retry_count,
+                        max_retries,
+                        delay_ms = delay.as_millis(),
+                        "MCP OAuth provider refresh timed out; retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
             }
         };
 
@@ -251,6 +327,82 @@ impl OAuthPersistor {
         debug!("persisted refreshed MCP OAuth credentials and completed the transaction");
         Ok(())
     }
+}
+
+fn classify_refresh_error(error: &AuthError) -> RetryDisposition {
+    match error {
+        AuthError::AuthorizationRequired | AuthError::TokenRefreshRejected(_) => {
+            RetryDisposition::DoNotRetry
+        }
+        AuthError::TokenRefreshFailed(message) => classify_retryable_refresh_text(message),
+        AuthError::HttpError(error) => classify_retryable_refresh_text(&error.to_string()),
+        _ => RetryDisposition::DoNotRetry,
+    }
+}
+
+fn classify_retryable_refresh_text(message: &str) -> RetryDisposition {
+    if is_capacity_error_body(message) {
+        return RetryDisposition::Capacity;
+    } else if is_permanent_error_text(message) {
+        return RetryDisposition::DoNotRetry;
+    }
+    match classify_provider_error_text(message) {
+        RetryDisposition::Capacity => RetryDisposition::Capacity,
+        RetryDisposition::Transient | RetryDisposition::DoNotRetry => {
+            // RMCP already labels this class as a non-definitive refresh failure. Preserve that
+            // contract when the provider uses an unstructured message without a known marker.
+            RetryDisposition::Transient
+        }
+    }
+}
+
+fn claim_refresh_retry(
+    disposition: RetryDisposition,
+    transient_retries: &mut u64,
+    capacity_retries: &mut u64,
+) -> Option<(u64, u64)> {
+    match disposition {
+        RetryDisposition::Capacity if *capacity_retries < OAUTH_CAPACITY_MAX_RETRIES => {
+            *capacity_retries = capacity_retries.saturating_add(1);
+            Some((*capacity_retries, OAUTH_CAPACITY_MAX_RETRIES))
+        }
+        RetryDisposition::Transient if *transient_retries < OAUTH_TRANSIENT_MAX_RETRIES => {
+            *transient_retries = transient_retries.saturating_add(1);
+            Some((*transient_retries, OAUTH_TRANSIENT_MAX_RETRIES))
+        }
+        RetryDisposition::DoNotRetry | RetryDisposition::Transient | RetryDisposition::Capacity => {
+            None
+        }
+    }
+}
+
+async fn emit_refresh_retry_status(
+    retry_notifier: Option<&RetryNotifier>,
+    disposition: RetryDisposition,
+    attempt: u64,
+    max_retries: u64,
+    delay: Duration,
+    error: String,
+) {
+    let Some(retry_notifier) = retry_notifier else {
+        return;
+    };
+    retry_notifier(RetryStatus {
+        operation: "mcp/oauth-refresh".to_string(),
+        disposition,
+        attempt,
+        max_retries,
+        delay,
+        error,
+    })
+    .await;
+    debug!(
+        attempt,
+        max_retries = format_retry_budget(max_retries),
+        delay_ms = delay.as_millis(),
+        retry_disposition = ?disposition,
+        "emitted MCP OAuth refresh retry status"
+    );
 }
 
 async fn install_tokens_in_manager_guard(

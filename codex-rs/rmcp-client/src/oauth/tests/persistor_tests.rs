@@ -1,9 +1,13 @@
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::time::Duration;
 
 use anyhow::Context;
 use anyhow::Result;
+use codex_client::RetryDisposition;
+use codex_client::RetryStatus;
 use codex_config::types::AuthKeyringBackendKind;
 use codex_config::types::OAuthCredentialsStoreMode;
 use codex_exec_server::RouteAwareHttpClient;
@@ -277,6 +281,100 @@ async fn transient_refresh_failure_does_not_require_reauthorization() -> Result<
     let stored = load_oauth_tokens_from_file(&initial.server_name, &initial.url)?
         .expect("a transient refresh failure must preserve durable credentials");
     assert_tokens_match_without_expiry(&stored, &initial);
+    server.verify().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn transient_refresh_failure_retries_before_succeeding() -> Result<()> {
+    let (_env, server, initial) = test_context().await?;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_for_responder = Arc::clone(&attempts);
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .and(body_string_contains("grant_type=refresh_token"))
+        .and(body_string_contains("refresh_token=refresh-token"))
+        .respond_with(move |_request: &wiremock::Request| {
+            let attempt = attempts_for_responder.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                ResponseTemplate::new(503).set_body_json(serde_json::json!({
+                    "error": "temporarily_unavailable",
+                    "error_description": "provider is temporarily unavailable",
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "retried-access-token",
+                    "token_type": "Bearer",
+                    "expires_in": 3600,
+                }))
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    save_oauth_tokens_to_file(&initial)?;
+    let persistor = persistor_for(&initial).await?;
+
+    persistor
+        .refresh_if_needed()
+        .await
+        .expect("a transient OAuth refresh failure should be retried");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    let stored = load_oauth_tokens_from_file(&initial.server_name, &initial.url)?
+        .expect("successful retry should persist refreshed credentials");
+    assert_eq!(
+        stored.token_response.0.access_token().secret(),
+        "retried-access-token"
+    );
+    server.verify().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn oauth_refresh_retry_status_is_visible_without_request_content() -> Result<()> {
+    let (_env, server, initial) = test_context().await?;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_for_responder = Arc::clone(&attempts);
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .and(body_string_contains("grant_type=refresh_token"))
+        .respond_with(move |_request: &wiremock::Request| {
+            if attempts_for_responder.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(503).set_body_json(serde_json::json!({
+                    "error": "temporarily_unavailable",
+                    "error_description": "provider is temporarily unavailable",
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "status-visible-access-token",
+                    "token_type": "Bearer",
+                    "expires_in": 3600,
+                }))
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    save_oauth_tokens_to_file(&initial)?;
+    let persistor = persistor_for(&initial).await?;
+    let statuses = Arc::new(std::sync::Mutex::new(Vec::<RetryStatus>::new()));
+    let statuses_for_notifier = Arc::clone(&statuses);
+    persistor.set_retry_notifier(Some(Arc::new(move |status| {
+        let statuses = Arc::clone(&statuses_for_notifier);
+        Box::pin(async move {
+            statuses.lock().expect("retry status lock").push(status);
+        })
+    })));
+
+    persistor.refresh_if_needed().await?;
+    let statuses = statuses.lock().expect("retry status lock").clone();
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0].operation, "mcp/oauth-refresh");
+    assert_eq!(statuses[0].disposition, RetryDisposition::Transient);
+    assert_eq!(statuses[0].attempt, 1);
+    assert_eq!(statuses[0].max_retries, 2);
+    assert!(!statuses[0].error.contains("refresh-token"));
+    assert!(!statuses[0].error.contains("access-token"));
     server.verify().await;
     Ok(())
 }

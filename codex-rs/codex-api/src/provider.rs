@@ -1,3 +1,4 @@
+use codex_client::PERSISTENT_CAPACITY_MAX_RETRIES;
 use codex_client::Request;
 use codex_client::RequestCompression;
 use codex_client::RetryOn;
@@ -25,12 +26,17 @@ impl RetryConfig {
     pub fn to_policy(&self) -> RetryPolicy {
         RetryPolicy {
             max_attempts: self.max_attempts,
+            // Capacity is a provider-side availability state. Keep retrying it across every
+            // endpoint, including Responses and legacy remote compaction, while ordinary
+            // transient failures retain the configured finite budget.
+            capacity_max_attempts: PERSISTENT_CAPACITY_MAX_RETRIES,
             base_delay: self.base_delay,
             retry_on: RetryOn {
                 retry_429: self.retry_429,
                 retry_5xx: self.retry_5xx,
                 retry_transport: self.retry_transport,
             },
+            retry_notifier: None,
         }
     }
 }
@@ -161,5 +167,22 @@ mod tests {
                 "expected {base_url} not to be detected as Azure"
             );
         }
+    }
+
+    #[test]
+    fn provider_policy_keeps_capacity_retries_persistent_for_every_endpoint() {
+        let policy = RetryConfig {
+            max_attempts: 1,
+            base_delay: Duration::from_millis(1),
+            retry_429: true,
+            retry_5xx: true,
+            retry_transport: true,
+        }
+        .to_policy();
+
+        assert_eq!(
+            policy.capacity_max_attempts,
+            PERSISTENT_CAPACITY_MAX_RETRIES
+        );
     }
 }

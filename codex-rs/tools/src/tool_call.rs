@@ -57,6 +57,15 @@ pub trait TurnItemEmitter: Send + Sync {
 
     /// Emits one completed visible turn item.
     fn emit_completed<'a>(&'a self, item: ExtensionTurnItem) -> TurnItemEmissionFuture<'a>;
+
+    /// Emits a host lifecycle event that is not an extension-owned turn item.
+    ///
+    /// Retry status uses this path so a tool can show progress without adding status text to the
+    /// request sent back to the model or to conversation history. Hosts that do not expose a
+    /// lifecycle event sink keep the default no-op behavior.
+    fn emit_event<'a>(&'a self, _event: EventMsg) -> TurnItemEmissionFuture<'a> {
+        Box::pin(std::future::ready(()))
+    }
 }
 
 /// Host-owned turn environment summary visible to extension tools.

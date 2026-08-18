@@ -5,13 +5,20 @@ use crate::common::ResponsesWsRequest;
 use crate::common::SafetyBufferingTreatment;
 use crate::common::WS_REQUEST_HEADER_TRACEPARENT_CLIENT_METADATA_KEY;
 use crate::error::ApiError;
+use crate::error::is_permanent_error_fields;
+use crate::error::is_server_overloaded_error;
+use crate::error::map_websocket_close_error;
+use crate::error::map_websocket_operation_error;
 use crate::provider::Provider;
 use crate::rate_limits::parse_rate_limit_event;
 use crate::safety_buffering::treatment_from_headers;
 use crate::sse::ResponsesStreamEvent;
 use crate::sse::process_responses_event;
 use crate::telemetry::WebsocketTelemetry;
+use codex_client::RetryDisposition;
 use codex_client::TransportError;
+use codex_client::classify_provider_error_text;
+use codex_client::is_capacity_error_body;
 use codex_http_client::HttpClientFactory;
 use codex_websocket_client::WebSocketConnection;
 use codex_websocket_client::WebSocketConnector;
@@ -286,9 +293,10 @@ impl ResponsesWebsocketConnection {
                 let result = {
                     let Some(ws_stream) = guard.as_mut() else {
                         let _ = tx_event
-                            .send(Err(ApiError::Stream(
-                                "websocket connection is closed".to_string(),
-                            )))
+                            .send(Err(ApiError::Retryable {
+                                message: "websocket connection is closed".to_string(),
+                                delay: None,
+                            }))
                             .await;
                         return;
                     };
@@ -377,7 +385,9 @@ impl ResponsesWebsocketClient {
         let ws_url = self
             .provider
             .websocket_url_for_path("responses")
-            .map_err(|err| ApiError::Stream(format!("failed to build websocket URL: {err}")))?;
+            .map_err(|err| ApiError::InvalidRequest {
+                message: format!("failed to build websocket URL: {err}"),
+            })?;
 
         let mut headers =
             merge_request_headers(&self.provider.headers, extra_headers, default_headers);
@@ -411,7 +421,9 @@ impl ResponsesWebsocketClient {
         let ws_url = self
             .provider
             .websocket_url_for_path("responses")
-            .map_err(|err| ApiError::Stream(format!("failed to build websocket URL: {err}")))?;
+            .map_err(|err| ApiError::InvalidRequest {
+                message: format!("failed to build websocket URL: {err}"),
+            })?;
 
         let mut headers =
             merge_request_headers(&self.provider.headers, extra_headers, default_headers);
@@ -430,7 +442,7 @@ impl ResponsesWebsocketClient {
             .flatten()
             .transpose()
             .map_err(|err| {
-                ApiError::Stream(format!("failed to read websocket probe event: {err}"))
+                map_websocket_operation_error(err, "failed to read websocket probe event")
             })?
             .and_then(immediate_close_from_message);
 
@@ -481,14 +493,18 @@ async fn connect_websocket(
 ) -> Result<(WsStream, StatusCode, bool, Option<String>), ApiError> {
     info!("connecting to websocket: {url}");
 
-    let mut request = url
-        .as_str()
-        .into_client_request()
-        .map_err(|err| ApiError::Stream(format!("failed to build websocket request: {err}")))?;
+    let mut request =
+        url.as_str()
+            .into_client_request()
+            .map_err(|err| ApiError::InvalidRequest {
+                message: format!("failed to build websocket request: {err}"),
+            })?;
     request.headers_mut().extend(headers);
 
-    let connector = WebSocketConnector::new(http_client_factory)
-        .map_err(|err| ApiError::Stream(format!("failed to configure websocket TLS: {err}")))?;
+    let connector =
+        WebSocketConnector::new(http_client_factory).map_err(|err| ApiError::InvalidRequest {
+            message: format!("failed to configure websocket TLS: {err}"),
+        })?;
     let response = connector.connect(request, websocket_config()).await;
 
     let (stream, response) = match response {
@@ -552,16 +568,14 @@ fn map_ws_error(err: WsError, url: &Url) -> ApiError {
                 body,
             })
         }
-        WsError::ConnectionClosed | WsError::AlreadyClosed => {
-            ApiError::Stream("websocket closed".to_string())
-        }
-        WsError::Io(err) => ApiError::Transport(TransportError::Network(err.to_string())),
-        other => ApiError::Transport(TransportError::Network(other.to_string())),
+        other => map_websocket_operation_error(other, "failed to connect websocket"),
     }
 }
 
 #[derive(Debug, Deserialize)]
 struct WrappedWebsocketError {
+    #[serde(rename = "type")]
+    error_type: Option<String>,
     code: Option<String>,
     message: Option<String>,
 }
@@ -616,17 +630,91 @@ fn map_wrapped_websocket_error_event(
         });
     }
 
-    let status = StatusCode::from_u16(status?).ok()?;
-    if status.is_success() {
-        return None;
+    // A gateway can wrap a capacity response in `invalid_request_error`. Check
+    // the semantic capacity markers before the generic request classification
+    // and before status mapping so the retry policy sees the real condition.
+    if let Some(error) = error.as_ref()
+        && is_server_overloaded_error(
+            error.error_type.as_deref(),
+            error.code.as_deref(),
+            error.message.as_deref(),
+        )
+    {
+        return Some(ApiError::ServerOverloaded);
     }
 
-    Some(ApiError::Transport(TransportError::Http {
-        status,
-        url: None,
-        headers: headers.as_ref().map(json_headers_to_http_headers),
-        body: Some(original_payload),
-    }))
+    // Some servers attach a 4xx status to a cancellation or other transient event. Preserve the
+    // event semantics before converting the envelope into a generic HTTP transport error.
+    if let Some(error) = error.as_ref()
+        && is_transient_wrapped_websocket_error(error)
+    {
+        return Some(ApiError::Retryable {
+            message: error
+                .message
+                .clone()
+                .unwrap_or_else(|| "Retryable websocket error.".to_string()),
+            delay: None,
+        });
+    }
+
+    if let Some(status) = status {
+        let status = StatusCode::from_u16(status).ok()?;
+        if status.is_success() {
+            return None;
+        }
+        return Some(ApiError::Transport(TransportError::Http {
+            status,
+            url: None,
+            headers: headers.as_ref().map(json_headers_to_http_headers),
+            body: Some(original_payload),
+        }));
+    }
+
+    if let Some(error) = error.as_ref()
+        && is_permanent_error_fields(
+            error.error_type.as_deref(),
+            error.code.as_deref(),
+            error.message.as_deref(),
+        )
+    {
+        return Some(ApiError::InvalidRequest {
+            message: error
+                .message
+                .clone()
+                .unwrap_or_else(|| "Invalid websocket request.".to_string()),
+        });
+    }
+
+    Some(match error {
+        Some(error) if is_transient_wrapped_websocket_error(&error) => ApiError::Retryable {
+            message: error
+                .message
+                .unwrap_or_else(|| "Retryable websocket error.".to_string()),
+            delay: None,
+        },
+        Some(error) => ApiError::InvalidRequest {
+            message: error
+                .message
+                .unwrap_or_else(|| "Websocket request failed.".to_string()),
+        },
+        None => ApiError::InvalidRequest {
+            message: "Websocket server returned an unclassified error event.".to_string(),
+        },
+    })
+}
+
+fn is_transient_wrapped_websocket_error(error: &WrappedWebsocketError) -> bool {
+    [
+        error.error_type.as_deref(),
+        error.code.as_deref(),
+        error.message.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| {
+        is_capacity_error_body(value)
+            || classify_provider_error_text(value) != RetryDisposition::DoNotRetry
+    })
 }
 
 fn json_headers_to_http_headers(headers: &JsonMap<String, Value>) -> HeaderMap {
@@ -677,19 +765,26 @@ async fn run_websocket_response_stream(
         let poll_start = Instant::now();
         let response = tokio::time::timeout(idle_timeout, ws_stream.next())
             .await
-            .map_err(|_| ApiError::Stream("idle timeout waiting for websocket".into()));
+            .map_err(|_| ApiError::Retryable {
+                message: "idle timeout waiting for websocket".into(),
+                delay: None,
+            });
         if let Some(t) = telemetry.as_ref() {
             t.on_ws_event(&response, poll_start.elapsed());
         }
         let message = match response {
             Ok(Some(Ok(msg))) => msg,
             Ok(Some(Err(err))) => {
-                return Err(ApiError::Stream(err.to_string()));
+                return Err(map_websocket_operation_error(
+                    err,
+                    "failed to read websocket response",
+                ));
             }
             Ok(None) => {
-                return Err(ApiError::Stream(
-                    "stream closed before response.completed".into(),
-                ));
+                return Err(ApiError::Retryable {
+                    message: "stream closed before response.completed".into(),
+                    delay: None,
+                });
             }
             Err(err) => {
                 return Err(err);
@@ -800,11 +895,22 @@ async fn run_websocket_response_stream(
                 }
             }
             Message::Binary(_) => {
-                return Err(ApiError::Stream("unexpected binary websocket event".into()));
+                return Err(ApiError::InvalidRequest {
+                    message: "unexpected binary websocket event".into(),
+                });
             }
-            Message::Close(_) => {
-                return Err(ApiError::Stream(
-                    "websocket closed by server before response.completed".into(),
+            Message::Close(frame) => {
+                let (code, reason) = frame
+                    .as_ref()
+                    .map(|frame| (frame.code, frame.reason.as_ref()))
+                    .unwrap_or((
+                        tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Status,
+                        "",
+                    ));
+                return Err(map_websocket_close_error(
+                    code,
+                    reason,
+                    "websocket closed by server before response.completed",
                 ));
             }
             Message::Frame(_) => {}
@@ -870,9 +976,12 @@ async fn send_websocket_request(
         ws_stream.send(Message::Text(request_text.into())),
     )
     .await
-    .map_err(|_| ApiError::Stream("idle timeout sending websocket request".into()))
+    .map_err(|_| ApiError::Retryable {
+        message: "idle timeout sending websocket request".into(),
+        delay: None,
+    })
     .and_then(|result| {
-        result.map_err(|err| ApiError::Stream(format!("failed to send websocket request: {err}")))
+        result.map_err(|err| map_websocket_operation_error(err, "failed to send websocket request"))
     });
 
     if let Some(t) = telemetry.as_ref() {
@@ -889,8 +998,9 @@ async fn send_websocket_request(
 }
 
 fn serialize_websocket_request(request: &ResponsesWsRequest<'_>) -> Result<String, ApiError> {
-    serde_json::to_string(request)
-        .map_err(|err| ApiError::Stream(format!("failed to encode websocket request: {err}")))
+    serde_json::to_string(request).map_err(|err| ApiError::InvalidRequest {
+        message: format!("failed to encode websocket request: {err}"),
+    })
 }
 
 #[cfg(test)]
@@ -1089,7 +1199,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_wrapped_websocket_error_event_without_status_is_not_mapped() {
+    fn parse_wrapped_websocket_permanent_error_without_status_is_terminal() {
         let payload = json!({
             "type": "error",
             "error": {
@@ -1105,8 +1215,111 @@ mod tests {
 
         let wrapped_error = parse_wrapped_websocket_error_event(&payload)
             .expect("expected websocket error payload to be parsed");
-        let api_error = map_wrapped_websocket_error_event(wrapped_error, payload);
-        assert!(api_error.is_none());
+        let api_error = map_wrapped_websocket_error_event(wrapped_error, payload)
+            .expect("expected permanent websocket error to be mapped");
+        assert!(matches!(api_error, ApiError::InvalidRequest { .. }));
+    }
+
+    #[test]
+    fn parse_wrapped_websocket_capacity_error_without_status_is_overload() {
+        let payload = json!({
+            "type": "error",
+            "error": {
+                "code": "model_at_capacity",
+                "message": "Selected model is at capacity. Please try a different model."
+            }
+        })
+        .to_string();
+
+        let wrapped_error = parse_wrapped_websocket_error_event(&payload)
+            .expect("expected websocket error payload to be parsed");
+        let api_error = map_wrapped_websocket_error_event(wrapped_error, payload)
+            .expect("expected capacity websocket error to be mapped");
+        assert!(matches!(api_error, ApiError::ServerOverloaded));
+    }
+
+    #[test]
+    fn parse_wrapped_websocket_latest_capacity_message_overrides_generic_request_type() {
+        let payload = json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "Selected model is at capacity. Please try a different model."
+            }
+        })
+        .to_string();
+
+        let wrapped_error = parse_wrapped_websocket_error_event(&payload)
+            .expect("expected websocket error payload to be parsed");
+        let api_error = map_wrapped_websocket_error_event(wrapped_error, payload)
+            .expect("expected capacity websocket error to be mapped");
+        assert!(matches!(api_error, ApiError::ServerOverloaded));
+    }
+
+    #[test]
+    fn parse_wrapped_websocket_nested_capacity_message_overrides_generic_request_type() {
+        let payload = json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "{\"error\":{\"message\":\"Selected model is at capacity. Please try a different model.\"}}"
+            }
+        })
+        .to_string();
+
+        let wrapped_error = parse_wrapped_websocket_error_event(&payload)
+            .expect("expected websocket error payload to be parsed");
+        let api_error = map_wrapped_websocket_error_event(wrapped_error, payload)
+            .expect("expected nested capacity websocket error to be mapped");
+        assert!(matches!(api_error, ApiError::ServerOverloaded));
+    }
+
+    #[test]
+    fn parse_wrapped_websocket_server_cancellation_without_status_is_retryable() {
+        let payload = json!({
+            "type": "error",
+            "error": {
+                "code": "response_cancelled",
+                "message": "Response cancelled by server"
+            }
+        })
+        .to_string();
+
+        let wrapped_error = parse_wrapped_websocket_error_event(&payload)
+            .expect("expected websocket error payload to be parsed");
+        let api_error = map_wrapped_websocket_error_event(wrapped_error, payload)
+            .expect("expected cancelled websocket error to be mapped");
+        assert!(matches!(api_error, ApiError::Retryable { .. }));
+    }
+
+    #[test]
+    fn parse_wrapped_websocket_server_cancellation_with_status_is_retryable() {
+        let payload = json!({
+            "type": "error",
+            "status": 400,
+            "error": {
+                "code": "response_cancelled",
+                "message": "Response cancelled by server"
+            }
+        })
+        .to_string();
+
+        let wrapped_error = parse_wrapped_websocket_error_event(&payload)
+            .expect("expected websocket error payload to be parsed");
+        let api_error = map_wrapped_websocket_error_event(wrapped_error, payload)
+            .expect("expected cancelled websocket error to be mapped");
+        assert!(matches!(api_error, ApiError::Retryable { .. }));
+    }
+
+    #[test]
+    fn parse_wrapped_websocket_unclassified_error_is_terminal() {
+        let payload = json!({ "type": "error" }).to_string();
+
+        let wrapped_error = parse_wrapped_websocket_error_event(&payload)
+            .expect("expected websocket error payload to be parsed");
+        let api_error = map_wrapped_websocket_error_event(wrapped_error, payload)
+            .expect("expected websocket error payload to map");
+        assert!(matches!(api_error, ApiError::InvalidRequest { .. }));
     }
 
     #[test]

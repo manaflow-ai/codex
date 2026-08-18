@@ -28,6 +28,7 @@ mod test_support;
 use anyhow::Context;
 use anyhow::Error;
 use anyhow::Result;
+use codex_client::RetryNotifier;
 use codex_config::types::AuthKeyringBackendKind;
 use codex_config::types::OAuthCredentialsStoreMode;
 use codex_secrets::LocalSecretsNamespace;
@@ -53,6 +54,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -645,6 +647,7 @@ struct OAuthPersistorInner {
     authorization_manager: Arc<Mutex<AuthorizationManager>>,
     credential_store: ResolvedOAuthCredentialStore,
     last_credentials: Mutex<Option<StoredOAuthTokens>>,
+    retry_notifier: StdMutex<Option<RetryNotifier>>,
 }
 
 impl OAuthPersistor {
@@ -662,8 +665,19 @@ impl OAuthPersistor {
                 authorization_manager,
                 credential_store,
                 last_credentials: Mutex::new(initial_credentials),
+                retry_notifier: StdMutex::new(None),
             }),
         }
+    }
+
+    /// Installs the UI-only retry status sink used by the MCP request owner.
+    /// The sink never receives OAuth request content or tokens.
+    pub(crate) fn set_retry_notifier(&self, retry_notifier: Option<RetryNotifier>) {
+        *self
+            .inner
+            .retry_notifier
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = retry_notifier;
     }
 
     pub(crate) async fn stored_credentials(&self) -> Option<StoredOAuthTokens> {

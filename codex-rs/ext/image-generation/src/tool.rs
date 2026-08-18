@@ -50,12 +50,14 @@ use schemars::r#gen::SchemaSettings;
 use serde::Deserialize;
 use serde_json::Map;
 use serde_json::Value;
+use std::sync::Arc;
 
 use crate::IMAGE_GEN_NAMESPACE;
 use crate::IMAGEGEN_TOOL_NAME;
 use crate::artifact::image_generation_artifact_path;
 use crate::artifact::image_generation_output_hint;
 use crate::backend::CodexImagesBackend;
+use crate::backend::image_retry_notifier;
 
 const IMAGE_MODEL: &str = "gpt-image-2";
 const MAX_EDIT_IMAGES: usize = 5;
@@ -156,9 +158,18 @@ impl ImageGenerationTool {
                 }),
             ))
             .await;
+        let retry_notifier = Some(image_retry_notifier(Arc::clone(&call.turn_item_emitter)));
         let result = match request {
-            ImageRequest::Generate(request) => self.backend.generate(request, &call.turn_id).await,
-            ImageRequest::Edit(request) => self.backend.edit(request, &call.turn_id).await,
+            ImageRequest::Generate(request) => {
+                self.backend
+                    .generate(request, &call.turn_id, retry_notifier.clone())
+                    .await
+            }
+            ImageRequest::Edit(request) => {
+                self.backend
+                    .edit(request, &call.turn_id, retry_notifier)
+                    .await
+            }
         }
         .map_err(|error| {
             (

@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+use codex_client::RetryNotifier;
+use codex_client::RetryStatus;
+use codex_client::format_retry_budget;
 use codex_extension_api::ExtensionEventSink;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::ExtensionWarning;
@@ -69,32 +72,60 @@ impl ToolLifecycleContributor for GuardianV2Extension {
                  {planned_action}\n\
                  >>> APPROVAL REQUEST END\n"
             );
-            if let Err(error) = sampler
-                .sample(LunaSamplingRequest {
-                    instructions: CLASSIFIER_INSTRUCTIONS.to_owned(),
-                    input: classification_input,
-                    output_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "scores": {
-                                "type": "object",
-                                "properties": {
-                                    "action_risk": {
-                                        "type": "number",
-                                        "minimum": 0.0,
-                                        "maximum": 1.0
-                                    }
-                                },
-                                "required": ["action_risk"],
-                                "additionalProperties": false
-                            }
-                        },
-                        "required": ["scores"],
-                        "additionalProperties": false
-                    }),
-                    reasoning_effort: ReasoningEffort::Low,
-                    turn_id: turn_id.clone(),
+            let retry_event_sink = Arc::clone(&event_sink);
+            let retry_thread_id = thread_id.clone();
+            let retry_turn_id = turn_id.clone();
+            let retry_notifier: RetryNotifier = Arc::new(move |status: RetryStatus| {
+                let event_sink = Arc::clone(&retry_event_sink);
+                let thread_id = retry_thread_id.clone();
+                let turn_id = retry_turn_id.clone();
+                Box::pin(async move {
+                    event_sink.emit_warning(ExtensionWarning {
+                        thread_id,
+                        turn_id: Some(turn_id),
+                        message: format!(
+                            "Guardian V2 Luna sampling retry: {} in {:?} (attempt {}/{})",
+                            match status.disposition {
+                                codex_client::RetryDisposition::Capacity => "model capacity",
+                                codex_client::RetryDisposition::Transient => "temporary failure",
+                                codex_client::RetryDisposition::DoNotRetry => "permanent failure",
+                            },
+                            status.delay,
+                            status.attempt,
+                            format_retry_budget(status.max_retries),
+                        ),
+                    });
                 })
+            });
+            if let Err(error) = sampler
+                .sample_with_retry_notifier(
+                    LunaSamplingRequest {
+                        instructions: CLASSIFIER_INSTRUCTIONS.to_owned(),
+                        input: classification_input,
+                        output_schema: json!({
+                            "type": "object",
+                            "properties": {
+                                "scores": {
+                                    "type": "object",
+                                    "properties": {
+                                        "action_risk": {
+                                            "type": "number",
+                                            "minimum": 0.0,
+                                            "maximum": 1.0
+                                        }
+                                    },
+                                    "required": ["action_risk"],
+                                    "additionalProperties": false
+                                }
+                            },
+                            "required": ["scores"],
+                            "additionalProperties": false
+                        }),
+                        reasoning_effort: ReasoningEffort::Low,
+                        turn_id: turn_id.clone(),
+                    },
+                    Some(retry_notifier),
+                )
                 .await
             {
                 event_sink.emit_warning(ExtensionWarning {

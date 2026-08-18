@@ -31,7 +31,8 @@ use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_retry::ResponsesStreamRequest;
 use crate::responses_retry::ResponsesStreamRetryState;
-use crate::responses_retry::handle_retryable_response_stream_error;
+use crate::responses_retry::handle_retryable_response_stream_error_with_cancellation;
+use crate::responses_retry::retry_status_notifier;
 use crate::session::PreviousTurnSettings;
 use crate::session::TurnInput;
 use crate::session::session::Session;
@@ -162,6 +163,10 @@ pub(crate) async fn run_turn(
 
     let mut client_session =
         prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
+    client_session.set_retry_notifier(retry_status_notifier(
+        Arc::clone(&sess),
+        Arc::clone(&turn_context),
+    ));
     // TODO(ccunningham): Pre-turn compaction runs before context updates and the
     // new user message are recorded. Estimate pending incoming items (context
     // diffs/full reinjection + user input) and trigger compaction preemptively
@@ -461,6 +466,7 @@ pub(crate) async fn run_turn(
                         },
                         CompactionReason::ContextLimit,
                         CompactionPhase::MidTurn,
+                        &cancellation_token,
                     )
                     .await
                     {
@@ -1016,6 +1022,7 @@ async fn run_pre_sampling_compact(
             InitialContextInjection::DoNotInject,
             CompactionReason::ContextLimit,
             CompactionPhase::PreTurn,
+            cancellation_token,
         )
         .await?;
     }
@@ -1098,6 +1105,7 @@ async fn maybe_run_previous_model_inline_compact(
             InitialContextInjection::DoNotInject,
             CompactionReason::CompHashChanged,
             CompactionPhase::PreTurn,
+            cancellation_token,
         )
         .await?;
         return Ok(());
@@ -1146,6 +1154,7 @@ async fn maybe_run_previous_model_inline_compact(
             InitialContextInjection::DoNotInject,
             CompactionReason::ModelDownshift,
             CompactionPhase::PreTurn,
+            cancellation_token,
         )
         .await?;
     }
@@ -1165,6 +1174,7 @@ async fn run_auto_compact(
     initial_context_injection: InitialContextInjection,
     reason: CompactionReason,
     phase: CompactionPhase,
+    cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
     let turn_context = &step_context.turn;
     let _profile_guard = turn_context.turn_timing_state.begin_compaction();
@@ -1175,6 +1185,7 @@ async fn run_auto_compact(
             Arc::clone(sess),
             step_context,
             initial_context_injection,
+            cancellation_token,
         )
         .await?;
         return Ok(());
@@ -1200,6 +1211,7 @@ async fn run_auto_compact(
                 initial_context_injection,
                 reason,
                 phase,
+                cancellation_token,
             )
             .await?;
         }
@@ -1217,6 +1229,7 @@ async fn run_auto_compact(
                 initial_context_injection,
                 reason,
                 phase,
+                cancellation_token,
             )
             .await?;
         }
@@ -1232,6 +1245,7 @@ async fn run_auto_compact(
                 initial_context_injection,
                 reason,
                 phase,
+                cancellation_token,
             )
             .await?;
         }
@@ -1406,11 +1420,7 @@ async fn run_sampling_request(
             original_input = Some(prompt.input);
         }
 
-        if !err.is_retryable() {
-            return Err(err);
-        }
-
-        handle_retryable_response_stream_error(
+        handle_retryable_response_stream_error_with_cancellation(
             &mut retry_state,
             max_retries,
             err,
@@ -1418,6 +1428,7 @@ async fn run_sampling_request(
             &sess,
             &turn_context,
             ResponsesStreamRequest::Sampling,
+            &cancellation_token,
         )
         .await?;
         turn_context.turn_timing_state.record_sampling_retry();
@@ -2245,9 +2256,10 @@ async fn try_run_sampling_request(
             Some(Ok(event)) => event,
             Some(Err(err)) => break Err(err),
             None => {
-                break Err(CodexErr::Stream(
-                    "stream closed before response.completed".into(),
-                ));
+                break Err(
+                    CodexErr::Stream("stream closed before response.completed".into())
+                        .with_explicit_retryable(),
+                );
             }
         };
 

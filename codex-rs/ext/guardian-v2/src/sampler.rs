@@ -13,6 +13,15 @@ use codex_api::ResponsesWebsocketConnection;
 use codex_api::ResponsesWsRequest;
 use codex_api::build_session_headers;
 use codex_api::create_text_param_for_request;
+use codex_client::PERSISTENT_CAPACITY_MAX_RETRIES;
+use codex_client::RetryDisposition;
+use codex_client::RetryNotifier;
+use codex_client::RetryStatus;
+use codex_client::backoff;
+use codex_client::classify_connection_error;
+use codex_client::classify_http_response;
+use codex_client::classify_io_error;
+use codex_client::classify_provider_error_text;
 use codex_http_client::HttpClientFactory;
 use codex_login::AgentIdentityAuthPolicy;
 use codex_login::CodexAuth;
@@ -22,6 +31,7 @@ use codex_model_provider::AgentIdentitySessionFallback;
 use codex_model_provider::ProviderAuthScope;
 use codex_model_provider::SharedModelProvider;
 use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -37,6 +47,8 @@ const MAX_OUTPUT_BYTES: usize = 8 * 1024;
 const INITIAL_WEBSOCKET_CONNECTIONS: usize = 2;
 const MAX_WEBSOCKET_CONNECTIONS: usize = 8;
 const MAX_WEBSOCKET_AGE: Duration = Duration::from_secs(55 * 60);
+const SAMPLING_MAX_RETRIES: u64 = 4;
+const SAMPLING_BASE_DELAY: Duration = Duration::from_millis(250);
 const RESPONSES_WEBSOCKETS_BETA: &str = "responses_websockets=2026-02-06";
 const RESPONSES_LITE_METADATA_KEY: &str =
     "ws_request_header_x_openai_internal_codex_responses_lite";
@@ -93,6 +105,93 @@ pub enum LunaSamplerError {
     /// The response exceeded the bounded output limit.
     #[error("Luna response exceeded the output limit")]
     OutputTooLarge,
+}
+
+/// Classifies a sampling failure before deciding whether the request can be replayed.
+///
+/// Sampling has no externally visible side effect, so an incomplete response can be replayed.
+/// Deterministic request, policy, and output-size failures remain terminal.
+pub(crate) fn classify_sampling_error(error: &LunaSamplerError) -> RetryDisposition {
+    match error {
+        LunaSamplerError::Api(error) => error.retry_disposition(),
+        LunaSamplerError::ConnectionTimeout | LunaSamplerError::MissingOutput => {
+            RetryDisposition::Transient
+        }
+        LunaSamplerError::OutputTooLarge => RetryDisposition::DoNotRetry,
+        LunaSamplerError::Provider(error) => match error.details() {
+            CodexErrorDetails::ServerOverloaded => RetryDisposition::Capacity,
+            CodexErrorDetails::Timeout
+            | CodexErrorDetails::RequestTimeout
+            | CodexErrorDetails::InternalServerError => RetryDisposition::Transient,
+            CodexErrorDetails::ResponseStreamFailed(error) => {
+                classify_connection_error(&error.source)
+            }
+            CodexErrorDetails::ConnectionFailed(error) => classify_connection_error(&error.source),
+            CodexErrorDetails::UnexpectedStatus(error) => {
+                classify_http_response(error.status, Some(&error.body))
+            }
+            CodexErrorDetails::RetryLimit(error) => classify_http_response(error.status, None),
+            CodexErrorDetails::Io(error) => classify_io_error(error),
+            CodexErrorDetails::Stream(message) => classify_provider_error_text(message),
+            CodexErrorDetails::InternalAgentDied | CodexErrorDetails::Json(_) => {
+                if error.is_explicitly_retryable() {
+                    RetryDisposition::Transient
+                } else {
+                    RetryDisposition::DoNotRetry
+                }
+            }
+            CodexErrorDetails::RefreshTokenFailed(_) => {
+                classify_provider_error_text(&error.to_string())
+            }
+            _ => RetryDisposition::DoNotRetry,
+        },
+    }
+}
+
+async fn wait_for_sampling_retry(
+    retry_notifier: Option<&RetryNotifier>,
+    error: &LunaSamplerError,
+    transient_retries: &mut u64,
+    capacity_retries: &mut u64,
+) -> bool {
+    let disposition = classify_sampling_error(error);
+    let (retry_attempt, max_retries) = match disposition {
+        RetryDisposition::Capacity if *capacity_retries < PERSISTENT_CAPACITY_MAX_RETRIES => {
+            *capacity_retries = capacity_retries.saturating_add(1);
+            (*capacity_retries, PERSISTENT_CAPACITY_MAX_RETRIES)
+        }
+        RetryDisposition::Transient if *transient_retries < SAMPLING_MAX_RETRIES => {
+            *transient_retries = transient_retries.saturating_add(1);
+            (*transient_retries, SAMPLING_MAX_RETRIES)
+        }
+        RetryDisposition::DoNotRetry | RetryDisposition::Transient | RetryDisposition::Capacity => {
+            return false;
+        }
+    };
+
+    let delay = backoff(SAMPLING_BASE_DELAY, retry_attempt);
+    tracing::warn!(
+        operation = "guardian/luna_sampling",
+        attempt = retry_attempt,
+        max_retries,
+        delay_ms = delay.as_millis() as u64,
+        retry_disposition = ?disposition,
+        error = %error,
+        "Luna sampling failed; retrying"
+    );
+    if let Some(retry_notifier) = retry_notifier {
+        retry_notifier(RetryStatus {
+            operation: "guardian/luna_sampling".to_owned(),
+            disposition,
+            attempt: retry_attempt,
+            max_retries,
+            delay,
+            error: error.to_string(),
+        })
+        .await;
+    }
+    tokio::time::sleep(delay).await;
+    true
 }
 
 struct PooledConnection {
@@ -252,6 +351,17 @@ impl LunaSampler {
 
     /// Sends one structured, tool-less request on an exclusively leased WebSocket.
     pub async fn sample(&self, request: LunaSamplingRequest) -> Result<String, LunaSamplerError> {
+        self.sample_with_retry_notifier(request, None).await
+    }
+
+    /// Sends one request and reports retry status through an optional host-owned event sink.
+    ///
+    /// Retry status is emitted out of band. It is never appended to the model request.
+    pub async fn sample_with_retry_notifier(
+        &self,
+        request: LunaSamplingRequest,
+        retry_notifier: Option<RetryNotifier>,
+    ) -> Result<String, LunaSamplerError> {
         let metadata = HashMap::from([
             ("session_id".to_owned(), self.config.session_id.clone()),
             ("thread_id".to_owned(), self.config.thread_id.clone()),
@@ -307,10 +417,26 @@ impl LunaSampler {
             ),
             client_metadata: Some(metadata),
         };
-        let mut retried = false;
+        let mut transient_retries = 0;
+        let mut capacity_retries = 0;
         'retry: loop {
-            let lease = self.lease_connection().await?;
-            let mut stream = lease
+            let lease = match self.lease_connection().await {
+                Ok(lease) => lease,
+                Err(error) => {
+                    if wait_for_sampling_retry(
+                        retry_notifier.as_ref(),
+                        &error,
+                        &mut transient_retries,
+                        &mut capacity_retries,
+                    )
+                    .await
+                    {
+                        continue 'retry;
+                    }
+                    return Err(error);
+                }
+            };
+            let mut stream = match lease
                 .connection
                 .connection
                 .stream_request(
@@ -319,24 +445,43 @@ impl LunaSampler {
                     /*turn_state*/ None,
                 )
                 .await
-                .map_err(LunaSamplerError::Api)?;
+            {
+                Ok(stream) => stream,
+                Err(error) => {
+                    let error = LunaSamplerError::Api(error);
+                    if wait_for_sampling_retry(
+                        retry_notifier.as_ref(),
+                        &error,
+                        &mut transient_retries,
+                        &mut capacity_retries,
+                    )
+                    .await
+                    {
+                        continue 'retry;
+                    }
+                    return Err(error);
+                }
+            };
 
             let mut output = String::new();
             let mut deltas = String::new();
             while let Some(event) = stream.rx_event.recv().await {
                 let event = match event {
                     Ok(event) => event,
-                    Err(error)
-                        if !retried
-                            && matches!(
-                                error,
-                                ApiError::Retryable { .. } | ApiError::Stream(_)
-                            ) =>
-                    {
-                        retried = true;
-                        continue 'retry;
+                    Err(error) => {
+                        let error = LunaSamplerError::Api(error);
+                        if wait_for_sampling_retry(
+                            retry_notifier.as_ref(),
+                            &error,
+                            &mut transient_retries,
+                            &mut capacity_retries,
+                        )
+                        .await
+                        {
+                            continue 'retry;
+                        }
+                        return Err(error);
                     }
-                    Err(error) => return Err(LunaSamplerError::Api(error)),
                 };
                 match event {
                     ResponseEvent::OutputTextDelta(delta) => {
@@ -379,7 +524,18 @@ impl LunaSampler {
                         if !deltas.is_empty() {
                             return Ok(deltas);
                         }
-                        return Err(LunaSamplerError::MissingOutput);
+                        let error = LunaSamplerError::MissingOutput;
+                        if wait_for_sampling_retry(
+                            retry_notifier.as_ref(),
+                            &error,
+                            &mut transient_retries,
+                            &mut capacity_retries,
+                        )
+                        .await
+                        {
+                            continue 'retry;
+                        }
+                        return Err(error);
                     }
                     _ => {}
                 }
@@ -387,7 +543,18 @@ impl LunaSampler {
                     return Err(LunaSamplerError::OutputTooLarge);
                 }
             }
-            return Err(LunaSamplerError::MissingOutput);
+            let error = LunaSamplerError::MissingOutput;
+            if wait_for_sampling_retry(
+                retry_notifier.as_ref(),
+                &error,
+                &mut transient_retries,
+                &mut capacity_retries,
+            )
+            .await
+            {
+                continue 'retry;
+            }
+            return Err(error);
         }
     }
 }

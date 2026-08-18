@@ -78,12 +78,14 @@ impl ReqwestTransport {
     }
 
     fn map_error(err: reqwest::Error) -> TransportError {
-        if err.is_connect() {
+        if err.is_builder() || err.is_redirect() {
+            TransportError::Build(err.without_url().to_string())
+        } else if err.is_connect() {
             TransportError::Connection(err.without_url())
         } else if err.is_timeout() {
             TransportError::Timeout
         } else {
-            TransportError::Network(err.to_string())
+            TransportError::Network(err.without_url().to_string())
         }
     }
 

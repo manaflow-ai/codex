@@ -20,8 +20,20 @@ use crate::endpoint::realtime_websocket::protocol::RealtimeTranscriptEntry;
 use crate::endpoint::realtime_websocket::protocol::RealtimeVoice;
 use crate::endpoint::realtime_websocket::protocol::parse_realtime_event;
 use crate::error::ApiError;
+use crate::error::is_permanent_error_fields;
+use crate::error::is_permanent_error_message;
+use crate::error::is_server_overloaded_error;
+use crate::error::map_websocket_close_error;
+use crate::error::map_websocket_operation_error;
 use crate::provider::Provider;
+use codex_client::PERSISTENT_CAPACITY_MAX_RETRIES;
+use codex_client::RetryDisposition;
+use codex_client::RetryNotifier;
+use codex_client::RetryStatus;
+use codex_client::TransportError;
 use codex_client::backoff;
+use codex_client::classify_provider_error_text;
+use codex_client::is_capacity_error_body;
 use codex_http_client::maybe_build_rustls_client_config_with_custom_ca;
 use codex_protocol::protocol::ConversationTextParams;
 use codex_protocol::protocol::ConversationTextRole;
@@ -36,6 +48,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
@@ -46,6 +59,7 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
@@ -406,23 +420,27 @@ impl RealtimeWebsocketWriter {
         if self.event_parser == RealtimeEventParser::FramelessBidi {
             let payload =
                 serde_json::to_string(&RealtimeOutboundMessage::SessionClose).map_err(|err| {
-                    ApiError::Stream(format!("failed to encode realtime request: {err}"))
+                    ApiError::InvalidRequest {
+                        message: format!("failed to encode realtime request: {err}"),
+                    }
                 })?;
             trace!(target: REALTIME_WIRE_LOG_TARGET, "realtime websocket request: {payload}");
             if let Err(err) = self.stream.send(Message::Text(payload.into())).await
                 && !matches!(err, WsError::ConnectionClosed | WsError::AlreadyClosed)
             {
-                return Err(ApiError::Stream(format!(
-                    "failed to close frameless realtime session: {err}"
-                )));
+                return Err(map_websocket_operation_error(
+                    err,
+                    "failed to close frameless realtime session",
+                ));
             }
         }
         if let Err(err) = self.stream.close().await
             && !matches!(err, WsError::ConnectionClosed | WsError::AlreadyClosed)
         {
-            return Err(ApiError::Stream(format!(
-                "failed to close websocket: {err}"
-            )));
+            return Err(map_websocket_operation_error(
+                err,
+                "failed to close realtime websocket",
+            ));
         }
         Ok(())
     }
@@ -463,24 +481,26 @@ impl RealtimeWebsocketWriter {
     }
 
     async fn send_json_frame(&self, message: &RealtimeOutboundMessage) -> Result<(), ApiError> {
-        let payload = serde_json::to_string(message)
-            .map_err(|err| ApiError::Stream(format!("failed to encode realtime request: {err}")))?;
+        let payload = serde_json::to_string(message).map_err(|err| ApiError::InvalidRequest {
+            message: format!("failed to encode realtime request: {err}"),
+        })?;
         debug!(?message, "realtime websocket request");
         self.send_payload(payload).await
     }
 
     pub async fn send_payload(&self, payload: String) -> Result<(), ApiError> {
         if self.is_closed.load(Ordering::SeqCst) {
-            return Err(ApiError::Stream(
-                "realtime websocket connection is closed".to_string(),
-            ));
+            return Err(ApiError::Retryable {
+                message: "realtime websocket connection is closed".to_string(),
+                delay: None,
+            });
         }
 
         trace!(target: REALTIME_WIRE_LOG_TARGET, "realtime websocket request: {payload}");
         self.stream
             .send(Message::Text(payload.into()))
             .await
-            .map_err(|err| ApiError::Stream(format!("failed to send realtime request: {err}")))?;
+            .map_err(|err| map_websocket_operation_error(err, "failed to send realtime request"))?;
         Ok(())
     }
 }
@@ -508,9 +528,10 @@ impl RealtimeWebsocketEvents {
                 Ok(Err(err)) => {
                     self.is_closed.store(true, Ordering::SeqCst);
                     error!("realtime websocket read failed: {err}");
-                    return Err(ApiError::Stream(format!(
-                        "failed to read websocket message: {err}"
-                    )));
+                    return Err(map_websocket_operation_error(
+                        err,
+                        "failed to read realtime websocket message",
+                    ));
                 }
                 Err(_) => {
                     self.is_closed.store(true, Ordering::SeqCst);
@@ -536,7 +557,19 @@ impl RealtimeWebsocketEvents {
                         frame.as_ref().map(|frame| frame.code),
                         frame.as_ref().map(|frame| frame.reason.as_str())
                     );
-                    return Ok(None);
+                    let Some(frame) = frame else {
+                        return Ok(None);
+                    };
+                    if frame.code
+                        == tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Normal
+                    {
+                        return Ok(None);
+                    }
+                    return Err(map_websocket_close_error(
+                        frame.code,
+                        frame.reason.as_ref(),
+                        "realtime websocket closed by server",
+                    ));
                 }
                 Message::Binary(_) => {
                     return Ok(Some(RealtimeEvent::Error(
@@ -550,19 +583,21 @@ impl RealtimeWebsocketEvents {
 
     async fn wait_for_session_started(&self) -> Result<(), ApiError> {
         let Some(event) = self.next_event().await? else {
-            return Err(ApiError::Stream(
-                "frameless realtime session ended before session.started".to_string(),
-            ));
+            return Err(ApiError::Retryable {
+                message: "frameless realtime session ended before session.started".to_string(),
+                delay: None,
+            });
         };
         match &event {
             RealtimeEvent::SessionUpdated { .. } => {
                 self.pending_events.lock().await.push_back(event);
                 Ok(())
             }
-            RealtimeEvent::Error(message) => Err(ApiError::Stream(message.clone())),
-            _ => Err(ApiError::Stream(
-                "frameless realtime session received an event before session.started".to_string(),
-            )),
+            RealtimeEvent::Error(message) => Err(classify_realtime_event_error(message.clone())),
+            _ => Err(ApiError::InvalidRequest {
+                message: "frameless realtime session received an event before session.started"
+                    .to_string(),
+            }),
         }
     }
 
@@ -628,6 +663,46 @@ impl RealtimeWebsocketEvents {
             | RealtimeEvent::ConversationItemAdded(_)
             | RealtimeEvent::Error(_) => {}
         }
+    }
+}
+
+fn classify_realtime_event_error(message: String) -> ApiError {
+    if is_capacity_error_body(&message) {
+        return ApiError::ServerOverloaded;
+    }
+    // The realtime protocol can fall back to serializing the whole error object when its
+    // nested message is absent. Inspect the structured fields before classifying the wrapper
+    // text, because `invalid_request_error` may wrap a capacity message.
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&message) {
+        let error = value
+            .get("error")
+            .and_then(serde_json::Value::as_object)
+            .or_else(|| value.as_object());
+        if let Some(error) = error {
+            let error_type = error.get("type").and_then(serde_json::Value::as_str);
+            let code = error.get("code").and_then(serde_json::Value::as_str);
+            let nested_message = error.get("message").and_then(serde_json::Value::as_str);
+            if is_server_overloaded_error(error_type, code, nested_message) {
+                return ApiError::ServerOverloaded;
+            }
+            if is_permanent_error_fields(error_type, code, nested_message) {
+                return ApiError::InvalidRequest { message };
+            }
+        }
+    }
+    if is_server_overloaded_error(None, None, Some(&message)) {
+        return ApiError::ServerOverloaded;
+    }
+    if is_permanent_error_message(&message) {
+        return ApiError::InvalidRequest { message };
+    }
+    if classify_provider_error_text(&message) != RetryDisposition::DoNotRetry {
+        ApiError::Retryable {
+            message,
+            delay: None,
+        }
+    } else {
+        ApiError::InvalidRequest { message }
     }
 }
 
@@ -700,6 +775,7 @@ fn contains_transcript_entry(entries: &[RealtimeTranscriptEntry], role: &str, te
 pub struct RealtimeWebsocketClient {
     provider: Provider,
     webrtc_sideband_base_url: String,
+    retry_notifier: Option<RetryNotifier>,
 }
 
 impl RealtimeWebsocketClient {
@@ -707,7 +783,14 @@ impl RealtimeWebsocketClient {
         Self {
             provider,
             webrtc_sideband_base_url: OPENAI_REALTIME_API_BASE_URL.to_string(),
+            retry_notifier: None,
         }
+    }
+
+    /// Adds a status sink for connection retries. Status is not sent on the websocket.
+    pub fn with_retry_notifier(mut self, retry_notifier: RetryNotifier) -> Self {
+        self.retry_notifier = Some(retry_notifier);
+        self
     }
 
     /// Overrides the direct WebRTC sideband URL for local development and tests.
@@ -722,6 +805,17 @@ impl RealtimeWebsocketClient {
         extra_headers: HeaderMap,
         default_headers: HeaderMap,
     ) -> Result<RealtimeWebsocketConnection, ApiError> {
+        self.connect_with_cancellation(config, extra_headers, default_headers, None)
+            .await
+    }
+
+    pub async fn connect_with_cancellation(
+        &self,
+        config: RealtimeSessionConfig,
+        extra_headers: HeaderMap,
+        default_headers: HeaderMap,
+        cancellation_token: Option<&CancellationToken>,
+    ) -> Result<RealtimeWebsocketConnection, ApiError> {
         let ws_url = websocket_url_from_api_url(
             self.provider.base_url.as_str(),
             self.provider.query_params.as_ref(),
@@ -729,14 +823,64 @@ impl RealtimeWebsocketClient {
             config.event_parser,
             config.session_mode,
         )?;
-        self.connect_realtime_websocket_url(
-            ws_url,
-            config,
-            extra_headers,
-            default_headers,
-            /*initialize_session*/ true,
-        )
-        .await
+        let mut transient_retries = 0;
+        let mut capacity_retries = 0;
+        loop {
+            let result = match cancellation_token {
+                Some(token) => {
+                    tokio::select! {
+                        _ = token.cancelled() => return Err(ApiError::Cancelled),
+                        result = self.connect_realtime_websocket_url(
+                            ws_url.clone(),
+                            config.clone(),
+                            extra_headers.clone(),
+                            default_headers.clone(),
+                            /*initialize_session*/ true,
+                        ) => result,
+                    }
+                }
+                None => {
+                    self.connect_realtime_websocket_url(
+                        ws_url.clone(),
+                        config.clone(),
+                        extra_headers.clone(),
+                        default_headers.clone(),
+                        /*initialize_session*/ true,
+                    )
+                    .await
+                }
+            };
+            match result {
+                Ok(connection) => return Ok(connection),
+                Err(error) => {
+                    let Some((disposition, retry_count, max_retries)) =
+                        self.claim_retry(&error, &mut transient_retries, &mut capacity_retries)
+                    else {
+                        return Err(error);
+                    };
+                    let delay = backoff(self.provider.retry.base_delay, retry_count);
+                    warn!(
+                        attempt = retry_count,
+                        max_retries,
+                        delay_ms = delay.as_millis(),
+                        retry_disposition = ?disposition,
+                        "realtime websocket connect failed; retrying: {error}"
+                    );
+                    self.emit_retry_status(RetryStatus {
+                        operation: "realtime/connect".to_string(),
+                        disposition,
+                        attempt: retry_count,
+                        max_retries,
+                        delay,
+                        error: error.to_string(),
+                    })
+                    .await;
+                    if !Self::sleep_with_cancellation(delay, cancellation_token).await {
+                        return Err(ApiError::Cancelled);
+                    }
+                }
+            }
+        }
     }
 
     pub async fn connect_webrtc_sideband(
@@ -746,37 +890,140 @@ impl RealtimeWebsocketClient {
         extra_headers: HeaderMap,
         default_headers: HeaderMap,
     ) -> Result<RealtimeWebsocketConnection, ApiError> {
+        self.connect_webrtc_sideband_with_cancellation(
+            config,
+            call_id,
+            extra_headers,
+            default_headers,
+            None,
+        )
+        .await
+    }
+
+    pub async fn connect_webrtc_sideband_with_cancellation(
+        &self,
+        config: RealtimeSessionConfig,
+        call_id: &str,
+        extra_headers: HeaderMap,
+        default_headers: HeaderMap,
+        cancellation_token: Option<&CancellationToken>,
+    ) -> Result<RealtimeWebsocketConnection, ApiError> {
         // The WebRTC call already exists; this loop only retries joining its sideband control
         // socket. Once joined, the returned connection is the same reader/writer state that the
         // ordinary websocket start path uses.
-        for attempt in 0..=self.provider.retry.max_attempts {
-            let result = self
-                .connect_webrtc_sideband_once(
-                    config.clone(),
-                    call_id,
-                    extra_headers.clone(),
-                    default_headers.clone(),
-                )
-                .await;
+        let mut transient_retries = 0;
+        let mut capacity_retries = 0;
+        loop {
+            let result = match cancellation_token {
+                Some(token) => {
+                    tokio::select! {
+                        _ = token.cancelled() => return Err(ApiError::Cancelled),
+                        result = self.connect_webrtc_sideband_once(
+                            config.clone(),
+                            call_id,
+                            extra_headers.clone(),
+                            default_headers.clone(),
+                        ) => result,
+                    }
+                }
+                None => {
+                    self.connect_webrtc_sideband_once(
+                        config.clone(),
+                        call_id,
+                        extra_headers.clone(),
+                        default_headers.clone(),
+                    )
+                    .await
+                }
+            };
             match result {
                 Ok(connection) => return Ok(connection),
-                Err(err) if attempt < self.provider.retry.max_attempts => {
-                    let delay = backoff(self.provider.retry.base_delay, attempt + 1);
+                Err(error) => {
+                    let Some((disposition, retry_count, max_retries)) =
+                        self.claim_retry(&error, &mut transient_retries, &mut capacity_retries)
+                    else {
+                        return Err(error);
+                    };
+                    let delay = backoff(self.provider.retry.base_delay, retry_count);
                     warn!(
-                        attempt = attempt + 1,
+                        attempt = retry_count,
+                        max_retries,
                         call_id,
                         delay_ms = delay.as_millis(),
-                        "realtime sideband websocket connect failed; retrying: {err}"
+                        retry_disposition = ?disposition,
+                        "realtime sideband websocket connect failed; retrying: {error}"
                     );
-                    sleep(delay).await;
+                    self.emit_retry_status(RetryStatus {
+                        operation: "realtime/sideband-connect".to_string(),
+                        disposition,
+                        attempt: retry_count,
+                        max_retries,
+                        delay,
+                        error: error.to_string(),
+                    })
+                    .await;
+                    if !Self::sleep_with_cancellation(delay, cancellation_token).await {
+                        return Err(ApiError::Cancelled);
+                    }
                 }
-                Err(err) => return Err(err),
             }
         }
+    }
 
-        Err(ApiError::Stream(
-            "realtime sideband websocket retry loop exhausted".to_string(),
-        ))
+    async fn sleep_with_cancellation(
+        delay: Duration,
+        cancellation_token: Option<&CancellationToken>,
+    ) -> bool {
+        let Some(token) = cancellation_token else {
+            sleep(delay).await;
+            return true;
+        };
+        tokio::select! {
+            _ = sleep(delay) => true,
+            _ = token.cancelled() => false,
+        }
+    }
+
+    fn claim_retry(
+        &self,
+        error: &ApiError,
+        transient_retries: &mut u64,
+        capacity_retries: &mut u64,
+    ) -> Option<(RetryDisposition, u64, u64)> {
+        let disposition = error.retry_disposition();
+        match disposition {
+            RetryDisposition::Capacity if *capacity_retries < PERSISTENT_CAPACITY_MAX_RETRIES => {
+                *capacity_retries += 1;
+                Some((
+                    RetryDisposition::Capacity,
+                    *capacity_retries,
+                    PERSISTENT_CAPACITY_MAX_RETRIES,
+                ))
+            }
+            RetryDisposition::Transient
+                if error.is_retryable_for_attempt(
+                    &self.provider.retry.to_policy().retry_on,
+                    *transient_retries,
+                    self.provider.retry.max_attempts,
+                ) =>
+            {
+                *transient_retries += 1;
+                Some((
+                    RetryDisposition::Transient,
+                    *transient_retries,
+                    self.provider.retry.max_attempts,
+                ))
+            }
+            RetryDisposition::DoNotRetry
+            | RetryDisposition::Transient
+            | RetryDisposition::Capacity => None,
+        }
+    }
+
+    async fn emit_retry_status(&self, status: RetryStatus) {
+        if let Some(retry_notifier) = self.retry_notifier.as_ref() {
+            retry_notifier(status).await;
+        }
     }
 
     async fn connect_webrtc_sideband_once(
@@ -824,10 +1071,13 @@ impl RealtimeWebsocketClient {
     ) -> Result<RealtimeWebsocketConnection, ApiError> {
         ensure_rustls_crypto_provider();
 
-        let mut request = ws_url
-            .as_str()
-            .into_client_request()
-            .map_err(|err| ApiError::Stream(format!("failed to build websocket request: {err}")))?;
+        let mut request =
+            ws_url
+                .as_str()
+                .into_client_request()
+                .map_err(|err| ApiError::InvalidRequest {
+                    message: format!("failed to build websocket request: {err}"),
+                })?;
         let headers = merge_request_headers(
             &self.provider.headers,
             with_session_id_header(extra_headers, config.session_id.as_deref())?,
@@ -839,7 +1089,9 @@ impl RealtimeWebsocketClient {
         // Realtime websocket TLS should honor the same custom-CA env vars as the rest of Codex's
         // outbound HTTPS and websocket traffic.
         let connector = maybe_build_rustls_client_config_with_custom_ca()
-            .map_err(|err| ApiError::Stream(format!("failed to configure websocket TLS: {err}")))?
+            .map_err(|err| ApiError::InvalidRequest {
+                message: format!("failed to configure websocket TLS: {err}"),
+            })?
             .map(tokio_tungstenite::Connector::Rustls);
         let (stream, response) = tokio_tungstenite::connect_async_tls_with_config(
             request,
@@ -848,7 +1100,7 @@ impl RealtimeWebsocketClient {
             connector,
         )
         .await
-        .map_err(|err| ApiError::Stream(format!("failed to connect realtime websocket: {err}")))?;
+        .map_err(|err| map_realtime_ws_error(err, &ws_url))?;
         info!(
             ws_url = %ws_url,
             status = %response.status(),
@@ -881,6 +1133,28 @@ impl RealtimeWebsocketClient {
     }
 }
 
+fn map_realtime_ws_error(err: WsError, url: &Url) -> ApiError {
+    match err {
+        WsError::Http(response) => {
+            let status = response.status();
+            let headers = response.headers().clone();
+            let body = response
+                .body()
+                .as_ref()
+                .and_then(|bytes| String::from_utf8(bytes.clone()).ok());
+            ApiError::Transport(TransportError::Http {
+                status,
+                url: Some(url.to_string()),
+                headers: Some(headers),
+                body,
+            })
+        }
+        other => {
+            map_websocket_operation_error(other, "realtime websocket failed before connecting")
+        }
+    }
+}
+
 fn merge_request_headers(
     provider_headers: &HeaderMap,
     extra_headers: HeaderMap,
@@ -905,8 +1179,8 @@ fn with_session_id_header(
     };
     headers.insert(
         "x-session-id",
-        HeaderValue::from_str(session_id).map_err(|err| {
-            ApiError::Stream(format!("invalid realtime session id header: {err}"))
+        HeaderValue::from_str(session_id).map_err(|err| ApiError::InvalidRequest {
+            message: format!("invalid realtime session id header: {err}"),
         })?,
     );
     Ok(headers)
@@ -923,8 +1197,9 @@ fn websocket_url_from_api_url(
     event_parser: RealtimeEventParser,
     _session_mode: RealtimeSessionMode,
 ) -> Result<Url, ApiError> {
-    let mut url = Url::parse(api_url)
-        .map_err(|err| ApiError::Stream(format!("failed to parse realtime api_url: {err}")))?;
+    let mut url = Url::parse(api_url).map_err(|err| ApiError::InvalidRequest {
+        message: format!("failed to parse realtime api_url: {err}"),
+    })?;
 
     normalize_realtime_path(&mut url, event_parser);
 
@@ -935,9 +1210,9 @@ fn websocket_url_from_api_url(
             let _ = url.set_scheme(scheme);
         }
         scheme => {
-            return Err(ApiError::Stream(format!(
-                "unsupported realtime api_url scheme: {scheme}"
-            )));
+            return Err(ApiError::InvalidRequest {
+                message: format!("unsupported realtime api_url scheme: {scheme}"),
+            });
         }
     }
 
@@ -1055,6 +1330,41 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
     use tokio_tungstenite::tungstenite::Message;
+
+    #[test]
+    fn realtime_error_classifier_separates_capacity_transient_and_permanent_failures() {
+        assert!(matches!(
+            classify_realtime_event_error(
+                "Selected model is at capacity. Please try a different model.".to_string()
+            ),
+            ApiError::ServerOverloaded
+        ));
+        assert!(matches!(
+            classify_realtime_event_error("connection reset by peer".to_string()),
+            ApiError::Retryable { .. }
+        ));
+        assert!(matches!(
+            classify_realtime_event_error("account_suspended".to_string()),
+            ApiError::InvalidRequest { .. }
+        ));
+    }
+
+    #[test]
+    fn realtime_error_classifier_reads_capacity_from_wrapped_provider_error() {
+        let message = serde_json::json!({
+            "type": "invalid_request_error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "Selected model is at capacity. Please try a different model."
+            }
+        })
+        .to_string();
+
+        assert!(matches!(
+            classify_realtime_event_error(message),
+            ApiError::ServerOverloaded
+        ));
+    }
 
     #[test]
     fn parse_session_updated_event() {
@@ -1830,6 +2140,49 @@ mod tests {
             .expect("build ws url");
 
         assert_eq!(url.as_str(), "wss://api.openai.com/v1/live/rtc_test");
+    }
+
+    #[test]
+    fn realtime_retry_budget_is_persistent_for_capacity_and_terminal_for_invalid_requests() {
+        let client = RealtimeWebsocketClient::new(Provider {
+            name: "test".to_string(),
+            base_url: "https://example.com".to_string(),
+            query_params: None,
+            headers: HeaderMap::new(),
+            retry: RetryConfig {
+                max_attempts: 1,
+                base_delay: Duration::from_millis(1),
+                retry_429: true,
+                retry_5xx: true,
+                retry_transport: true,
+            },
+            stream_idle_timeout: Duration::from_secs(5),
+        });
+        let mut transient_retries = 0;
+        let mut capacity_retries = 0;
+
+        assert_eq!(
+            client.claim_retry(
+                &ApiError::ServerOverloaded,
+                &mut transient_retries,
+                &mut capacity_retries,
+            ),
+            Some((
+                RetryDisposition::Capacity,
+                1,
+                codex_client::PERSISTENT_CAPACITY_MAX_RETRIES,
+            )),
+        );
+        assert_eq!(
+            client.claim_retry(
+                &ApiError::InvalidRequest {
+                    message: "invalid request".to_string(),
+                },
+                &mut transient_retries,
+                &mut capacity_retries,
+            ),
+            None,
+        );
     }
 
     #[tokio::test]

@@ -14,9 +14,11 @@ pub(crate) mod sse;
 pub(crate) mod telemetry;
 
 pub use crate::requests::headers::build_session_headers;
+pub use codex_client::PERSISTENT_CAPACITY_MAX_RETRIES;
 pub use codex_client::RequestTelemetry;
 pub use codex_client::ReqwestTransport;
 pub use codex_client::TransportError;
+pub use codex_client::UNLIMITED_RETRIES;
 
 pub use crate::api_bridge::map_api_error;
 pub use crate::auth::AgentIdentityTelemetry;

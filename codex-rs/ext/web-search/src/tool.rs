@@ -4,6 +4,10 @@ use codex_api::SearchCommands;
 use codex_api::SearchQuery;
 use codex_api::SearchRequest;
 use codex_api::SearchSettings;
+use codex_client::RetryDisposition;
+use codex_client::RetryNotifier;
+use codex_client::RetryStatus;
+use codex_client::format_retry_budget;
 use codex_core::X_CODEX_TURN_METADATA_HEADER;
 use codex_core::web_search_action_detail;
 use codex_extension_api::ExtensionTurnItem;
@@ -31,6 +35,7 @@ use codex_tools::ToolExposure;
 use codex_tools::default_namespace_description;
 use http::HeaderMap;
 use http::HeaderValue;
+use std::sync::Arc;
 use url::Url;
 
 use crate::history::recent_input;
@@ -106,7 +111,10 @@ impl WebSearchTool {
             ReqwestTransport::from_http_client(create_client()),
             provider,
             auth,
-        );
+        )
+        .with_retry_notifier(Some(search_retry_notifier(Arc::clone(
+            &call.turn_item_emitter,
+        ))));
         let request = SearchRequest {
             id: self.session_id.clone(),
             model: call.model.clone(),
@@ -180,6 +188,37 @@ impl WebSearchTool {
 
         Ok(Box::new(SearchOutput::new(output)))
     }
+}
+
+fn search_retry_notifier(emitter: Arc<dyn codex_tools::TurnItemEmitter>) -> RetryNotifier {
+    Arc::new(move |status: RetryStatus| {
+        let emitter = Arc::clone(&emitter);
+        Box::pin(async move {
+            let retry_kind = match status.disposition {
+                RetryDisposition::Capacity => "Search service is at capacity",
+                RetryDisposition::Transient => "Search request failed",
+                RetryDisposition::DoNotRetry => return,
+            };
+            let delay = if status.delay < std::time::Duration::from_secs(1) {
+                format!("{}ms", status.delay.as_millis().max(1))
+            } else {
+                format!("{:.1}s", status.delay.as_secs_f64())
+            };
+            emitter
+                .emit_event(EventMsg::StreamError(
+                    codex_protocol::protocol::StreamErrorEvent {
+                        message: format!(
+                            "{retry_kind}. Retrying in {delay} (attempt {}/{})",
+                            status.attempt,
+                            format_retry_budget(status.max_retries),
+                        ),
+                        codex_error_info: None,
+                        additional_details: Some(status.error),
+                    },
+                ))
+                .await;
+        })
+    })
 }
 
 fn search_request_headers(originator: Option<&str>, turn_metadata: Option<&str>) -> HeaderMap {

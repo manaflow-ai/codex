@@ -2462,6 +2462,7 @@ dependencies = [
  "futures",
  "http 1.4.0",
  "rand 0.9.3",
+ "serde_json",
  "tokio",
  "tracing",
 ]
@@ -3304,6 +3305,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "codex-api",
+ "codex-client",
  "codex-extension-api",
  "codex-http-client",
  "codex-login",
@@ -3316,6 +3318,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -3403,6 +3406,7 @@ version = "0.0.0"
 dependencies = [
  "base64 0.22.1",
  "codex-api",
+ "codex-client",
  "codex-core",
  "codex-exec-server",
  "codex-extension-api",
@@ -3536,6 +3540,7 @@ dependencies = [
  "async-channel",
  "codex-api",
  "codex-async-utils",
+ "codex-client",
  "codex-config",
  "codex-connectors",
  "codex-diagnostics",
@@ -3995,6 +4000,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "codex-api",
+ "codex-client",
  "codex-config",
  "codex-exec-server",
  "codex-http-client",
@@ -4709,6 +4715,7 @@ name = "codex-web-search-extension"
 version = "0.0.0"
 dependencies = [
  "codex-api",
+ "codex-client",
  "codex-core",
  "codex-extension-api",
  "codex-extension-items",

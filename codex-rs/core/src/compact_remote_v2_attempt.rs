@@ -8,6 +8,7 @@ use crate::compact::CompactionAnalyticsDetails;
 use crate::compact_remote::trim_function_call_history_to_fit_context_window;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::CompactionTurnMetadata;
+use crate::responses_retry::retry_status_notifier;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use codex_history::CodexHarnessMetadata;
@@ -17,6 +18,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RawResponseCompletedEvent;
 use codex_protocol::protocol::TokenUsage;
 use codex_rollout_trace::CompactionTraceContext;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 pub(super) struct RemoteCompactV2Attempt {
@@ -36,6 +38,7 @@ pub(super) async fn run_remote_compact_v2_attempt(
     compaction_trace: &CompactionTraceContext,
     compaction_metadata: CompactionTurnMetadata,
     analytics_details: &mut CompactionAnalyticsDetails,
+    cancellation_token: &CancellationToken,
 ) -> CodexResult<RemoteCompactV2Attempt> {
     let turn_context = &step_context.turn;
     let mut history = sess.clone_history().await;
@@ -101,12 +104,17 @@ pub(super) async fn run_remote_compact_v2_attempt(
         Some(client_session) => client_session,
         None => owned_client_session.insert(sess.services.model_client.new_session()),
     };
+    client_session.set_retry_notifier(retry_status_notifier(
+        Arc::clone(sess),
+        Arc::clone(turn_context),
+    ));
     let compaction_output_result = run_remote_compaction_request_v2(
         sess,
         turn_context.as_ref(),
         client_session,
         &prompt,
         &responses_metadata,
+        cancellation_token,
     )
     .await;
     trace_attempt.record_result(

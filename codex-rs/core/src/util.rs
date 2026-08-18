@@ -5,6 +5,7 @@ use tracing::error;
 
 const INITIAL_DELAY_MS: u64 = 200;
 const BACKOFF_FACTOR: f64 = 2.0;
+const MAX_RETRY_DELAY_MS: u64 = 60_000;
 
 /// Emit structured feedback metadata as key/value pairs.
 ///
@@ -84,10 +85,12 @@ pub(crate) fn emit_feedback_auth_recovery_tags(
 }
 
 pub fn backoff(attempt: u64) -> Duration {
-    let exp = BACKOFF_FACTOR.powi(attempt.saturating_sub(1) as i32);
+    let exponent = attempt.saturating_sub(1).min(31) as i32;
+    let exp = BACKOFF_FACTOR.powi(exponent);
     let base = (INITIAL_DELAY_MS as f64 * exp) as u64;
+    let base = base.min(MAX_RETRY_DELAY_MS);
     let jitter = rand::rng().random_range(0.9..1.1);
-    Duration::from_millis((base as f64 * jitter) as u64)
+    Duration::from_millis((base as f64 * jitter) as u64).min(Duration::from_secs(60))
 }
 
 pub(crate) fn error_or_panic(message: impl std::string::ToString) {
