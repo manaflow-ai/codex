@@ -319,6 +319,13 @@ mod tests {
             classify_websocket_close(CloseCode::Policy, "try again later"),
             RetryDisposition::DoNotRetry
         );
+        assert_eq!(
+            classify_websocket_close(
+                CloseCode::Policy,
+                "Selected model is at capacity. Please try a different model."
+            ),
+            RetryDisposition::DoNotRetry
+        );
     }
 
     #[test]
