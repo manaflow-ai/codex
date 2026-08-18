@@ -481,6 +481,11 @@ fn is_local_cancellation_text(text: &str) -> bool {
         // Hyper uses these forms when a caller cancellation drops an in-flight request.
         "operation was canceled",
         "operation was cancelled",
+        // Reqwest and several upstream runtimes use the shorter request/context forms.
+        "request canceled",
+        "request cancelled",
+        "context canceled",
+        "context cancelled",
         "request was canceled",
         "request was cancelled",
         "task canceled by caller",
