@@ -70,6 +70,11 @@ pub enum SandboxErr {
 pub struct CodexErr {
     details: CodexErrorDetails,
     retry_delay: Option<Duration>,
+    /// Marks an error explicitly classified as retryable by a provider event.
+    ///
+    /// This is separate from `CodexErrorDetails::Stream`, because a stream-shaped
+    /// error can also represent a permanent malformed or invalid response.
+    explicitly_retryable: bool,
 }
 
 /// The semantic category and diagnostic payload for a [`CodexErr`].
@@ -216,6 +221,7 @@ impl From<CodexErrorDetails> for CodexErr {
         Self {
             details,
             retry_delay: None,
+            explicitly_retryable: false,
         }
     }
 }
@@ -280,6 +286,7 @@ macro_rules! codex_err_unit_constructors {
             pub const $variant: Self = Self {
                 details: CodexErrorDetails::$variant,
                 retry_delay: None,
+                explicitly_retryable: false,
             };
         )*
     };
@@ -407,6 +414,17 @@ impl CodexErr {
     pub fn with_retry_delay(mut self, retry_delay: Duration) -> Self {
         self.retry_delay = Some(retry_delay);
         self
+    }
+
+    /// Marks this error as a provider-confirmed transient failure.
+    pub fn with_explicit_retryable(mut self) -> Self {
+        self.explicitly_retryable = true;
+        self
+    }
+
+    /// Returns whether the provider classified this failure as transient.
+    pub fn is_explicitly_retryable(&self) -> bool {
+        self.explicitly_retryable
     }
 
     /// Minimal shim so that existing `e.downcast_ref::<CodexErr>()` checks continue to compile

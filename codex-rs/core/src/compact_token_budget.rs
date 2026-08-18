@@ -26,7 +26,11 @@ use tokio_util::sync::CancellationToken;
 pub(crate) async fn run_manual_compact_task(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
+    cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
+    if cancellation_token.is_cancelled() {
+        return Err(CodexErr::TurnAborted);
+    }
     let start_event = EventMsg::TurnStarted(TurnStartedEvent {
         turn_id: turn_context.sub_id.clone(),
         trace_id: turn_context.trace_id.clone(),
@@ -38,10 +42,20 @@ pub(crate) async fn run_manual_compact_task(
 
     // Manual compaction runs outside run_turn, so it captures its own current step.
     let step_context = sess
-        .capture_step_context(Arc::clone(&turn_context), &CancellationToken::new())
+        .capture_step_context(Arc::clone(&turn_context), cancellation_token)
         .await?;
+    if cancellation_token.is_cancelled() {
+        return Err(CodexErr::TurnAborted);
+    }
     let world_state = Arc::new(sess.build_world_state_for_step(&step_context).await?);
-    run_compact_task_inner(&sess, &step_context, world_state, CompactionTrigger::Manual).await
+    run_compact_task_inner(
+        &sess,
+        &step_context,
+        world_state,
+        CompactionTrigger::Manual,
+        cancellation_token,
+    )
+    .await
 }
 
 /// Runs token-budget inline auto-compaction as a normal compaction lifecycle.
@@ -53,14 +67,25 @@ pub(crate) async fn run_inline_auto_compact_task(
     sess: Arc<Session>,
     step_context: Arc<StepContext>,
     initial_context_injection: InitialContextInjection,
+    cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
+    if cancellation_token.is_cancelled() {
+        return Err(CodexErr::TurnAborted);
+    }
     let world_state = match initial_context_injection {
         InitialContextInjection::BeforeLastUserMessage { world_state, .. } => world_state,
         InitialContextInjection::DoNotInject => {
             Arc::new(sess.build_world_state_for_step(&step_context).await?)
         }
     };
-    run_compact_task_inner(&sess, &step_context, world_state, CompactionTrigger::Auto).await
+    run_compact_task_inner(
+        &sess,
+        &step_context,
+        world_state,
+        CompactionTrigger::Auto,
+        cancellation_token,
+    )
+    .await
 }
 
 async fn run_compact_task_inner(
@@ -68,12 +93,19 @@ async fn run_compact_task_inner(
     step_context: &Arc<StepContext>,
     world_state: Arc<WorldState>,
     trigger: CompactionTrigger,
+    cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
+    if cancellation_token.is_cancelled() {
+        return Err(CodexErr::TurnAborted);
+    }
     let turn_context = &step_context.turn;
     let pre_compact_outcome = run_pre_compact_hooks(sess, turn_context, trigger).await;
     match pre_compact_outcome {
         PreCompactHookOutcome::Continue => {}
         PreCompactHookOutcome::Stopped => return Err(CodexErr::TurnAborted),
+    }
+    if cancellation_token.is_cancelled() {
+        return Err(CodexErr::TurnAborted);
     }
 
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
@@ -81,6 +113,9 @@ async fn run_compact_task_inner(
         .await;
     sess.start_new_context_window(step_context, world_state)
         .await;
+    if cancellation_token.is_cancelled() {
+        return Err(CodexErr::TurnAborted);
+    }
     sess.emit_turn_item_completed(turn_context, compaction_item)
         .await;
 

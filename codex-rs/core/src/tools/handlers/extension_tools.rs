@@ -128,6 +128,20 @@ impl TurnItemEmitter for CoreTurnItemEmitter {
             emit_legacy_events(session.as_ref(), turn.as_ref(), legacy_events).await;
         })
     }
+
+    fn emit_event<'a>(&'a self, event: EventMsg) -> TurnItemEmissionFuture<'a> {
+        Box::pin(async move {
+            let (Some(session), Some(turn)) = (self.session.upgrade(), self.turn.upgrade()) else {
+                return;
+            };
+            session
+                .send_event_raw(Event {
+                    id: turn.sub_id.clone(),
+                    msg: event,
+                })
+                .await;
+        })
+    }
 }
 
 async fn to_extension_call(invocation: &ToolInvocation) -> ExtensionToolCall {

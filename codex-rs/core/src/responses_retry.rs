@@ -6,21 +6,68 @@ use crate::client::ModelClientSession;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::util::backoff;
+use codex_client::RetryDisposition;
+use codex_client::RetryNotifier;
 use codex_client::RetryOperation;
+use codex_client::RetryStatus;
+use codex_client::classify_connection_error;
+use codex_client::classify_http_response;
+use codex_client::format_retry_budget;
+use codex_client::is_capacity_error_body;
+use codex_client::is_permanent_error_text;
+use codex_client::is_transient_http_status;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::WarningEvent;
 use http::StatusCode;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 const INITIAL_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(5);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
-const MAX_CAPACITY_RETRIES: u64 = 100;
+const MAX_CAPACITY_RETRIES: u64 = codex_client::UNLIMITED_RETRIES;
+
+pub(crate) fn retry_status_notifier(
+    sess: std::sync::Arc<Session>,
+    turn_context: std::sync::Arc<TurnContext>,
+) -> RetryNotifier {
+    std::sync::Arc::new(move |status: RetryStatus| {
+        let sess = std::sync::Arc::clone(&sess);
+        let turn_context = std::sync::Arc::clone(&turn_context);
+        Box::pin(async move {
+            let message = match status.disposition {
+                RetryDisposition::Capacity => format!(
+                    "Model at capacity. Retrying in {} (HTTP attempt {}/{})",
+                    format_retry_delay(status.delay),
+                    status.attempt,
+                    format_retry_budget(status.max_retries),
+                ),
+                RetryDisposition::Transient => format!(
+                    "Request failed. Retrying in {} (HTTP attempt {}/{})",
+                    format_retry_delay(status.delay),
+                    status.attempt,
+                    format_retry_budget(status.max_retries),
+                ),
+                RetryDisposition::DoNotRetry => return,
+            };
+            let error = match status.disposition {
+                RetryDisposition::Capacity => CodexErr::ServerOverloaded,
+                RetryDisposition::Transient => {
+                    CodexErr::Stream(status.error).with_explicit_retryable()
+                }
+                RetryDisposition::DoNotRetry => return,
+            };
+            sess.notify_stream_error(&turn_context, message, error)
+                .await;
+        })
+    })
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ResponsesStreamRequest {
     Sampling,
+    LocalCompaction,
     RemoteCompactionV1,
     RemoteCompactionV2,
 }
@@ -30,6 +77,7 @@ pub(crate) struct ResponsesStreamRetryState {
     connection_retries: u64,
     connection_retry_delay: Duration,
     capacity_retries: u64,
+    rate_limit_retries: u64,
 }
 
 impl Default for ResponsesStreamRetryState {
@@ -39,33 +87,70 @@ impl Default for ResponsesStreamRetryState {
             connection_retries: 0,
             connection_retry_delay: INITIAL_CONNECTION_RETRY_DELAY,
             capacity_retries: 0,
+            rate_limit_retries: 0,
         }
     }
 }
 
 pub(crate) fn should_retry_response_stream_error(
-    request: ResponsesStreamRequest,
+    _request: ResponsesStreamRequest,
     err: &CodexErr,
 ) -> bool {
+    response_error_retry_disposition(err) != RetryDisposition::DoNotRetry
+}
+
+/// Classify an error after the API bridge has converted it to a protocol error.
+///
+/// Capacity has a persistent outer budget. Keep this classification separate from the finite
+/// transient budget so a capacity body hidden inside `UnexpectedStatus` or `Stream` does not
+/// accidentally consume the ordinary retry limit.
+fn response_error_retry_disposition(err: &CodexErr) -> RetryDisposition {
     match err.details() {
-        CodexErrorDetails::ServerOverloaded
-        | CodexErrorDetails::Timeout
+        CodexErrorDetails::ServerOverloaded => RetryDisposition::Capacity,
+        CodexErrorDetails::Timeout
         | CodexErrorDetails::RequestTimeout
-        | CodexErrorDetails::InternalServerError
-        | CodexErrorDetails::InternalAgentDied
+        | CodexErrorDetails::InternalServerError => RetryDisposition::Transient,
+        // These variants can be produced by local task, parser, or auth plumbing. They are
+        // retryable only when the producer has explicitly classified them as transient.
+        CodexErrorDetails::InternalAgentDied
         | CodexErrorDetails::Io(_)
-        | CodexErrorDetails::TokioJoin(_) => true,
-        CodexErrorDetails::Stream(_) | CodexErrorDetails::Json(_) => {
-            !matches!(request, ResponsesStreamRequest::RemoteCompactionV1)
+        | CodexErrorDetails::Json(_) => {
+            if err.is_explicitly_retryable() {
+                RetryDisposition::Transient
+            } else {
+                RetryDisposition::DoNotRetry
+            }
         }
-        CodexErrorDetails::UnexpectedStatus(error) => is_transient_http_status(error.status),
-        CodexErrorDetails::RetryLimit(error) => is_transient_http_status(error.status),
-        CodexErrorDetails::ResponseStreamFailed(error) => {
-            error.source.status().is_none_or(is_transient_http_status)
+        CodexErrorDetails::Stream(message) => {
+            if !err.is_explicitly_retryable() {
+                RetryDisposition::DoNotRetry
+            } else if is_capacity_error_body(message) {
+                RetryDisposition::Capacity
+            } else if !is_permanent_error_text(message) {
+                RetryDisposition::Transient
+            } else {
+                RetryDisposition::DoNotRetry
+            }
         }
-        CodexErrorDetails::ConnectionFailed(error) => {
-            error.source.status().is_none_or(is_transient_http_status)
+        // A join error means the producer task was cancelled or panicked. Retrying can hide a
+        // shutdown signal or repeatedly restart a broken task, so both cases are terminal here.
+        CodexErrorDetails::TokioJoin(_) => RetryDisposition::DoNotRetry,
+        CodexErrorDetails::UnexpectedStatus(error) => {
+            classify_http_response(error.status, Some(&error.body))
         }
+        CodexErrorDetails::RetryLimit(error) => {
+            if is_transient_http_status(error.status) {
+                RetryDisposition::Transient
+            } else {
+                RetryDisposition::DoNotRetry
+            }
+        }
+        CodexErrorDetails::ResponseStreamFailed(error) => match error.source.status() {
+            Some(status) if is_transient_http_status(status) => RetryDisposition::Transient,
+            Some(_) => RetryDisposition::DoNotRetry,
+            None => classify_connection_error(&error.source),
+        },
+        CodexErrorDetails::ConnectionFailed(error) => classify_connection_error(&error.source),
         CodexErrorDetails::TurnAborted
         | CodexErrorDetails::SessionBudgetExceeded
         | CodexErrorDetails::ContextWindowExceeded
@@ -86,22 +171,17 @@ pub(crate) fn should_retry_response_stream_error(
         | CodexErrorDetails::UnsupportedOperation(_)
         | CodexErrorDetails::RefreshTokenFailed(_)
         | CodexErrorDetails::Fatal(_)
-        | CodexErrorDetails::EnvVar(_) => false,
+        | CodexErrorDetails::EnvVar(_) => RetryDisposition::DoNotRetry,
         #[cfg(target_os = "linux")]
-        CodexErrorDetails::LandlockRuleset(_) | CodexErrorDetails::LandlockPathFd(_) => false,
+        CodexErrorDetails::LandlockRuleset(_) | CodexErrorDetails::LandlockPathFd(_) => {
+            RetryDisposition::DoNotRetry
+        }
     }
 }
 
-fn is_transient_http_status(status: StatusCode) -> bool {
-    matches!(
-        status,
-        StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_EARLY | StatusCode::TOO_MANY_REQUESTS
-    ) || status.is_server_error()
-}
-
-/// Handles a retryable stream error and returns `Ok(())` when the caller should
-/// retry the request loop.
-pub(crate) async fn handle_retryable_response_stream_error(
+/// Cancellation-aware variant used by an active turn. A cancelled turn must stop during a
+/// backoff window instead of starting another provider request.
+pub(crate) async fn handle_retryable_response_stream_error_with_cancellation(
     retry_state: &mut ResponsesStreamRetryState,
     max_retries: u64,
     err: CodexErr,
@@ -109,6 +189,7 @@ pub(crate) async fn handle_retryable_response_stream_error(
     sess: &Session,
     turn_context: &TurnContext,
     request: ResponsesStreamRequest,
+    cancellation_token: &CancellationToken,
 ) -> Result<(), CodexErr> {
     handle_retryable_response_error_inner(
         retry_state,
@@ -118,19 +199,21 @@ pub(crate) async fn handle_retryable_response_stream_error(
         sess,
         turn_context,
         request,
+        Some(cancellation_token),
     )
     .await
 }
 
-/// Handles a retryable unary Responses error and returns `Ok(())` when the
-/// caller should retry the request loop.
-pub(crate) async fn handle_retryable_response_error(
+/// Cancellation-aware variant for unary compaction requests. It prevents a cancelled manual or
+/// automatic compaction from sleeping through a retry delay and issuing another request.
+pub(crate) async fn handle_retryable_response_error_with_cancellation(
     retry_state: &mut ResponsesStreamRetryState,
     max_retries: u64,
     err: CodexErr,
     sess: &Session,
     turn_context: &TurnContext,
     request: ResponsesStreamRequest,
+    cancellation_token: &CancellationToken,
 ) -> Result<(), CodexErr> {
     handle_retryable_response_error_inner(
         retry_state,
@@ -140,6 +223,7 @@ pub(crate) async fn handle_retryable_response_error(
         sess,
         turn_context,
         request,
+        Some(cancellation_token),
     )
     .await
 }
@@ -153,9 +237,15 @@ async fn handle_retryable_response_error_inner(
     sess: &Session,
     turn_context: &TurnContext,
     request: ResponsesStreamRequest,
+    cancellation_token: Option<&CancellationToken>,
 ) -> Result<(), CodexErr> {
+    if cancellation_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+        return Err(CodexErr::TurnAborted);
+    }
+
     let operation = match request {
         ResponsesStreamRequest::Sampling => RetryOperation::Sampling,
+        ResponsesStreamRequest::LocalCompaction => RetryOperation::LocalCompaction,
         ResponsesStreamRequest::RemoteCompactionV1 => RetryOperation::RemoteCompactionV1,
         ResponsesStreamRequest::RemoteCompactionV2 => RetryOperation::RemoteCompactionV2,
     };
@@ -166,8 +256,8 @@ async fn handle_retryable_response_error_inner(
         return Err(err);
     }
 
-    if matches!(err.details(), CodexErrorDetails::ServerOverloaded) {
-        if retry_state.capacity_retries >= MAX_CAPACITY_RETRIES {
+    if response_error_retry_disposition(&err) == RetryDisposition::Capacity {
+        if retry_state.capacity_retries == MAX_CAPACITY_RETRIES {
             return Err(err);
         }
         retry_state.capacity_retries = retry_state.capacity_retries.saturating_add(1);
@@ -193,7 +283,39 @@ async fn handle_retryable_response_error_inner(
         )
         .await;
         codex_client::record_retry!(retry_count, delay, operation);
-        tokio::time::sleep(delay).await;
+        wait_for_retry(delay, cancellation_token).await?;
+        return Ok(());
+    }
+
+    // A low-level request can still return a 429 after its configured transport budget. Keep
+    // that provider rate limit in the same unlimited outer retry loop instead of surfacing
+    // `exceeded retry limit` to the user.
+    if matches!(
+        err.details(),
+        CodexErrorDetails::RetryLimit(error) if error.status == StatusCode::TOO_MANY_REQUESTS
+    ) {
+        retry_state.rate_limit_retries = retry_state.rate_limit_retries.saturating_add(1);
+        let retry_count = retry_state.rate_limit_retries;
+        let delay = backoff(retry_count).min(MAX_RETRY_DELAY);
+        warn!(
+            turn_id = %turn_context.sub_id,
+            retries = retry_count,
+            max_retries = "unlimited",
+            ?delay,
+            "rate limit exhausted a transport retry budget; waiting to retry Responses request"
+        );
+        sess.notify_stream_error(
+            turn_context,
+            format!(
+                "Rate limited. Retrying in {} (attempt {}/unlimited)",
+                format_retry_delay(delay),
+                retry_count,
+            ),
+            err,
+        )
+        .await;
+        codex_client::record_retry!(retry_count, delay, operation);
+        wait_for_retry(delay, cancellation_token).await?;
         return Ok(());
     }
 
@@ -229,13 +351,14 @@ async fn handle_retryable_response_error_inner(
             turn_context,
             format!(
                 "Network error. Retrying in {} (attempt {retry_count}/{max_retries})",
-                format_retry_delay(retry_delay)
+                format_retry_delay(retry_delay),
+                max_retries = format_retry_budget(max_retries)
             ),
             err,
         )
         .await;
         codex_client::record_retry!(retry_count, retry_delay, operation);
-        tokio::time::sleep(retry_delay).await;
+        wait_for_retry(retry_delay, cancellation_token).await?;
         retry_state.connection_retry_delay = retry_delay.saturating_mul(2).min(MAX_RETRY_DELAY);
         return Ok(());
     }
@@ -266,17 +389,33 @@ async fn handle_retryable_response_error_inner(
             turn_context,
             format!(
                 "Request failed. Retrying in {} (attempt {retry_count}/{max_retries})",
-                format_retry_delay(delay)
+                format_retry_delay(delay),
+                max_retries = format_retry_budget(max_retries)
             ),
             err,
         )
         .await;
         codex_client::record_retry!(retry_count, delay, operation);
-        tokio::time::sleep(delay).await;
+        wait_for_retry(delay, cancellation_token).await?;
         return Ok(());
     }
 
     Err(err)
+}
+
+async fn wait_for_retry(
+    delay: Duration,
+    cancellation_token: Option<&CancellationToken>,
+) -> Result<(), CodexErr> {
+    if let Some(cancellation_token) = cancellation_token {
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => Ok(()),
+            _ = cancellation_token.cancelled() => Err(CodexErr::TurnAborted),
+        }
+    } else {
+        tokio::time::sleep(delay).await;
+        Ok(())
+    }
 }
 
 async fn notify_transport_fallback(sess: &Session, turn_context: &TurnContext, err: &CodexErr) {
@@ -324,7 +463,17 @@ fn log_retry(
                 retries,
                 max_retries,
                 sampling_error = %err,
-                "stream disconnected - retrying sampling request ({retries}/{max_retries} in {delay:?})...",
+                "stream disconnected - retrying sampling request ({retries}/{} in {delay:?})...",
+                format_retry_budget(max_retries),
+            );
+        }
+        ResponsesStreamRequest::LocalCompaction => {
+            warn!(
+                turn_id = %turn_context.sub_id,
+                retries,
+                max_retries,
+                compact_error = %err,
+                "local compaction stream failed; retrying request after delay"
             );
         }
         ResponsesStreamRequest::RemoteCompactionV1 => {

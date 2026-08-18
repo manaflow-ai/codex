@@ -188,6 +188,7 @@ async fn compact_uses_bearer_after_agent_identity_session_fallback() -> anyhow::
                 service_tier: None,
             },
             &test_session_telemetry(),
+            /*retry_notifier*/ None,
             &CompactionTraceContext::disabled(),
             &responses_metadata,
         )

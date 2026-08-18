@@ -26,6 +26,10 @@ use codex_api::RealtimeWebsocketEvents;
 use codex_api::RealtimeWebsocketWriter;
 use codex_api::build_session_headers;
 use codex_api::map_api_error;
+use codex_client::RetryDisposition;
+use codex_client::RetryNotifier;
+use codex_client::RetryStatus;
+use codex_client::format_retry_budget;
 use codex_config::config_toml::RealtimeWsMode;
 use codex_config::config_toml::RealtimeWsVersion;
 use codex_login::CodexAuth;
@@ -57,6 +61,7 @@ use codex_protocol::protocol::RealtimeOutputModality;
 use codex_protocol::protocol::RealtimeTranscriptEntry;
 use codex_protocol::protocol::RealtimeVoice;
 use codex_protocol::protocol::RealtimeVoicesList;
+use codex_protocol::protocol::StreamErrorEvent;
 use codex_utils_output_truncation::approx_bytes_for_tokens;
 use codex_utils_string::approx_token_count;
 use codex_utils_string::take_bytes_at_char_boundary;
@@ -67,6 +72,7 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -124,6 +130,7 @@ enum RealtimeFanoutTaskStop {
 pub(crate) struct RealtimeConversationManager {
     state: Mutex<Option<ConversationState>>,
     mode_instructions: Mutex<Option<RealtimeModeInstructions>>,
+    starting_stop_tokens: StdMutex<Vec<Arc<CancellationToken>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -477,6 +484,7 @@ struct RealtimeStart {
     realtime_call_api_provider: Option<ApiProvider>,
     session_config: RealtimeSessionConfig,
     model_client: ModelClient,
+    retry_notifier: RetryNotifier,
     sdp: Option<String>,
 }
 
@@ -493,7 +501,28 @@ impl RealtimeConversationManager {
         Self {
             state: Mutex::new(None),
             mode_instructions: Mutex::new(None),
+            starting_stop_tokens: StdMutex::new(Vec::new()),
         }
+    }
+
+    /// Registers a token for a start operation that has not installed its running state yet.
+    /// Shutdown uses these tokens to interrupt a connection retry or WebRTC call setup.
+    pub(crate) fn register_start_cancellation(&self) -> Arc<CancellationToken> {
+        let token = Arc::new(CancellationToken::new());
+        let mut tokens = self
+            .starting_stop_tokens
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tokens.push(Arc::clone(&token));
+        token
+    }
+
+    fn clear_start_cancellation(&self, token: &Arc<CancellationToken>) {
+        let mut tokens = self
+            .starting_stop_tokens
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tokens.retain(|candidate| !Arc::ptr_eq(candidate, token));
     }
 
     pub(crate) async fn mode_instructions(&self) -> Option<RealtimeModeInstructions> {
@@ -522,6 +551,7 @@ impl RealtimeConversationManager {
         start: RealtimeStart,
         mode_instructions: RealtimeModeInstructions,
     ) -> CodexResult<RealtimeStartOutput> {
+        let start_token = self.register_start_cancellation();
         let previous_state = {
             let mut guard = self.state.lock().await;
             guard.take()
@@ -530,12 +560,18 @@ impl RealtimeConversationManager {
             stop_conversation_state(state, RealtimeFanoutTaskStop::Await).await;
         }
 
-        let output = self.start_inner(start).await?;
+        let output = self.start_inner(start, Arc::clone(&start_token)).await;
+        self.clear_start_cancellation(&start_token);
+        let output = output?;
         *self.mode_instructions.lock().await = Some(mode_instructions);
         Ok(output)
     }
 
-    async fn start_inner(&self, start: RealtimeStart) -> CodexResult<RealtimeStartOutput> {
+    async fn start_inner(
+        &self,
+        start: RealtimeStart,
+        start_token: Arc<CancellationToken>,
+    ) -> CodexResult<RealtimeStartOutput> {
         let RealtimeStart {
             api_provider,
             realtime_sideband_base_url,
@@ -549,6 +585,7 @@ impl RealtimeConversationManager {
             realtime_call_api_provider,
             session_config,
             model_client,
+            retry_notifier,
             sdp,
         } = start;
         let event_parser = session_config.event_parser;
@@ -589,20 +626,23 @@ impl RealtimeConversationManager {
             audio_rx,
         };
 
-        let client = RealtimeWebsocketClient::new(api_provider);
+        let client = RealtimeWebsocketClient::new(api_provider)
+            .with_retry_notifier(Arc::clone(&retry_notifier));
         let client = match realtime_sideband_base_url {
             Some(base_url) => client.with_webrtc_sideband_base_url(base_url),
             None => client,
         };
         let (task, sdp) = if let Some(sdp) = sdp {
-            let call = model_client
-                .create_realtime_call_with_headers(
+            let call = tokio::select! {
+                _ = start_token.cancelled() => return Err(CodexErr::TurnAborted),
+                call = model_client.create_realtime_call_with_headers(
                     sdp,
                     session_config.clone(),
                     extra_headers.unwrap_or_default(),
                     realtime_call_api_provider,
-                )
-                .await?;
+                    Some(Arc::clone(&retry_notifier)),
+                ) => call?,
+            };
             let task = spawn_webrtc_sideband_input_task(RealtimeWebrtcSidebandInputTask {
                 client,
                 session_config,
@@ -621,10 +661,11 @@ impl RealtimeConversationManager {
             (task, Some(call.sdp))
         } else {
             let connection = client
-                .connect(
+                .connect_with_cancellation(
                     session_config,
                     extra_headers.unwrap_or_default(),
                     default_headers(),
+                    Some(&start_token),
                 )
                 .await
                 .map_err(map_api_error)?;
@@ -645,7 +686,21 @@ impl RealtimeConversationManager {
             (task, None)
         };
 
+        if start_token.is_cancelled() {
+            realtime_active.store(false, Ordering::Relaxed);
+            stop_token.cancel();
+            let _ = task.await;
+            return Err(CodexErr::TurnAborted);
+        }
+
         let mut guard = self.state.lock().await;
+        if start_token.is_cancelled() {
+            drop(guard);
+            realtime_active.store(false, Ordering::Relaxed);
+            stop_token.cancel();
+            let _ = task.await;
+            return Err(CodexErr::TurnAborted);
+        }
         *guard = Some(ConversationState {
             audio_tx,
             text_tx,
@@ -1048,6 +1103,17 @@ impl RealtimeConversationManager {
     }
 
     pub(crate) async fn shutdown(&self) -> CodexResult<()> {
+        let starting_tokens = {
+            let mut tokens = self
+                .starting_stop_tokens
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut *tokens)
+        };
+        for token in starting_tokens {
+            token.cancel();
+        }
+
         let state = {
             let mut guard = self.state.lock().await;
             guard.take()
@@ -1426,6 +1492,39 @@ fn validate_realtime_voice(version: RealtimeWsVersion, voice: RealtimeVoice) -> 
     )))
 }
 
+fn realtime_retry_notifier(tx_event: Sender<Event>, submit_id: String) -> RetryNotifier {
+    Arc::new(move |status: RetryStatus| {
+        let tx_event = tx_event.clone();
+        let submit_id = submit_id.clone();
+        Box::pin(async move {
+            let retry_kind = match status.disposition {
+                RetryDisposition::Capacity => "Realtime service is at capacity",
+                RetryDisposition::Transient => "Realtime connection failed",
+                RetryDisposition::DoNotRetry => return,
+            };
+            let delay = if status.delay < Duration::from_secs(1) {
+                format!("{}ms", status.delay.as_millis().max(1))
+            } else {
+                format!("{:.1}s", status.delay.as_secs_f64())
+            };
+            let _ = tx_event
+                .send(Event {
+                    id: submit_id,
+                    msg: EventMsg::StreamError(StreamErrorEvent {
+                        message: format!(
+                            "{retry_kind}. Retrying in {delay} (attempt {}/{})",
+                            status.attempt,
+                            format_retry_budget(status.max_retries),
+                        ),
+                        codex_error_info: None,
+                        additional_details: Some(status.error),
+                    }),
+                })
+                .await;
+        })
+    })
+}
+
 async fn handle_start_inner(
     sess: &Arc<Session>,
     sub_id: &str,
@@ -1471,6 +1570,7 @@ async fn handle_start_inner(
         realtime_call_api_provider,
         session_config,
         model_client: sess.services.model_client.clone(),
+        retry_notifier: realtime_retry_notifier(sess.get_tx_event(), sub_id.to_string()),
         sdp,
     };
     let start_output = sess.conversation.start(start, mode_instructions).await?;
@@ -1761,11 +1861,12 @@ fn spawn_webrtc_sideband_input_task(input: RealtimeWebrtcSidebandInputTask) -> J
         }
 
         let connection = match tokio::select! {
-            connection = client.connect_webrtc_sideband(
+            connection = client.connect_webrtc_sideband_with_cancellation(
                 session_config,
                 &call_id,
                 sideband_headers,
                 default_headers(),
+                Some(&stop_token),
             ) => connection,
             _ = stop_token.cancelled() => return,
         } {

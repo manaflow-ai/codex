@@ -11,7 +11,7 @@ use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
-use core_test_support::wait_for_event;
+use core_test_support::wait_for_event_with_timeout;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::net::TcpListener;
@@ -222,9 +222,11 @@ async fn submit_user_input(test: &TestCodex, text: &str) -> Result<()> {
 }
 
 async fn wait_for_turn_completion(test: &TestCodex) {
-    let EventMsg::TurnComplete(completed) = wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
+    let EventMsg::TurnComplete(completed) = wait_for_event_with_timeout(
+        &test.codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        Duration::from_secs(30),
+    )
     .await
     else {
         unreachable!("predicate guarantees a turn complete event");
@@ -238,7 +240,7 @@ async fn wait_for_stream_retry_success(
 ) -> Vec<StreamErrorEvent> {
     let mut retry_events = Vec::new();
     loop {
-        match wait_for_event(&test.codex, |_| true).await {
+        match wait_for_event_with_timeout(&test.codex, |_| true, Duration::from_secs(30)).await {
             EventMsg::StreamError(event) => retry_events.push(event),
             EventMsg::Error(error) => panic!("capacity retry became terminal: {error:?}"),
             EventMsg::TurnComplete(completed) => {
@@ -265,8 +267,11 @@ async fn wait_for_capacity_retry_success(test: &TestCodex, expected_retries: usi
             event.message
         );
         assert!(
-            event.message.ends_with(&format!("(attempt {})", index + 1)),
-            "retry status should expose its attempt: {}",
+            event.message.ends_with(&format!("(attempt {})", index + 1))
+                || event
+                    .message
+                    .contains(&format!("(HTTP attempt {}/unlimited)", index + 1)),
+            "retry status should expose its attempt and budget: {}",
             event.message
         );
     }
@@ -354,30 +359,25 @@ async fn responses_http_overload_without_retry_after_retries_until_success() -> 
         .await?;
 
     submit_user_input(&test, "wait for the model to have capacity").await?;
-    let first_retry = telemetry.next_retry().await;
-    assert!((FIRST_RETRY_MIN_DELAY..FIRST_RETRY_MAX_DELAY).contains(&first_retry.delay));
-    assert_eq!(
-        first_retry,
-        RetryTelemetryEvent {
-            attempt: 1,
-            delay: first_retry.delay,
-            layer: "stream".into(),
-            operation: "sampling".into(),
-        }
-    );
-    wait_for_retry(&mut telemetry, &first_retry).await;
-    let second_retry = telemetry.next_retry().await;
-    assert!((SECOND_RETRY_MIN_DELAY..SECOND_RETRY_MAX_DELAY).contains(&second_retry.delay));
-    assert_eq!(
-        second_retry,
-        RetryTelemetryEvent {
-            attempt: 2,
-            delay: second_retry.delay,
-            layer: "stream".into(),
-            operation: "sampling".into(),
-        }
-    );
-    wait_for_retry(&mut telemetry, &second_retry).await;
+    for attempt in 1..=2 {
+        let retry = telemetry.next_retry().await;
+        let expected_range = if attempt == 1 {
+            FIRST_RETRY_MIN_DELAY..FIRST_RETRY_MAX_DELAY
+        } else {
+            SECOND_RETRY_MIN_DELAY..SECOND_RETRY_MAX_DELAY
+        };
+        assert!(expected_range.contains(&retry.delay));
+        assert_eq!(
+            retry,
+            RetryTelemetryEvent {
+                attempt,
+                delay: retry.delay,
+                layer: "http".into(),
+                operation: "request".into(),
+            }
+        );
+        wait_for_retry(&mut telemetry, &retry).await;
+    }
     wait_for_capacity_retry_success(&test, /*expected_retries*/ 2).await;
 
     assert_eq!(response_mock.requests().len(), 3);
@@ -591,7 +591,7 @@ async fn compact_v2_stream_failure_without_retry_after_exhausts_stream_retries()
     let mut error_events = 0;
     let mut stream_error_events = 0;
     loop {
-        match wait_for_event(&test.codex, |_| true).await {
+        match wait_for_event_with_timeout(&test.codex, |_| true, Duration::from_secs(30)).await {
             EventMsg::Error(error) => {
                 error_events += 1;
                 assert_eq!(error.codex_error_info, Some(CodexErrorInfo::Other));
@@ -821,43 +821,31 @@ async fn compact_v2_capacity_failure_retries_until_success() -> Result<()> {
     test.submit_turn("seed history for compaction").await?;
 
     test.codex.submit(Op::Compact).await?;
-    let first_retry = telemetry.next_retry().await;
-    assert!((FIRST_RETRY_MIN_DELAY..FIRST_RETRY_MAX_DELAY).contains(&first_retry.delay));
-    assert_eq!(
-        first_retry,
-        RetryTelemetryEvent {
-            attempt: 1,
-            delay: first_retry.delay,
-            layer: "http".into(),
-            operation: "request".into(),
-        }
+    for attempt in 1..=3 {
+        let retry = telemetry.next_retry().await;
+        let expected_range = match attempt {
+            1 => FIRST_RETRY_MIN_DELAY..FIRST_RETRY_MAX_DELAY,
+            2 => SECOND_RETRY_MIN_DELAY..SECOND_RETRY_MAX_DELAY,
+            _ => SECOND_RETRY_MIN_DELAY..Duration::from_millis(900),
+        };
+        assert!(expected_range.contains(&retry.delay));
+        assert_eq!(
+            retry,
+            RetryTelemetryEvent {
+                attempt,
+                delay: retry.delay,
+                layer: "http".into(),
+                operation: "request".into(),
+            }
+        );
+        wait_for_retry(&mut telemetry, &retry).await;
+    }
+    let retry_events = wait_for_stream_retry_success(&test, /*expected_retries*/ 3).await;
+    assert!(
+        retry_events
+            .iter()
+            .all(|event| event.message.starts_with("Model at capacity. Retrying in "))
     );
-    wait_for_retry(&mut telemetry, &first_retry).await;
-    let second_retry = telemetry.next_retry().await;
-    assert!((SECOND_RETRY_MIN_DELAY..SECOND_RETRY_MAX_DELAY).contains(&second_retry.delay));
-    assert_eq!(
-        second_retry,
-        RetryTelemetryEvent {
-            attempt: 2,
-            delay: second_retry.delay,
-            layer: "http".into(),
-            operation: "request".into(),
-        }
-    );
-    wait_for_retry(&mut telemetry, &second_retry).await;
-    let capacity_retry = telemetry.next_retry().await;
-    assert!((FIRST_RETRY_MIN_DELAY..FIRST_RETRY_MAX_DELAY).contains(&capacity_retry.delay));
-    assert_eq!(
-        capacity_retry,
-        RetryTelemetryEvent {
-            attempt: 1,
-            delay: capacity_retry.delay,
-            layer: "stream".into(),
-            operation: "remote_compaction_v2".into(),
-        }
-    );
-    wait_for_retry(&mut telemetry, &capacity_retry).await;
-    wait_for_capacity_retry_success(&test, /*expected_retries*/ 1).await;
     let requests = response_mock.requests();
     assert_eq!(
         requests.len(),
@@ -1048,7 +1036,7 @@ async fn sse_failure_without_retry_after_exhausts_stream_retries() -> Result<()>
     let mut error_events = 0;
     let mut stream_error_events = 0;
     loop {
-        match wait_for_event(&test.codex, |_| true).await {
+        match wait_for_event_with_timeout(&test.codex, |_| true, Duration::from_secs(30)).await {
             EventMsg::Error(error) => {
                 error_events += 1;
                 assert_eq!(error.codex_error_info, Some(CodexErrorInfo::Other));
@@ -1330,6 +1318,11 @@ async fn capacity_after_tool_call_preserves_the_successful_tool_result() -> Resu
     let first_follow_up_output = requests[1].function_call_output(call_id);
     let retried_follow_up_output = requests[2].function_call_output(call_id);
     assert_eq!(retried_follow_up_output, first_follow_up_output);
+    let retried_body = requests[2].body_json().to_string();
+    assert!(
+        !retried_body.contains("Model at capacity") && !retried_body.contains("Retrying in"),
+        "user-visible retry status must not enter model input: {retried_body}"
+    );
     Ok(())
 }
 
@@ -1405,7 +1398,7 @@ async fn invalid_prompt_is_not_retried() -> Result<()> {
     submit_user_input(&test, "do not retry a permanent request error").await?;
     let mut stream_errors = 0;
     loop {
-        match wait_for_event(&test.codex, |_| true).await {
+        match wait_for_event_with_timeout(&test.codex, |_| true, Duration::from_secs(30)).await {
             EventMsg::StreamError(_) => stream_errors += 1,
             EventMsg::TurnComplete(event) => {
                 assert!(
@@ -1524,7 +1517,8 @@ async fn connection_failures_stop_after_the_retry_limit() -> Result<()> {
     let stream_errors = tokio::time::timeout(Duration::from_secs(2), async {
         let mut stream_errors = 0;
         loop {
-            match wait_for_event(&test.codex, |_| true).await {
+            match wait_for_event_with_timeout(&test.codex, |_| true, Duration::from_secs(30)).await
+            {
                 EventMsg::StreamError(_) => stream_errors += 1,
                 EventMsg::TurnComplete(event) => {
                     assert!(
