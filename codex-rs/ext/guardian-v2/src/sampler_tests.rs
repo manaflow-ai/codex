@@ -1,4 +1,6 @@
 use anyhow::Result;
+use codex_api::ApiError;
+use codex_client::RetryDisposition;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
 use codex_login::AgentIdentityAuthPolicy;
@@ -21,9 +23,37 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 
+use super::classify_sampling_error;
 use super::LunaSampler;
+use super::LunaSamplerError;
 use super::LunaSamplerConfig;
 use super::LunaSamplingRequest;
+
+#[test]
+fn sampler_classifies_stream_and_capacity_errors_before_retrying() {
+    let permanent = LunaSamplerError::Api(ApiError::Stream(
+        "invalid request: model not found".to_owned(),
+    ));
+    assert_eq!(
+        classify_sampling_error(&permanent),
+        RetryDisposition::DoNotRetry
+    );
+
+    let transient = LunaSamplerError::Api(ApiError::Stream("connection reset by peer".to_owned()));
+    assert_eq!(
+        classify_sampling_error(&transient),
+        RetryDisposition::Transient
+    );
+
+    let capacity = LunaSamplerError::Api(ApiError::Retryable {
+        message: r#"{"error":{"type":"invalid_request_error","message":"Selected model is at capacity. Please try a different model."}}"#.to_owned(),
+        delay: None,
+    });
+    assert_eq!(
+        classify_sampling_error(&capacity),
+        RetryDisposition::Capacity
+    );
+}
 
 async fn proxy_websocket_servers(servers: &[&responses::WebSocketTestServer]) -> Result<String> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
