@@ -4,21 +4,61 @@ use super::RealtimeHandoffState;
 use super::RealtimeSessionKind;
 use super::RealtimeStreamedItem;
 use super::realtime_delegation_from_handoff;
+use super::realtime_retry_notifier;
 use super::realtime_request_headers;
 use super::realtime_text_from_handoff_request;
 use super::wrap_realtime_delegation_input;
 use crate::context::RealtimeDelegationSource;
 use async_channel::bounded;
 use codex_api::RealtimeEventParser;
+use codex_client::RetryDisposition;
+use codex_client::RetryStatus;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::protocol::CodexResponseHandoffMode;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RealtimeHandoffRequested;
 use codex_protocol::protocol::RealtimeTranscriptEntry;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::Mutex;
+
+#[tokio::test]
+async fn shutting_down_cancels_a_realtime_start_that_is_waiting_to_connect() {
+    let manager = super::RealtimeConversationManager::new();
+    let start_token = manager.register_start_cancellation();
+
+    assert!(!start_token.is_cancelled());
+    manager.shutdown().await.expect("shutdown should succeed");
+    assert!(start_token.is_cancelled());
+}
+
+#[tokio::test]
+async fn realtime_retry_status_is_visible_without_becoming_realtime_input() {
+    let (tx_event, rx_event) = bounded(1);
+    let notifier = realtime_retry_notifier(tx_event, "turn-1".to_string());
+
+    notifier(RetryStatus {
+        operation: "realtime/connect".to_string(),
+        disposition: RetryDisposition::Capacity,
+        attempt: 3,
+        max_retries: 100,
+        delay: Duration::from_secs(2),
+        error: "Selected model is at capacity".to_string(),
+    })
+    .await;
+
+    let event = rx_event.recv().await.expect("retry status should be sent");
+    let EventMsg::StreamError(status) = event.msg else {
+        panic!("expected stream status event");
+    };
+    assert_eq!(
+        status.message,
+        "Realtime service is at capacity. Retrying in 2.0s (attempt 3/100)"
+    );
+}
 
 #[test]
 fn prefers_handoff_input_transcript_over_active_transcript() {
