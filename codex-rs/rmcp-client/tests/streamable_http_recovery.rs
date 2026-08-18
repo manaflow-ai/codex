@@ -5,12 +5,15 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use anyhow::Context as _;
 use codex_exec_server::Environment;
 use codex_exec_server::ExecServerError;
 use codex_exec_server::HttpClient;
 use codex_exec_server::HttpRequestParams;
 use codex_exec_server::HttpRequestResponse;
 use codex_exec_server::HttpResponseBodyStream;
+use codex_rmcp_client::McpRetryStatus;
+use codex_rmcp_client::RetryDisposition;
 use futures::FutureExt as _;
 use futures::future::BoxFuture;
 use pretty_assertions::assert_eq;
@@ -386,9 +389,20 @@ async fn streamable_http_404_recovery_only_retries_once() -> anyhow::Result<()> 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn streamable_http_non_session_failure_does_not_trigger_recovery() -> anyhow::Result<()> {
+async fn streamable_http_tool_call_retries_non_session_server_failures() -> anyhow::Result<()> {
     let (_server, base_url) = spawn_streamable_http_server().await?;
-    let client = create_client(&base_url).await?;
+    let (retry_tx, mut retry_rx) = tokio::sync::mpsc::unbounded_channel::<McpRetryStatus>();
+    let client = create_client(&base_url)
+        .await?
+        .with_retry_notifier(Arc::new(move |status| {
+            let retry_tx = retry_tx.clone();
+            async move {
+                retry_tx
+                    .send(status)
+                    .expect("retry status receiver should remain open");
+            }
+            .boxed()
+        }));
 
     let warmup = call_echo_tool(&client, "warmup").await?;
     assert_eq!(warmup, expected_echo_result("warmup"));
@@ -401,13 +415,23 @@ async fn streamable_http_non_session_failure_does_not_trigger_recovery() -> anyh
     )
     .await?;
 
-    let first_error = call_echo_tool(&client, "server-error").await.unwrap_err();
-    assert!(first_error.to_string().contains("500"));
-
-    let second_error = call_echo_tool(&client, "still-server-error")
+    let recovered = call_echo_tool(&client, "server-error").await?;
+    assert_eq!(recovered, expected_echo_result("server-error"));
+    let first_retry = retry_rx
+        .recv()
         .await
-        .unwrap_err();
-    assert!(second_error.to_string().contains("500"));
+        .context("missing first retry status")?;
+    let second_retry = retry_rx
+        .recv()
+        .await
+        .context("missing second retry status")?;
+    assert_eq!(first_retry.operation, "tools/call");
+    assert_eq!(first_retry.disposition, RetryDisposition::Transient);
+    assert_eq!(first_retry.attempt, 1);
+    assert_eq!(second_retry.attempt, 2);
+
+    let next_call = call_echo_tool(&client, "after-server-error").await?;
+    assert_eq!(next_call, expected_echo_result("after-server-error"));
 
     Ok(())
 }

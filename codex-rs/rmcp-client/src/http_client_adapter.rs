@@ -749,6 +749,10 @@ fn retryable_post_response_status(mcp_method: Option<&str>, status: u16) -> bool
                     | "initialize"
                     | "notifications/initialized"
                     | "tools/list"
+                    | "resources/list"
+                    | "resources/templates/list"
+                    | "resources/read"
+                    | "tools/call"
             )
         )
 }
@@ -756,13 +760,11 @@ fn retryable_post_response_status(mcp_method: Option<&str>, status: u16) -> bool
 fn is_retryable_http_status(status: StatusCode) -> bool {
     matches!(
         status,
-        StatusCode::REQUEST_TIMEOUT
+        StatusCode::MISDIRECTED_REQUEST
+            | StatusCode::REQUEST_TIMEOUT
+            | StatusCode::TOO_EARLY
             | StatusCode::TOO_MANY_REQUESTS
-            | StatusCode::INTERNAL_SERVER_ERROR
-            | StatusCode::BAD_GATEWAY
-            | StatusCode::SERVICE_UNAVAILABLE
-            | StatusCode::GATEWAY_TIMEOUT
-    )
+    ) || status.is_server_error()
 }
 
 fn parse_json_rpc_error(body: &[u8]) -> Option<ServerJsonRpcMessage> {
