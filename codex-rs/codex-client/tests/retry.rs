@@ -13,6 +13,8 @@ use http::HeaderMap;
 use http::Method;
 use http::StatusCode;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -529,5 +531,62 @@ async fn capacity_uses_its_separate_persistent_retry_budget() {
     assert_eq!(
         result.expect("capacity retries should recover"),
         "recovered"
+    );
+}
+
+#[tokio::test]
+async fn persistent_capacity_budget_returns_the_last_error_after_one_hundred_retries() {
+    let attempts = Arc::new(AtomicU64::new(0));
+    let attempts_for_request = Arc::clone(&attempts);
+    let policy = RetryPolicy {
+        max_attempts: 0,
+        capacity_max_attempts: codex_client::PERSISTENT_CAPACITY_MAX_RETRIES,
+        base_delay: Duration::ZERO,
+        retry_on: RetryOn {
+            retry_429: true,
+            retry_5xx: true,
+            retry_transport: true,
+        },
+        retry_notifier: None,
+    };
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        run_with_retry(
+            policy,
+            || Request {
+                method: Method::GET,
+                url: "https://example.com".to_string(),
+                headers: HeaderMap::new(),
+                body: None,
+                compression: RequestCompression::None,
+                timeout: None,
+            },
+            move |_request, _attempt| {
+                let attempts = Arc::clone(&attempts_for_request);
+                async move {
+                    attempts.fetch_add(1, Ordering::Relaxed);
+                    Err::<(), _>(TransportError::Http {
+                        status: StatusCode::SERVICE_UNAVAILABLE,
+                        url: None,
+                        headers: None,
+                        body: Some(
+                            "Selected model is at capacity. Please try a different model."
+                                .to_string(),
+                        ),
+                    })
+                }
+            },
+        ),
+    )
+    .await
+    .expect("capacity retries must have a bounded attempt count")
+    .expect_err("the final capacity error should be returned");
+
+    assert!(matches!(result, TransportError::Http { .. }));
+    assert_eq!(
+        attempts.load(Ordering::Relaxed),
+        101,
+        "one initial request plus one hundred bounded retries is expected"
     );
 }
