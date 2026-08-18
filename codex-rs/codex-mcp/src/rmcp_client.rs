@@ -1410,6 +1410,51 @@ mod tests {
         assert_eq!(state.retry_not_before, None);
     }
 
+    #[tokio::test]
+    async fn exhausted_apps_reconnect_capacity_budget_does_not_schedule_another_retry() {
+        let reconnect = Arc::new(CodexAppsStartupReconnect::new(Arc::new(|| {
+            async {
+                Err(StartupOutcomeError::Failed {
+                    error: "Selected model is at capacity. Please try a different model."
+                        .to_string(),
+                    is_authentication_required: false,
+                })
+            }
+            .boxed()
+            .shared()
+        })));
+        {
+            let mut state = reconnect
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.consecutive_failures = PERSISTENT_CAPACITY_MAX_RETRIES as u32;
+        }
+
+        reconnect.reconnect_in_background();
+
+        for _ in 0..100 {
+            let finished = {
+                let state = reconnect
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                !state.reconnect_in_flight
+            };
+            if finished {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let state = reconnect
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!state.reconnect_in_flight);
+        assert_eq!(state.retry_not_before, None);
+    }
+
     #[test]
     fn startup_outcome_error_identifies_authentication_required() {
         let error = anyhow::Error::new(AuthError::AuthorizationRequired)
