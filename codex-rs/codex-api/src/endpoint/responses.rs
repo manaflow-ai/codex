@@ -14,6 +14,7 @@ use codex_client::EncodedJsonBody;
 use codex_client::HttpTransport;
 use codex_client::RequestCompression;
 use codex_client::RequestTelemetry;
+use codex_client::RetryNotifier;
 use codex_protocol::protocol::SessionSource;
 use http::HeaderMap;
 use http::HeaderValue;
@@ -57,6 +58,13 @@ impl<T: HttpTransport> ResponsesClient<T> {
         }
     }
 
+    pub fn with_retry_notifier(self, retry_notifier: Option<RetryNotifier>) -> Self {
+        Self {
+            session: self.session.with_retry_notifier(retry_notifier),
+            sse_telemetry: self.sse_telemetry,
+        }
+    }
+
     #[instrument(
         name = "responses.stream_request",
         level = "info",
@@ -81,8 +89,9 @@ impl<T: HttpTransport> ResponsesClient<T> {
             turn_state,
         } = options;
 
-        let body = EncodedJsonBody::encode(&request)
-            .map_err(|e| ApiError::Stream(format!("failed to encode responses request: {e}")))?;
+        let body = EncodedJsonBody::encode(&request).map_err(|e| ApiError::InvalidRequest {
+            message: format!("failed to encode responses request: {e}"),
+        })?;
 
         let mut headers = extra_headers;
         if let Some(ref thread_id) = thread_id {
@@ -119,8 +128,9 @@ impl<T: HttpTransport> ResponsesClient<T> {
         compression: Compression,
         turn_state: Option<Arc<OnceLock<String>>>,
     ) -> Result<ResponseStream, ApiError> {
-        let body = EncodedJsonBody::encode(&body)
-            .map_err(|e| ApiError::Stream(format!("failed to encode responses request: {e}")))?;
+        let body = EncodedJsonBody::encode(&body).map_err(|e| ApiError::InvalidRequest {
+            message: format!("failed to encode responses request: {e}"),
+        })?;
         self.stream_encoded(body, extra_headers, compression, turn_state)
             .await
     }

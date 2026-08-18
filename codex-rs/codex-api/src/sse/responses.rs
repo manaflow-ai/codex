@@ -3,15 +3,23 @@ use crate::common::ResponseStream;
 use crate::common::SafetyBuffering;
 use crate::common::SafetyBufferingTreatment;
 use crate::error::ApiError;
+use crate::error::is_permanent_error_fields;
+use crate::error::is_permanent_error_message;
+use crate::error::is_server_overloaded_error as is_capacity_error;
 use crate::rate_limits::parse_all_rate_limits;
 use crate::safety_buffering::treatment_from_headers;
 use crate::telemetry::SseTelemetry;
 use codex_client::ByteStream;
+use codex_client::RetryDisposition;
 use codex_client::StreamResponse;
+use codex_client::TransportError;
+use codex_client::classify_provider_error_text;
+use codex_client::is_capacity_error_body;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::ModelVerification;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnModerationMetadataEvent;
+use eventsource_stream::EventStreamError;
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use serde::Deserialize;
@@ -99,7 +107,7 @@ pub fn spawn_response_stream(
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 struct Error {
     r#type: Option<String>,
@@ -167,6 +175,8 @@ pub struct ResponsesStreamEvent {
     pub(crate) headers: Option<Value>,
     metadata: Option<Value>,
     response: Option<Value>,
+    #[serde(default)]
+    error: Option<Error>,
     item: Option<Value>,
     item_id: Option<String>,
     call_id: Option<String>,
@@ -406,40 +416,53 @@ pub fn process_responses_event(
             }
         }
         "response.failed" => {
-            if let Some(resp_val) = event.response {
-                let mut response_error = ApiError::Stream("response.failed event received".into());
-                if let Some(error) = resp_val.get("error")
-                    && let Ok(error) = serde_json::from_value::<Error>(error.clone())
+            let error = event
+                .response
+                .as_ref()
+                .and_then(|resp_val| resp_val.get("error"))
+                .and_then(|error| serde_json::from_value::<Error>(error.clone()).ok())
+                .or(event.error);
+            if let Some(error) = error {
+                let response_error = if is_context_window_error(&error) {
+                    ApiError::ContextWindowExceeded
+                } else if is_quota_exceeded_error(&error) {
+                    ApiError::QuotaExceeded
+                } else if is_usage_not_included(&error) {
+                    ApiError::UsageNotIncluded
+                } else if is_cyber_policy_error(&error) {
+                    let message = cyber_policy_message(error.message);
+                    ApiError::CyberPolicy { message }
+                } else if error_matches_kind(&error, "invalid_prompt")
+                    || error_matches_kind(&error, "bio_policy")
                 {
-                    if is_context_window_error(&error) {
-                        response_error = ApiError::ContextWindowExceeded;
-                    } else if is_quota_exceeded_error(&error) {
-                        response_error = ApiError::QuotaExceeded;
-                    } else if is_usage_not_included(&error) {
-                        response_error = ApiError::UsageNotIncluded;
-                    } else if is_cyber_policy_error(&error) {
-                        let message = cyber_policy_message(error.message);
-                        response_error = ApiError::CyberPolicy { message };
-                    } else if matches!(error.code.as_deref(), Some("invalid_prompt" | "bio_policy"))
-                    {
-                        let message = error
-                            .message
-                            .unwrap_or_else(|| "Invalid request.".to_string());
-                        response_error = ApiError::InvalidRequest { message };
-                    } else if is_server_overloaded_error(&error) {
-                        response_error = ApiError::ServerOverloaded;
-                    } else {
-                        let delay = try_parse_retry_after(&error);
-                        let message = error.message.unwrap_or_default();
-                        response_error = ApiError::Retryable { message, delay };
-                    }
-                }
+                    let message = error
+                        .message
+                        .unwrap_or_else(|| "Invalid request.".to_string());
+                    ApiError::InvalidRequest { message }
+                } else if is_server_overloaded_error(&error) {
+                    ApiError::ServerOverloaded
+                } else if is_permanent_response_error(&error) {
+                    let message = error
+                        .message
+                        .unwrap_or_else(|| "Invalid response request.".to_string());
+                    ApiError::InvalidRequest { message }
+                } else if !is_retryable_response_error(&error) {
+                    let message = error
+                        .message
+                        .unwrap_or_else(|| "Response failed.".to_string());
+                    ApiError::InvalidRequest { message }
+                } else {
+                    let delay = try_parse_retry_after(&error);
+                    let message = error.message.unwrap_or_default();
+                    ApiError::Retryable { message, delay }
+                };
                 return Err(ResponsesEventError::Api(response_error));
             }
 
-            return Err(ResponsesEventError::Api(ApiError::Stream(
-                "response.failed event received".into(),
-            )));
+            return Err(ResponsesEventError::Api(ApiError::Retryable {
+                message: "response.failed event received".into(),
+                delay: None,
+            }));
         }
         "response.incomplete" => {
             let reason = event.response.as_ref().and_then(|response| {
@@ -450,7 +473,15 @@ pub fn process_responses_event(
             });
             let reason = reason.unwrap_or("unknown");
             let message = format!("Incomplete response returned, reason: {reason}");
-            return Err(ResponsesEventError::Api(ApiError::Stream(message)));
+            let error = if is_permanent_incomplete_reason(reason) {
+                ApiError::InvalidRequest { message }
+            } else {
+                ApiError::Retryable {
+                    message,
+                    delay: None,
+                }
+            };
+            return Err(ResponsesEventError::Api(error));
         }
         "response.cancelled" => {
             return Err(ResponsesEventError::Api(ApiError::Retryable {
@@ -471,7 +502,9 @@ pub fn process_responses_event(
                     Err(err) => {
                         let error = format!("failed to parse ResponseCompleted: {err}");
                         debug!("{error}");
-                        return Err(ResponsesEventError::Api(ApiError::Stream(error)));
+                        return Err(ResponsesEventError::Api(ApiError::InvalidRequest {
+                            message: error,
+                        }));
                     }
                 }
             }
@@ -556,19 +589,23 @@ async fn process_sse_with_treatment(
             Ok(Some(Ok(sse))) => sse,
             Ok(Some(Err(e))) => {
                 debug!("SSE Error: {e:#}");
-                let _ = tx_event.send(Err(ApiError::Stream(e.to_string()))).await;
+                let _ = tx_event.send(Err(map_sse_stream_error(e))).await;
                 return;
             }
             Ok(None) => {
-                let error = response_error.unwrap_or(ApiError::Stream(
-                    "stream closed before response.completed".into(),
-                ));
+                let error = response_error.unwrap_or(ApiError::Retryable {
+                    message: "stream closed before response.completed".into(),
+                    delay: None,
+                });
                 let _ = tx_event.send(Err(error)).await;
                 return;
             }
             Err(_) => {
                 let _ = tx_event
-                    .send(Err(ApiError::Stream("idle timeout waiting for SSE".into())))
+                    .send(Err(ApiError::Retryable {
+                        message: "idle timeout waiting for SSE".into(),
+                        delay: None,
+                    }))
                     .await;
                 return;
             }
@@ -648,8 +685,20 @@ async fn process_sse_with_treatment(
     }
 }
 
+fn map_sse_stream_error(error: EventStreamError<TransportError>) -> ApiError {
+    match error {
+        EventStreamError::Transport(error) => ApiError::Transport(error),
+        EventStreamError::Utf8(error) => ApiError::InvalidRequest {
+            message: format!("invalid UTF-8 in SSE response: {error}"),
+        },
+        EventStreamError::Parser(error) => ApiError::InvalidRequest {
+            message: format!("invalid SSE response: {error}"),
+        },
+    }
+}
+
 fn try_parse_retry_after(err: &Error) -> Option<Duration> {
-    if err.code.as_deref() != Some("rate_limit_exceeded") {
+    if !error_matches_kind(err, "rate_limit_exceeded") {
         return None;
     }
 
@@ -675,24 +724,75 @@ fn try_parse_retry_after(err: &Error) -> Option<Duration> {
 }
 
 fn is_context_window_error(error: &Error) -> bool {
-    error.code.as_deref() == Some("context_length_exceeded")
+    error_matches_kind(error, "context_length_exceeded")
+        || error_matches_kind(error, "context_window_exceeded")
 }
 
 fn is_quota_exceeded_error(error: &Error) -> bool {
-    error.code.as_deref() == Some("insufficient_quota")
+    error_matches_kind(error, "insufficient_quota") || error_matches_kind(error, "quota_exceeded")
 }
 
 fn is_usage_not_included(error: &Error) -> bool {
-    error.code.as_deref() == Some("usage_not_included")
+    error_matches_kind(error, "usage_not_included")
 }
 
 fn is_cyber_policy_error(error: &Error) -> bool {
-    error.code.as_deref() == Some("cyber_policy")
+    error_matches_kind(error, "cyber_policy")
 }
 
 fn is_server_overloaded_error(error: &Error) -> bool {
-    error.code.as_deref() == Some("server_is_overloaded")
-        || error.code.as_deref() == Some("slow_down")
+    is_capacity_error(
+        error.r#type.as_deref(),
+        error.code.as_deref(),
+        error.message.as_deref(),
+    ) || error.message.as_deref().is_some_and(is_capacity_error_body)
+}
+
+fn is_permanent_response_error(error: &Error) -> bool {
+    is_permanent_error_fields(
+        error.r#type.as_deref(),
+        error.code.as_deref(),
+        error.message.as_deref(),
+    )
+}
+
+fn is_retryable_response_error(error: &Error) -> bool {
+    is_server_overloaded_error(error)
+        || error.message.as_deref().is_some_and(is_capacity_error_body)
+        || [
+            "server_error",
+            "rate_limit_error",
+            "api_error",
+            "timeout_error",
+            "connection_error",
+            "rate_limit_exceeded",
+            "internal_server_error",
+            "internal_error",
+            "request_timeout",
+            "timeout",
+            "response_cancelled",
+            "cancelled",
+            "canceled",
+            "request_cancelled",
+            "request_canceled",
+        ]
+        .iter()
+        .any(|candidate| error_matches_kind(error, candidate))
+        || error.message.as_deref().is_some_and(|message| {
+            classify_provider_error_text(message) != RetryDisposition::DoNotRetry
+        })
+}
+
+fn error_matches_kind(error: &Error, candidate: &str) -> bool {
+    let candidate = candidate.replace(['_', '-'], " ");
+    [error.r#type.as_deref(), error.code.as_deref()]
+        .into_iter()
+        .flatten()
+        .any(|value| value.to_ascii_lowercase().replace(['_', '-'], " ") == candidate)
+}
+
+fn is_permanent_incomplete_reason(reason: &str) -> bool {
+    matches!(reason, "max_output_tokens" | "content_filter") || is_permanent_error_message(reason)
 }
 
 fn cyber_policy_fallback_message() -> String {
@@ -755,6 +855,21 @@ mod tests {
             events.push(ev);
         }
         events
+    }
+
+    #[test]
+    fn sse_stream_error_mapping_retries_transport_but_not_invalid_utf8() {
+        let transport = map_sse_stream_error(EventStreamError::Transport(TransportError::Network(
+            "connection reset".to_string(),
+        )));
+        assert!(matches!(
+            transport,
+            ApiError::Transport(TransportError::Network(_))
+        ));
+
+        let utf8 = String::from_utf8(vec![0xff]).expect_err("byte should be invalid UTF-8");
+        let invalid = map_sse_stream_error(EventStreamError::Utf8(utf8));
+        assert!(matches!(invalid, ApiError::InvalidRequest { .. }));
     }
 
     async fn run_sse(events: Vec<serde_json::Value>) -> Vec<ResponseEvent> {
@@ -934,7 +1049,7 @@ mod tests {
         assert_matches!(events[0], Ok(ResponseEvent::OutputItemDone(_)));
 
         match &events[1] {
-            Err(ApiError::Stream(msg)) => {
+            Err(ApiError::Retryable { message: msg, .. }) => {
                 assert_eq!(msg, "stream closed before response.completed")
             }
             other => panic!("unexpected second event: {other:?}"),
@@ -1098,6 +1213,93 @@ mod tests {
             [Err(ApiError::InvalidRequest { message })]
                 if message == "The model does not exist."
         );
+    }
+
+    #[tokio::test]
+    async fn failed_response_without_error_is_retryable() {
+        let raw_error = json!({
+            "type": "response.failed",
+            "response": {
+                "id": "resp_unknown_failure",
+                "status": "failed"
+            }
+        })
+        .to_string();
+        let sse = format!("event: response.failed\ndata: {raw_error}\n\n");
+        let events = collect_events(&[sse.as_bytes()]).await;
+
+        assert_matches!(
+            events.as_slice(),
+            [Err(ApiError::Retryable { message, .. })]
+                if message == "response.failed event received"
+        );
+    }
+
+    #[tokio::test]
+    async fn capacity_error_variants_are_persistent_overload_errors() {
+        let cases = [
+            (Some("model_at_capacity"), None, "model at capacity"),
+            (None, Some("server_overloaded"), "server overloaded"),
+            (Some("capacity_exceeded"), None, "capacity exceeded"),
+            (
+                None,
+                None,
+                "Selected model is at capacity. Please try a different model.",
+            ),
+        ];
+
+        for (code, error_type, message) in cases {
+            let raw_error = json!({
+                "type": "response.failed",
+                "response": {
+                    "id": "resp_capacity",
+                    "error": {
+                        "code": code,
+                        "type": error_type,
+                        "message": message,
+                    }
+                }
+            })
+            .to_string();
+            let sse = format!("event: response.failed\ndata: {raw_error}\n\n");
+            let events = collect_events(&[sse.as_bytes()]).await;
+
+            assert_matches!(events.as_slice(), [Err(ApiError::ServerOverloaded)]);
+        }
+    }
+
+    #[tokio::test]
+    async fn top_level_capacity_error_is_retryable() {
+        let raw_error = json!({
+            "type": "response.failed",
+            "error": {
+                "message": "Selected model is at capacity. Please try a different model."
+            }
+        })
+        .to_string();
+        let sse = format!("event: response.failed\ndata: {raw_error}\n\n");
+        let events = collect_events(&[sse.as_bytes()]).await;
+
+        assert_matches!(events.as_slice(), [Err(ApiError::ServerOverloaded)]);
+    }
+
+    #[tokio::test]
+    async fn wrapped_capacity_message_overrides_generic_response_error_type() {
+        let raw_error = json!({
+            "type": "response.failed",
+            "response": {
+                "id": "resp_wrapped_capacity",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "{\"error\":{\"message\":\"Selected model is at capacity. Please try a different model.\"}}"
+                }
+            }
+        })
+        .to_string();
+        let sse = format!("event: response.failed\ndata: {raw_error}\n\n");
+        let events = collect_events(&[sse.as_bytes()]).await;
+
+        assert_matches!(events.as_slice(), [Err(ApiError::ServerOverloaded)]);
     }
 
     #[tokio::test]

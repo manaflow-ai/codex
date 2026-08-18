@@ -6,7 +6,9 @@ use crate::images::ImageGenerationRequest;
 use crate::images::ImageResponse;
 use crate::provider::Provider;
 use codex_client::HttpTransport;
+use codex_client::PERSISTENT_CAPACITY_MAX_RETRIES;
 use codex_client::RequestTelemetry;
+use codex_client::RetryNotifier;
 use http::HeaderMap;
 use http::Method;
 use serde::Serialize;
@@ -20,13 +22,20 @@ pub struct ImagesClient<T: HttpTransport> {
 impl<T: HttpTransport> ImagesClient<T> {
     pub fn new(transport: T, provider: Provider, auth: SharedAuthProvider) -> Self {
         Self {
-            session: EndpointSession::new(transport, provider, auth),
+            session: EndpointSession::new(transport, provider, auth)
+                .with_capacity_max_attempts(PERSISTENT_CAPACITY_MAX_RETRIES),
         }
     }
 
     pub fn with_telemetry(self, request: Option<Arc<dyn RequestTelemetry>>) -> Self {
         Self {
             session: self.session.with_request_telemetry(request),
+        }
+    }
+
+    pub fn with_retry_notifier(self, retry_notifier: Option<RetryNotifier>) -> Self {
+        Self {
+            session: self.session.with_retry_notifier(retry_notifier),
         }
     }
 
@@ -60,14 +69,16 @@ impl<T: HttpTransport> ImagesClient<T> {
         extra_headers: HeaderMap,
         operation: &str,
     ) -> Result<ImageResponse, ApiError> {
-        let body = to_value(request)
-            .map_err(|e| ApiError::Stream(format!("failed to encode {operation} request: {e}")))?;
+        let body = to_value(request).map_err(|e| ApiError::InvalidRequest {
+            message: format!("failed to encode {operation} request: {e}"),
+        })?;
         let resp = self
             .session
             .execute(Method::POST, path, extra_headers, Some(body))
             .await?;
-        serde_json::from_slice(&resp.body)
-            .map_err(|e| ApiError::Stream(format!("failed to decode {operation} response: {e}")))
+        serde_json::from_slice(&resp.body).map_err(|e| ApiError::InvalidRequest {
+            message: format!("failed to decode {operation} response: {e}"),
+        })
     }
 }
 
@@ -289,7 +300,7 @@ mod tests {
             .await
             .expect_err("image response without data should fail");
 
-        let ApiError::Stream(message) = error else {
+        let ApiError::InvalidRequest { message } = error else {
             panic!("expected image response decode error");
         };
         assert!(

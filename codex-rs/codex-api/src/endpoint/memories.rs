@@ -5,7 +5,9 @@ use crate::endpoint::session::EndpointSession;
 use crate::error::ApiError;
 use crate::provider::Provider;
 use codex_client::HttpTransport;
+use codex_client::PERSISTENT_CAPACITY_MAX_RETRIES;
 use codex_client::RequestTelemetry;
+use codex_client::RetryNotifier;
 use http::HeaderMap;
 use http::Method;
 use serde::Deserialize;
@@ -19,13 +21,20 @@ pub struct MemoriesClient<T: HttpTransport> {
 impl<T: HttpTransport> MemoriesClient<T> {
     pub fn new(transport: T, provider: Provider, auth: SharedAuthProvider) -> Self {
         Self {
-            session: EndpointSession::new(transport, provider, auth),
+            session: EndpointSession::new(transport, provider, auth)
+                .with_capacity_max_attempts(PERSISTENT_CAPACITY_MAX_RETRIES),
         }
     }
 
     pub fn with_telemetry(self, request: Option<Arc<dyn RequestTelemetry>>) -> Self {
         Self {
             session: self.session.with_request_telemetry(request),
+        }
+    }
+
+    pub fn with_retry_notifier(self, retry_notifier: Option<RetryNotifier>) -> Self {
+        Self {
+            session: self.session.with_retry_notifier(retry_notifier),
         }
     }
 
@@ -43,7 +52,9 @@ impl<T: HttpTransport> MemoriesClient<T> {
             .execute(Method::POST, Self::path(), extra_headers, Some(body))
             .await?;
         let parsed: SummarizeResponse =
-            serde_json::from_slice(&resp.body).map_err(|e| ApiError::Stream(e.to_string()))?;
+            serde_json::from_slice(&resp.body).map_err(|e| ApiError::InvalidRequest {
+                message: format!("failed to decode memory summarize response: {e}"),
+            })?;
         Ok(parsed.output)
     }
 
@@ -52,8 +63,8 @@ impl<T: HttpTransport> MemoriesClient<T> {
         input: &MemorySummarizeInput,
         extra_headers: HeaderMap,
     ) -> Result<Vec<MemorySummarizeOutput>, ApiError> {
-        let body = to_value(input).map_err(|e| {
-            ApiError::Stream(format!("failed to encode memory summarize input: {e}"))
+        let body = to_value(input).map_err(|e| ApiError::InvalidRequest {
+            message: format!("failed to encode memory summarize input: {e}"),
         })?;
         self.summarize(body, extra_headers).await
     }

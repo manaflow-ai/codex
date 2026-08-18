@@ -3,7 +3,9 @@ use crate::endpoint::session::EndpointSession;
 use crate::error::ApiError;
 use crate::provider::Provider;
 use codex_client::HttpTransport;
+use codex_client::PERSISTENT_CAPACITY_MAX_RETRIES;
 use codex_client::RequestTelemetry;
+use codex_client::RetryNotifier;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelsResponse;
 use http::HeaderMap;
@@ -18,13 +20,20 @@ pub struct ModelsClient<T: HttpTransport> {
 impl<T: HttpTransport> ModelsClient<T> {
     pub fn new(transport: T, provider: Provider, auth: SharedAuthProvider) -> Self {
         Self {
-            session: EndpointSession::new(transport, provider, auth),
+            session: EndpointSession::new(transport, provider, auth)
+                .with_capacity_max_attempts(PERSISTENT_CAPACITY_MAX_RETRIES),
         }
     }
 
     pub fn with_telemetry(self, request: Option<Arc<dyn RequestTelemetry>>) -> Self {
         Self {
             session: self.session.with_request_telemetry(request),
+        }
+    }
+
+    pub fn with_retry_notifier(self, retry_notifier: Option<RetryNotifier>) -> Self {
+        Self {
+            session: self.session.with_retry_notifier(retry_notifier),
         }
     }
 
@@ -68,11 +77,11 @@ impl<T: HttpTransport> ModelsClient<T> {
             .map(ToString::to_string);
 
         let ModelsResponse { models } = serde_json::from_slice::<ModelsResponse>(&resp.body)
-            .map_err(|e| {
-                ApiError::Stream(format!(
+            .map_err(|e| ApiError::InvalidRequest {
+                message: format!(
                     "failed to decode models response: {e}; body: {}",
                     String::from_utf8_lossy(&resp.body)
-                ))
+                ),
             })?;
 
         Ok((models, header_etag))

@@ -7,9 +7,11 @@ use crate::error::ApiError;
 use crate::provider::Provider;
 use bytes::Bytes;
 use codex_client::HttpTransport;
+use codex_client::PERSISTENT_CAPACITY_MAX_RETRIES;
 use codex_client::Request;
 use codex_client::RequestBody;
 use codex_client::RequestTelemetry;
+use codex_client::RetryNotifier;
 use http::HeaderMap;
 use http::HeaderValue;
 use http::Method;
@@ -49,13 +51,20 @@ struct BackendRealtimeCallRequest<'a> {
 impl<T: HttpTransport> RealtimeCallClient<T> {
     pub fn new(transport: T, provider: Provider, auth: SharedAuthProvider) -> Self {
         Self {
-            session: EndpointSession::new(transport, provider, auth),
+            session: EndpointSession::new(transport, provider, auth)
+                .with_capacity_max_attempts(PERSISTENT_CAPACITY_MAX_RETRIES),
         }
     }
 
     pub fn with_telemetry(self, request: Option<Arc<dyn RequestTelemetry>>) -> Self {
         Self {
             session: self.session.with_request_telemetry(request),
+        }
+    }
+
+    pub fn with_retry_notifier(self, retry_notifier: Option<RetryNotifier>) -> Self {
+        Self {
+            session: self.session.with_retry_notifier(retry_notifier),
         }
     }
 
@@ -149,7 +158,9 @@ impl<T: HttpTransport> RealtimeCallClient<T> {
                 sdp: &sdp,
                 session: &session,
             })
-            .map_err(|err| ApiError::Stream(format!("failed to encode realtime call: {err}")))?;
+            .map_err(|err| ApiError::InvalidRequest {
+                message: format!("failed to encode realtime call: {err}"),
+            })?;
             let resp = self
                 .session
                 .execute_with(Method::POST, path, extra_headers, Some(body), |request| {
@@ -244,24 +255,27 @@ fn append_query_pair(url: &mut String, key: &str, value: &str) {
 }
 
 fn realtime_session_json(session_config: RealtimeSessionConfig) -> Result<Value, ApiError> {
-    session_update_session_json(session_config)
-        .map_err(|err| ApiError::Stream(format!("failed to encode realtime call session: {err}")))
+    session_update_session_json(session_config).map_err(|err| ApiError::InvalidRequest {
+        message: format!("failed to encode realtime call session: {err}"),
+    })
 }
 
 fn decode_sdp_response(body: &[u8]) -> Result<String, ApiError> {
-    String::from_utf8(body.to_vec()).map_err(|err| {
-        ApiError::Stream(format!(
-            "failed to decode realtime call SDP response: {err}"
-        ))
+    String::from_utf8(body.to_vec()).map_err(|err| ApiError::InvalidRequest {
+        message: format!("failed to decode realtime call SDP response: {err}"),
     })
 }
 
 fn decode_call_id_from_location(headers: &HeaderMap) -> Result<String, ApiError> {
     let location = headers
         .get(LOCATION)
-        .ok_or_else(|| ApiError::Stream("realtime call response missing Location".to_string()))?
+        .ok_or_else(|| ApiError::InvalidRequest {
+            message: "realtime call response missing Location".to_string(),
+        })?
         .to_str()
-        .map_err(|err| ApiError::Stream(format!("invalid realtime call Location: {err}")))?;
+        .map_err(|err| ApiError::InvalidRequest {
+            message: format!("invalid realtime call Location: {err}"),
+        })?;
     trace!("realtime call Location: {location}");
 
     location
@@ -271,10 +285,8 @@ fn decode_call_id_from_location(headers: &HeaderMap) -> Result<String, ApiError>
         .rsplit('/')
         .find(|segment| is_realtime_call_id_segment(segment))
         .map(str::to_string)
-        .ok_or_else(|| {
-            ApiError::Stream(format!(
-                "realtime call Location does not contain a call id: {location}"
-            ))
+        .ok_or_else(|| ApiError::InvalidRequest {
+            message: format!("realtime call Location does not contain a call id: {location}"),
         })
 }
 
@@ -763,7 +775,7 @@ mod tests {
 
         assert_eq!(
             err.to_string(),
-            "stream error: realtime call response missing Location"
+            "invalid request: realtime call response missing Location"
         );
     }
 
@@ -777,7 +789,7 @@ mod tests {
 
         assert_eq!(
             err.to_string(),
-            "stream error: realtime call Location does not contain a call id: /v1/realtime/calls"
+            "invalid request: realtime call Location does not contain a call id: /v1/realtime/calls"
         );
     }
 

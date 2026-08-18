@@ -5,7 +5,9 @@ use crate::provider::Provider;
 use crate::search::SearchRequest;
 use crate::search::SearchResponse;
 use codex_client::HttpTransport;
+use codex_client::PERSISTENT_CAPACITY_MAX_RETRIES;
 use codex_client::RequestTelemetry;
+use codex_client::RetryNotifier;
 use http::HeaderMap;
 use http::Method;
 use serde_json::to_value;
@@ -18,13 +20,20 @@ pub struct SearchClient<T: HttpTransport> {
 impl<T: HttpTransport> SearchClient<T> {
     pub fn new(transport: T, provider: Provider, auth: SharedAuthProvider) -> Self {
         Self {
-            session: EndpointSession::new(transport, provider, auth),
+            session: EndpointSession::new(transport, provider, auth)
+                .with_capacity_max_attempts(PERSISTENT_CAPACITY_MAX_RETRIES),
         }
     }
 
     pub fn with_telemetry(self, request: Option<Arc<dyn RequestTelemetry>>) -> Self {
         Self {
             session: self.session.with_request_telemetry(request),
+        }
+    }
+
+    pub fn with_retry_notifier(self, retry_notifier: Option<RetryNotifier>) -> Self {
+        Self {
+            session: self.session.with_retry_notifier(retry_notifier),
         }
     }
 
@@ -37,14 +46,16 @@ impl<T: HttpTransport> SearchClient<T> {
         request: &SearchRequest,
         extra_headers: HeaderMap,
     ) -> Result<SearchResponse, ApiError> {
-        let body = to_value(request)
-            .map_err(|e| ApiError::Stream(format!("failed to encode search request: {e}")))?;
+        let body = to_value(request).map_err(|e| ApiError::InvalidRequest {
+            message: format!("failed to encode search request: {e}"),
+        })?;
         let resp = self
             .session
             .execute(Method::POST, Self::path(), extra_headers, Some(body))
             .await?;
-        serde_json::from_slice(&resp.body)
-            .map_err(|e| ApiError::Stream(format!("failed to decode search response: {e}")))
+        serde_json::from_slice(&resp.body).map_err(|e| ApiError::InvalidRequest {
+            message: format!("failed to decode search response: {e}"),
+        })
     }
 }
 
