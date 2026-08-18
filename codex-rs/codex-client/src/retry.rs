@@ -478,6 +478,11 @@ fn is_local_cancellation_text(text: &str) -> bool {
     [
         "operation canceled",
         "operation cancelled",
+        // Hyper uses these forms when a caller cancellation drops an in-flight request.
+        "operation was canceled",
+        "operation was cancelled",
+        "request was canceled",
+        "request was cancelled",
         "task canceled by caller",
         "task cancelled by caller",
         "request aborted by caller",
