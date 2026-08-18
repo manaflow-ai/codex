@@ -23,11 +23,11 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 
-use super::classify_sampling_error;
 use super::LunaSampler;
-use super::LunaSamplerError;
 use super::LunaSamplerConfig;
+use super::LunaSamplerError;
 use super::LunaSamplingRequest;
+use super::classify_sampling_error;
 
 #[test]
 fn sampler_classifies_stream_and_capacity_errors_before_retrying() {
