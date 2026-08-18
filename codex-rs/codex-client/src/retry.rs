@@ -474,8 +474,8 @@ fn classify_network_error(text: &str) -> RetryDisposition {
 }
 
 fn is_local_cancellation_text(text: &str) -> bool {
-    let normalized = normalize_error_text(text);
-    [
+    let normalized = normalize_error_text(text).trim().to_string();
+    const LOCAL_CANCELLATION_PREFIXES: &[&str] = &[
         "operation canceled",
         "operation cancelled",
         // Hyper uses these forms when a caller cancellation drops an in-flight request.
@@ -492,9 +492,22 @@ fn is_local_cancellation_text(text: &str) -> bool {
         "task cancelled by caller",
         "request aborted by caller",
         "request aborted by user",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker))
+    ];
+
+    LOCAL_CANCELLATION_PREFIXES.iter().any(|marker| {
+        if normalized == *marker {
+            return true;
+        }
+        let Some(suffix) = normalized.strip_prefix(marker) else {
+            return false;
+        };
+        let suffix = suffix.trim_start();
+        suffix.is_empty()
+            || suffix.starts_with(':')
+            || suffix.starts_with('(')
+            || suffix.starts_with("by caller")
+            || suffix.starts_with("by user")
+    })
 }
 
 /// Returns true for HTTP statuses that are safe to retry without response-body semantics.
