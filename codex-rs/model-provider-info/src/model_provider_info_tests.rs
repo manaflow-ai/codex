@@ -155,6 +155,24 @@ fn test_header_auth_uses_chatgpt_codex_base_url() {
 }
 
 #[test]
+fn default_retry_limits_bound_transient_requests_but_keep_capacity_persistent() {
+    let provider = ModelProviderInfo::default();
+
+    assert_eq!(provider.request_max_retries(), 4);
+    assert_eq!(provider.stream_max_retries(), 5);
+
+    let api_provider = provider
+        .to_api_provider(None)
+        .expect("default provider should build");
+    let retry_policy = api_provider.retry.to_policy();
+    assert_eq!(retry_policy.max_attempts, 4);
+    assert_eq!(
+        retry_policy.capacity_max_attempts,
+        codex_api::UNLIMITED_RETRIES
+    );
+}
+
+#[test]
 fn test_uses_openai_actor_authorization() {
     let mut provider = ModelProviderInfo {
         http_headers: Some(maplit::hashmap! {

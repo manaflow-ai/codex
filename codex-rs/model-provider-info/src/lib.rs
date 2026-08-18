@@ -23,6 +23,8 @@ use std::fmt;
 use std::time::Duration;
 
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS: u64 = 300_000;
+// Ordinary transient failures have a finite default budget. Capacity has a separate persistent
+// budget in `codex-api`, so a provider outage does not consume these limits.
 const DEFAULT_STREAM_MAX_RETRIES: u64 = 5;
 const DEFAULT_REQUEST_MAX_RETRIES: u64 = 4;
 pub const DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS: u64 = 15_000;
@@ -269,7 +271,7 @@ impl ModelProviderInfo {
         let retry = ApiRetryConfig {
             max_attempts: self.request_max_retries(),
             base_delay: Duration::from_millis(200),
-            retry_429: false,
+            retry_429: true,
             retry_5xx: true,
             retry_transport: true,
         };
@@ -308,15 +310,15 @@ impl ModelProviderInfo {
     /// Effective maximum number of request retries for this provider.
     pub fn request_max_retries(&self) -> u64 {
         self.request_max_retries
+            .map(|retries| retries.min(MAX_REQUEST_MAX_RETRIES))
             .unwrap_or(DEFAULT_REQUEST_MAX_RETRIES)
-            .min(MAX_REQUEST_MAX_RETRIES)
     }
 
     /// Effective maximum number of stream reconnection attempts for this provider.
     pub fn stream_max_retries(&self) -> u64 {
         self.stream_max_retries
+            .map(|retries| retries.min(MAX_STREAM_MAX_RETRIES))
             .unwrap_or(DEFAULT_STREAM_MAX_RETRIES)
-            .min(MAX_STREAM_MAX_RETRIES)
     }
 
     /// Effective idle timeout for streaming responses.
