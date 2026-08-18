@@ -405,7 +405,12 @@ fn local_cancellation_and_permanent_model_or_tls_errors_are_terminal() {
         retry_5xx: true,
         retry_transport: true,
     };
-    for message in ["operation canceled", "operation cancelled"] {
+    for message in [
+        "operation canceled",
+        "operation cancelled",
+        // Hyper uses this exact message when a caller cancellation drops an in-flight request.
+        "operation was canceled",
+    ] {
         assert!(!retry_on.should_retry(&TransportError::Network(message.to_string()), 0, 1,));
         assert_eq!(
             classify_provider_error_text(message),
