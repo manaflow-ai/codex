@@ -422,6 +422,14 @@ fn local_cancellation_and_permanent_model_or_tls_errors_are_terminal() {
             "caller cancellation must stay terminal in provider-shaped text: {message}",
         );
     }
+    for message in ["request canceled by server", "context cancelled by server"] {
+        assert!(retry_on.should_retry(&TransportError::Network(message.to_string()), 0, 1));
+        assert_eq!(
+            classify_provider_error_text(message),
+            RetryDisposition::Transient,
+            "server cancellation must remain retryable: {message}",
+        );
+    }
     for message in [
         "operation canceled by caller",
         "request cancelled by user",
