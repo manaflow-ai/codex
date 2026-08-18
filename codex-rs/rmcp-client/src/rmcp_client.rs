@@ -1434,9 +1434,8 @@ impl RmcpClient {
                     }
                     Some(reason) => match codex_client::classify_provider_error_text(reason) {
                         RetryDisposition::Capacity => RetryDisposition::Capacity,
-                        RetryDisposition::Transient | RetryDisposition::DoNotRetry => {
-                            RetryDisposition::Transient
-                        }
+                        RetryDisposition::Transient => RetryDisposition::Transient,
+                        RetryDisposition::DoNotRetry => RetryDisposition::DoNotRetry,
                     },
                     None => RetryDisposition::Transient,
                 }
