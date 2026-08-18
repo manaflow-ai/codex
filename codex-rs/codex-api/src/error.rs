@@ -207,26 +207,29 @@ pub(crate) fn map_websocket_operation_error(error: WsError, context: &str) -> Ap
 }
 
 pub(crate) fn classify_websocket_close(code: CloseCode, reason: &str) -> RetryDisposition {
-    if is_capacity_error_body(reason) || code == CloseCode::Again {
-        return RetryDisposition::Capacity;
-    }
-    if is_permanent_error_text(reason)
-        || matches!(
-            code,
-            CloseCode::Protocol
-                | CloseCode::Unsupported
-                | CloseCode::Invalid
-                | CloseCode::Policy
-                | CloseCode::Size
-                | CloseCode::Extension
-                | CloseCode::Tls
-                | CloseCode::Reserved(_)
-                | CloseCode::Iana(_)
-                | CloseCode::Library(_)
-                | CloseCode::Bad(_)
-        )
-    {
+    let capacity = is_capacity_error_body(reason);
+    let permanent_close_code = matches!(
+        code,
+        CloseCode::Protocol
+            | CloseCode::Unsupported
+            | CloseCode::Invalid
+            | CloseCode::Policy
+            | CloseCode::Size
+            | CloseCode::Extension
+            | CloseCode::Tls
+            | CloseCode::Reserved(_)
+            | CloseCode::Iana(_)
+            | CloseCode::Library(_)
+            | CloseCode::Bad(_)
+    );
+    // A protocol-level policy or format close is terminal even when a gateway copied a capacity
+    // phrase into its reason. For retry-oriented close codes, keep a genuine capacity wrapper
+    // retryable while still honoring a plain permanent provider message.
+    if permanent_close_code || (is_permanent_error_text(reason) && !capacity) {
         return RetryDisposition::DoNotRetry;
+    }
+    if capacity || code == CloseCode::Again {
+        return RetryDisposition::Capacity;
     }
     if is_transient_error_text(reason)
         || matches!(
