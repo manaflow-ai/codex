@@ -27,7 +27,10 @@ use std::path::Path;
 use std::time::Duration;
 
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS: u64 = 300_000;
-const DEFAULT_STREAM_MAX_RETRIES: u64 = 5;
+/// cmux fork: stream retries are unlimited unless `stream_max_retries` is set
+/// explicitly. Server failures are retried once a second until they clear.
+pub const UNLIMITED_STREAM_RETRIES: u64 = u64::MAX;
+const DEFAULT_STREAM_MAX_RETRIES: u64 = UNLIMITED_STREAM_RETRIES;
 const DEFAULT_REQUEST_MAX_RETRIES: u64 = 4;
 const DEFAULT_AWS_CREDENTIAL_EXPORT_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_AWS_AUTH_REFRESH_TIMEOUT_MS: u64 = 300_000;
@@ -422,8 +425,8 @@ impl ModelProviderInfo {
     /// Effective maximum number of stream reconnection attempts for this provider.
     pub fn stream_max_retries(&self) -> u64 {
         self.stream_max_retries
+            .map(|retries| retries.min(MAX_STREAM_MAX_RETRIES))
             .unwrap_or(DEFAULT_STREAM_MAX_RETRIES)
-            .min(MAX_STREAM_MAX_RETRIES)
     }
 
     /// Effective idle timeout for streaming responses.

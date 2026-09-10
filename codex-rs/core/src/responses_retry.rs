@@ -5,7 +5,9 @@ use std::time::Duration;
 use crate::client::ModelClientSession;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
-use crate::util::backoff;
+use crate::util::retry_progress_label;
+use crate::util::stream_retry_delay;
+use crate::util::STREAM_RETRY_INTERVAL;
 use codex_client::RetryOperation;
 use codex_features::Feature;
 use codex_protocol::error::CodexErr;
@@ -14,8 +16,10 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::WarningEvent;
 use tracing::warn;
 
-const INITIAL_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(5);
-const MAX_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(60);
+const INITIAL_CONNECTION_RETRY_DELAY: Duration = STREAM_RETRY_INTERVAL;
+const MAX_CONNECTION_RETRY_DELAY: Duration = STREAM_RETRY_INTERVAL;
+/// Retries on the WebSocket transport before falling back to HTTPS.
+const TRANSPORT_FALLBACK_AFTER_RETRIES: u64 = 5;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ResponsesStreamRequest {
@@ -82,7 +86,7 @@ pub(crate) async fn handle_retryable_response_stream_error(
         return Ok(());
     }
 
-    if retry_state.retries >= max_retries
+    if retry_state.retries >= max_retries.min(TRANSPORT_FALLBACK_AFTER_RETRIES)
         && client_session.try_switch_fallback_transport(
             &turn_context.session_telemetry,
             turn_context.model_info(),
@@ -102,24 +106,14 @@ pub(crate) async fn handle_retryable_response_stream_error(
     if retry_state.retries < max_retries {
         retry_state.retries += 1;
         let retry_count = retry_state.retries;
-        let delay = err.retry_delay().unwrap_or_else(|| backoff(retry_count));
+        let delay = stream_retry_delay(&err);
         log_retry(request, turn_context, &err, retry_count, max_retries, delay);
 
-        // In release builds, hide the first websocket retry notification to reduce noisy
-        // transient reconnect messages. In debug builds, keep full visibility for diagnosis.
-        let report_error = retry_count > 1
-            || cfg!(debug_assertions)
-            || !sess.services.model_client.responses_websocket_enabled();
-        if report_error {
-            // Surface retry information to any UI/front-end so the user understands what is
-            // happening instead of staring at a seemingly frozen screen.
-            sess.notify_stream_error(
-                turn_context,
-                format!("Reconnecting... {retry_count}/{max_retries}"),
-                err,
-            )
+        // cmux fork: every retry is surfaced so the UI never looks frozen while
+        // the server is overloaded.
+        let label = retry_progress_label(retry_count, max_retries);
+        sess.notify_stream_error(turn_context, format!("Reconnecting... {label}"), err)
             .await;
-        }
         codex_client::record_retry!(retry_count, delay, operation);
         tokio::time::sleep(delay).await;
         return Ok(());

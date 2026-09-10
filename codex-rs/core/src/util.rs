@@ -83,6 +83,25 @@ pub(crate) fn emit_feedback_auth_recovery_tags(
     );
 }
 
+/// cmux fork: fixed interval between stream retries when the server did not
+/// ask for a specific delay.
+pub const STREAM_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Delay before the next stream retry: the server-requested delay when present,
+/// otherwise [`STREAM_RETRY_INTERVAL`].
+pub fn stream_retry_delay(err: &codex_protocol::error::CodexErr) -> Duration {
+    err.retry_delay().unwrap_or(STREAM_RETRY_INTERVAL)
+}
+
+/// `"3/5"` for a bounded retry budget, `"3"` when retries are unlimited.
+pub fn retry_progress_label(retries: u64, max_retries: u64) -> String {
+    if max_retries == codex_model_provider_info::UNLIMITED_STREAM_RETRIES {
+        retries.to_string()
+    } else {
+        format!("{retries}/{max_retries}")
+    }
+}
+
 pub fn backoff(attempt: u64) -> Duration {
     let exp = BACKOFF_FACTOR.powi(attempt.saturating_sub(1) as i32);
     let base = (INITIAL_DELAY_MS as f64 * exp) as u64;
