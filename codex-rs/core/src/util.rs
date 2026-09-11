@@ -94,17 +94,9 @@ pub fn stream_retry_delay(err: &codex_protocol::error::CodexErr) -> Duration {
     if let Some(delay) = err.retry_delay() {
         return delay;
     }
-    match err.details() {
-        // Quota-class failures clear on a slower clock than capacity blips.
-        CodexErrorDetails::UsageLimitReached(_)
-        | CodexErrorDetails::QuotaExceeded
-        | CodexErrorDetails::UsageNotIncluded => QUOTA_RETRY_INTERVAL,
-        _ => STREAM_RETRY_INTERVAL,
-    }
+    let _ = CodexErrorDetails::ServerOverloaded;
+    STREAM_RETRY_INTERVAL
 }
-
-/// cmux fork: interval between retries of quota-class failures.
-pub const QUOTA_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 /// `"3/5"` for a bounded retry budget, `"3"` when retries are unlimited.
 pub fn retry_progress_label(retries: u64, max_retries: u64) -> String {

@@ -388,17 +388,18 @@ impl CodexErr {
             | CodexErrorDetails::AgentLimitReached { .. }
             | CodexErrorDetails::Spawn
             | CodexErrorDetails::SessionConfiguredNotFirstEvent
-            | CodexErrorDetails::CyberPolicy { .. }
-            | CodexErrorDetails::MisalignmentPolicyViolation { .. } => false,
-            // cmux fork: quota, usage-limit and credential-refresh failures are
-            // retried too. Behind the team router they resolve by account
-            // failover, and the user asked for a session that never stops.
-            CodexErrorDetails::Stream(..)
-            | CodexErrorDetails::ServerOverloaded
             | CodexErrorDetails::UsageLimitReached(_)
             | CodexErrorDetails::QuotaExceeded
             | CodexErrorDetails::UsageNotIncluded
             | CodexErrorDetails::RefreshTokenFailed(_)
+            | CodexErrorDetails::CyberPolicy { .. }
+            | CodexErrorDetails::MisalignmentPolicyViolation { .. } => false,
+            // cmux fork: capacity and transport failures retry forever.
+            // Quota-class failures stay terminal: a client cannot change
+            // accounts, only the team router can, and it reroutes before the
+            // client ever sees them.
+            CodexErrorDetails::Stream(..)
+            | CodexErrorDetails::ServerOverloaded
             | CodexErrorDetails::RateLimitExceeded(_)
             | CodexErrorDetails::Timeout
             | CodexErrorDetails::RequestTimeout
