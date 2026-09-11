@@ -1589,7 +1589,9 @@ async fn run_sampling_request(
                     if let Some(rate_limits) = rate_limits {
                         sess.update_rate_limits(&turn_context, *rate_limits).await;
                     }
-                    return Err(err);
+                    // cmux fork: fall through to the retry loop instead of
+                    // ending the turn.
+                    err
                 }
                 _ => err,
             },

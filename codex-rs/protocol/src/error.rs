@@ -376,12 +376,9 @@ impl CodexErr {
             | CodexErrorDetails::Interrupted
             | CodexErrorDetails::EnvVar(_)
             | CodexErrorDetails::Fatal(_)
-            | CodexErrorDetails::UsageNotIncluded
-            | CodexErrorDetails::QuotaExceeded
             | CodexErrorDetails::InvalidImageRequest()
             | CodexErrorDetails::InvalidRequest(_)
             | CodexErrorDetails::ToolCollision(_)
-            | CodexErrorDetails::RefreshTokenFailed(_)
             | CodexErrorDetails::UnsupportedOperation(_)
             | CodexErrorDetails::Sandbox(_)
             | CodexErrorDetails::LandlockSandboxExecutableNotProvided
@@ -391,11 +388,17 @@ impl CodexErr {
             | CodexErrorDetails::AgentLimitReached { .. }
             | CodexErrorDetails::Spawn
             | CodexErrorDetails::SessionConfiguredNotFirstEvent
-            | CodexErrorDetails::UsageLimitReached(_)
             | CodexErrorDetails::CyberPolicy { .. }
             | CodexErrorDetails::MisalignmentPolicyViolation { .. } => false,
+            // cmux fork: quota, usage-limit and credential-refresh failures are
+            // retried too. Behind the team router they resolve by account
+            // failover, and the user asked for a session that never stops.
             CodexErrorDetails::Stream(..)
             | CodexErrorDetails::ServerOverloaded
+            | CodexErrorDetails::UsageLimitReached(_)
+            | CodexErrorDetails::QuotaExceeded
+            | CodexErrorDetails::UsageNotIncluded
+            | CodexErrorDetails::RefreshTokenFailed(_)
             | CodexErrorDetails::RateLimitExceeded(_)
             | CodexErrorDetails::Timeout
             | CodexErrorDetails::RequestTimeout
