@@ -79,6 +79,7 @@ pub(crate) async fn handle_retryable_response_stream_error(
             .await;
         retry_state.connection_retries = retry_state.connection_retries.saturating_add(1);
         codex_client::record_retry!(retry_state.connection_retries, retry_delay, operation);
+        client_session.reset_connection_for_retry();
         tokio::time::sleep(retry_delay).await;
         retry_state.connection_retry_delay = retry_delay
             .saturating_mul(2)
@@ -115,6 +116,7 @@ pub(crate) async fn handle_retryable_response_stream_error(
         sess.notify_stream_error(turn_context, format!("Reconnecting... {label}"), err)
             .await;
         codex_client::record_retry!(retry_count, delay, operation);
+        client_session.reset_connection_for_retry();
         tokio::time::sleep(delay).await;
         return Ok(());
     }

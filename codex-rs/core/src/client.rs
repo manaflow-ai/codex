@@ -1985,6 +1985,15 @@ impl ModelClientSession {
     /// the HTTP transport.
     ///
     /// Returns `true` if this call activated fallback, or `false` if fallback was already active.
+    /// cmux fork: forget the live websocket and the sticky `x-codex-turn-state`
+    /// token so the next attempt dials a fresh connection with no routing pin.
+    /// A retry that reuses both lands on the same backend that just failed;
+    /// a fresh dial lets the load balancer place it anywhere.
+    pub(crate) fn reset_connection_for_retry(&mut self) {
+        self.websocket_session = WebsocketSession::default();
+        self.turn_state = Arc::new(OnceLock::new());
+    }
+
     pub(crate) fn try_switch_fallback_transport(
         &mut self,
         session_telemetry: &SessionTelemetry,

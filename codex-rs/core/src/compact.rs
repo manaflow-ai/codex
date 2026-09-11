@@ -331,6 +331,7 @@ async fn run_compact_task_inner_impl(
                 if retries < max_retries {
                     retries += 1;
                     let delay = stream_retry_delay(&e);
+                    client_session.reset_connection_for_retry();
                     let label = retry_progress_label(retries, max_retries);
                     sess.notify_stream_error(
                         turn_context.as_ref(),
