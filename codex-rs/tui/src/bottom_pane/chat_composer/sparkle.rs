@@ -53,17 +53,10 @@ impl Sparkle {
 
 impl BottomPane {
     pub(crate) fn set_astra_sparkle(&mut self, model: &str, settings: &Tui) {
-        let started = self
-            .composer
-            .astra_sparkle
-            .as_ref()
-            .map_or_else(Instant::now, |sparkle| sparkle.started);
-        self.composer.astra_sparkle = Some(Sparkle {
-            model: model.to_owned(),
-            whimsy: settings.whimsy,
-            animations: settings.animations,
-            started,
-        });
+        // The animated composer stars are disabled in the cmux build. Keep this
+        // setter as a no-op so model/settings updates cannot re-enable them.
+        let _ = (model, settings);
+        self.composer.astra_sparkle = None;
     }
 }
 

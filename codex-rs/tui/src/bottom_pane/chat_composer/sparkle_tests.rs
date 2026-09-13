@@ -149,7 +149,7 @@ fn stars_fade_using_the_custom_terminal_foreground() {
 }
 
 #[test]
-fn model_changes_and_disable_setting_control_sparkle() {
+fn astra_sparkle_is_disabled_for_all_models_and_settings() {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let mut pane = BottomPane::new(crate::bottom_pane::BottomPaneParams {
         app_event_tx: crate::app_event_sender::AppEventSender::new(tx),
@@ -172,58 +172,16 @@ fn model_changes_and_disable_setting_control_sparkle() {
                 animations: true,
                 ..Tui::default()
             };
-            pane.set_astra_sparkle("gpt-6-astra", &settings);
-            let started = pane
-                .composer
-                .astra_sparkle
-                .as_ref()
-                .map(|sparkle| sparkle.started);
-            for model in ["astra", "ASTRA-preview", "openai/astra-2026-09-01"] {
+            for model in ["gpt-6-astra", "astra", "ASTRA-preview", "gpt-5.6-sol"] {
                 pane.set_astra_sparkle(model, &settings);
-                assert_eq!(
-                    pane.composer
-                        .astra_sparkle
-                        .as_ref()
-                        .and_then(Sparkle::enabled_foreground),
-                    Some((230, 216, 255)),
-                );
-                assert_eq!(
-                    pane.composer
-                        .astra_sparkle
-                        .as_ref()
-                        .map(|sparkle| sparkle.started),
-                    started
-                );
-            }
-            for model in [
-                "gpt-5.6-sol",
-                "astral",
-                "castrated",
-                "astra2",
-                "astra_preview",
-            ] {
-                pane.set_astra_sparkle(model, &settings);
-                assert_eq!(
-                    pane.composer
-                        .astra_sparkle
-                        .as_ref()
-                        .and_then(Sparkle::enabled_foreground),
-                    None,
-                    "{model}",
-                );
+                assert!(pane.composer.astra_sparkle.is_none());
             }
             for (whimsy, animations) in [(false, true), (true, false), (false, false), (true, true)]
             {
                 settings.whimsy = whimsy;
                 settings.animations = animations;
                 pane.set_astra_sparkle("astra", &settings);
-                assert_eq!(
-                    pane.composer
-                        .astra_sparkle
-                        .as_ref()
-                        .and_then(Sparkle::enabled_foreground),
-                    (whimsy && animations).then_some((230, 216, 255)),
-                );
+                assert!(pane.composer.astra_sparkle.is_none());
             }
         },
     );
