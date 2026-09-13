@@ -49,7 +49,6 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TruncationPolicy;
-use codex_protocol::protocol::TurnStartedEvent;
 use codex_rollout_trace::CompactionCheckpointTracePayload;
 use codex_rollout_trace::InferenceTraceContext;
 use codex_utils_output_truncation::approx_token_count;
@@ -111,14 +110,7 @@ pub(crate) async fn run_remote_compact_task(
     let step_context = sess
         .capture_step_context(Arc::clone(&turn_context), &CancellationToken::new())
         .await?;
-    let start_event = EventMsg::TurnStarted(TurnStartedEvent {
-        turn_id: turn_context.sub_id.clone(),
-        trace_id: turn_context.trace_id.clone(),
-        started_at: turn_context.turn_timing_state.started_at_unix_secs().await,
-        model_context_window: turn_context.model_context_window(),
-        collaboration_mode_kind: turn_context.mode(),
-    });
-    sess.send_event(&turn_context, start_event).await;
+    sess.emit_turn_started(&turn_context).await;
 
     let compaction_metadata = CompactionTurnMetadata::new(
         CompactionTrigger::Manual,
@@ -208,10 +200,13 @@ async fn run_remote_compact_task_inner(
         Err(err) if matches!(err.details(), CodexErrorDetails::TurnAborted) => Err(err),
         Err(err) => {
             sess.track_turn_codex_error(turn_context, &err);
-            let event = EventMsg::Error(
-                err.to_error_event(Some("Error running remote compact task".to_string())),
-            );
-            sess.send_event(turn_context, event).await;
+            // Pre-turn failures are reported by run_turn after preserving the incoming prompt.
+            if !matches!(phase, CompactionPhase::PreTurn) {
+                let event = EventMsg::Error(
+                    err.to_error_event(Some("Error running remote compact task".to_string())),
+                );
+                sess.send_event(turn_context, event).await;
+            }
             Err(err)
         }
     }

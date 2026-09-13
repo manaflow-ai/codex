@@ -3,6 +3,7 @@
 use crate::GuardianAssessment;
 use codex_analytics::GuardianReviewFailureReason;
 use codex_protocol::protocol::CodexErrorInfo;
+use tokio::time::Instant;
 
 #[derive(Debug)]
 pub enum GuardianReviewOutcome {
@@ -12,12 +13,14 @@ pub enum GuardianReviewOutcome {
 
 #[derive(Debug)]
 pub enum GuardianReviewError {
+    InputBudgetExceeded,
     PromptBuild {
         message: String,
     },
     Session {
         message: String,
         error_info: Option<CodexErrorInfo>,
+        retry_at: Option<Instant>,
     },
     Parse {
         message: String,
@@ -37,13 +40,16 @@ impl GuardianReviewError {
         Self::Session {
             message: err.to_string(),
             error_info: None,
+            retry_at: None,
         }
     }
 
-    pub fn session_with_error_info(err: anyhow::Error, error_info: CodexErrorInfo) -> Self {
+    #[cfg(test)]
+    pub(crate) fn session_with_error_info(err: anyhow::Error, error_info: CodexErrorInfo) -> Self {
         Self::Session {
             message: err.to_string(),
             error_info: Some(error_info),
+            retry_at: None,
         }
     }
 
@@ -56,7 +62,9 @@ impl GuardianReviewError {
     pub fn failure_reason(&self) -> GuardianReviewFailureReason {
         match self {
             Self::PromptBuild { .. } => GuardianReviewFailureReason::PromptBuildError,
-            Self::Session { .. } => GuardianReviewFailureReason::SessionError,
+            Self::Session { .. } | Self::InputBudgetExceeded => {
+                GuardianReviewFailureReason::SessionError
+            }
             Self::Parse { .. } => GuardianReviewFailureReason::ParseError,
             Self::Timeout => GuardianReviewFailureReason::Timeout,
             Self::Cancelled => GuardianReviewFailureReason::Cancelled,
@@ -68,9 +76,11 @@ impl GuardianReviewError {
 pub enum GuardianReviewSessionOutcome {
     Completed(anyhow::Result<Option<String>>),
     PromptBuildFailed(anyhow::Error),
+    InputBudgetExceeded,
     SessionFailed {
         error: anyhow::Error,
         error_info: Option<CodexErrorInfo>,
+        retry_at: Option<Instant>,
     },
     TimedOut,
     Aborted,
@@ -96,14 +106,18 @@ impl From<GuardianReviewSessionOutcome> for GuardianReviewOutcome {
             GuardianReviewSessionOutcome::PromptBuildFailed(error) => {
                 Self::Error(GuardianReviewError::prompt_build(error))
             }
-            GuardianReviewSessionOutcome::SessionFailed { error, error_info } => {
-                Self::Error(match error_info {
-                    Some(error_info) => {
-                        GuardianReviewError::session_with_error_info(error, error_info)
-                    }
-                    None => GuardianReviewError::session(error),
-                })
+            GuardianReviewSessionOutcome::InputBudgetExceeded => {
+                Self::Error(GuardianReviewError::InputBudgetExceeded)
             }
+            GuardianReviewSessionOutcome::SessionFailed {
+                error,
+                error_info,
+                retry_at,
+            } => Self::Error(GuardianReviewError::Session {
+                message: error.to_string(),
+                error_info,
+                retry_at,
+            }),
             GuardianReviewSessionOutcome::TimedOut => Self::Error(GuardianReviewError::Timeout),
             GuardianReviewSessionOutcome::Aborted => Self::Error(GuardianReviewError::Cancelled),
         }

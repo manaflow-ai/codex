@@ -69,6 +69,8 @@ mod transcript_composer;
 mod turn_submission;
 #[path = "tests/user_verification_routes_tests.rs"]
 mod user_verification_routes;
+#[path = "tests/worktree_background_terminals_tests.rs"]
+mod worktree_background_terminals_tests;
 
 use super::*;
 use crate::app_backtrack::BacktrackSelection;
@@ -135,6 +137,8 @@ use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadArchivedNotification;
+use codex_app_server_protocol::ThreadAttachmentOperation;
+use codex_app_server_protocol::ThreadAttachmentUpdatedNotification;
 use codex_app_server_protocol::ThreadClosedNotification;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadSettings;
@@ -396,6 +400,7 @@ async fn handle_mcp_inventory_result_respects_origin_thread() {
 
     app.handle_mcp_inventory_result(
         Ok(vec![McpServerStatus {
+            server_capabilities: None,
             tools_error: None,
             name: "docs".to_string(),
             runtime_status: None,
@@ -1976,7 +1981,8 @@ async fn archived_untracked_threads_do_not_appear_in_agent_picker() -> Result<()
         app.chat_widget.config_ref(),
     ))
     .await?;
-    let primary_thread_id = ThreadId::new();
+    let primary_thread_id =
+        ThreadId::from_string("00000000-0000-0000-0000-000000000123").expect("valid thread id");
     app.enqueue_primary_thread_session(
         test_thread_session(primary_thread_id, test_path_buf("/tmp/project")),
         Vec::new(),
@@ -1996,8 +2002,32 @@ async fn archived_untracked_threads_do_not_appear_in_agent_picker() -> Result<()
 
     assert!(!app.thread_event_channels.contains_key(&archived_thread_id));
 
+    let attachment_thread_id = ThreadId::new();
+    app.handle_app_server_event(
+        &app_server,
+        codex_app_server_client::AppServerEvent::ServerNotification(Box::new(
+            ServerNotification::ThreadAttachmentUpdated(ThreadAttachmentUpdatedNotification {
+                thread_id: attachment_thread_id.to_string(),
+                attachment_type: "pull_request".to_string(),
+                identity_key: r#"["github.com","openai","codex",123]"#.to_string(),
+                attachment_id: "attachment-1".to_string(),
+                operation: ThreadAttachmentOperation::Deleted,
+            }),
+        )),
+    )
+    .await;
+
+    assert!(
+        !app.thread_event_channels
+            .contains_key(&attachment_thread_id)
+    );
+
     Box::pin(app.open_agent_picker(&mut app_server)).await;
 
+    assert_app_snapshot!(
+        "untracked_thread_notifications_agent_picker",
+        render_bottom_popup(&app.chat_widget, /*width*/ 80)
+    );
     assert_eq!(
         app.agent_navigation.ordered_thread_ids(),
         vec![primary_thread_id]
@@ -5884,7 +5914,7 @@ async fn make_test_app() -> App {
         pending_realtime_transcript_replay: HashMap::new(),
         realtime_replay_order: VecDeque::new(),
         temporary_structured_requests: HashMap::new(),
-        pending_thread_titles: HashSet::new(),
+        pending_thread_titles: HashMap::new(),
         thread_event_listener_tasks: HashMap::new(),
         agent_navigation: AgentNavigationState::default(),
         pending_server_profiles: HashMap::new(),
@@ -5983,7 +6013,7 @@ pub(super) async fn make_test_app_with_channels() -> (
             pending_realtime_transcript_replay: HashMap::new(),
             realtime_replay_order: VecDeque::new(),
             temporary_structured_requests: HashMap::new(),
-            pending_thread_titles: HashSet::new(),
+            pending_thread_titles: HashMap::new(),
             thread_event_listener_tasks: HashMap::new(),
             agent_navigation: AgentNavigationState::default(),
             pending_server_profiles: HashMap::new(),
@@ -7602,9 +7632,8 @@ async fn remote_resume_keeps_server_only_cwd_out_of_local_config() -> Result<()>
             auth_token: None,
         },
     };
-    let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config))
-        .await?
-        .with_remote_cwd_override(Some(remote_cwd.clone()));
+    app.harness_overrides.cwd = Some(remote_cwd.clone());
+    let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
     app_server
         .resume_thread(
             &crate::local_settings::LocalSettings::from(&app.config),
@@ -7639,7 +7668,7 @@ async fn remote_resume_keeps_server_only_cwd_out_of_local_config() -> Result<()>
         .await?;
 
     assert!(matches!(control, AppRunControl::Continue));
-    assert_eq!(app_server.remote_cwd_override(), Some(remote_cwd.as_path()));
+    assert_eq!(app.harness_overrides.cwd, Some(remote_cwd));
     assert!(!crate::session_resume::cwds_differ(
         app.config.cwd.as_path(),
         &local_cwd,
@@ -7688,6 +7717,20 @@ async fn in_app_resume_uses_configured_or_explicit_cwd() -> Result<()> {
             codex_home.join("config.toml"),
             format!("[tui]\nresume_cwd = \"{configured_mode}\"\n"),
         )?;
+        for cwd in [
+            &launch_cwd,
+            &active_cwd,
+            &session_cwd,
+            &explicit_cwd,
+            &runtime_cwd,
+        ] {
+            crate::legacy_core::config::set_project_trust_level(
+                &codex_home,
+                cwd,
+                codex_protocol::config_types::TrustLevel::Trusted,
+            )
+            .map_err(std::io::Error::other)?;
+        }
         let config = ConfigBuilder::default()
             .codex_home(codex_home.clone())
             .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
@@ -7816,6 +7859,12 @@ async fn remembered_current_cwd_stays_at_launch_across_in_app_resumes() -> Resul
     std::fs::create_dir_all(&active_cwd)?;
     std::fs::create_dir_all(&first_session_cwd)?;
     std::fs::create_dir_all(&second_session_cwd)?;
+    crate::legacy_core::config::set_project_trust_level(
+        &codex_home,
+        &launch_cwd,
+        codex_protocol::config_types::TrustLevel::Trusted,
+    )
+    .map_err(std::io::Error::other)?;
     let config = ConfigBuilder::default()
         .codex_home(codex_home.clone())
         .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
@@ -7955,6 +8004,7 @@ async fn prompt_edit_forks_before_selected_prompt_and_preserves_source() -> Resu
         for item in [
             RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: turn_id.to_string(),
+                root_turn_id: None,
                 trace_id: None,
                 started_at: None,
                 model_context_window: None,
@@ -8658,6 +8708,7 @@ async fn override_turn_context_sends_thread_settings_update() {
         let thread_id = started.session.thread_id;
         let initial_model = started.session.model.clone();
         let initial_effort = started.session.reasoning_effort.clone();
+        let initial_personality = started.session.personality;
         app.enqueue_primary_thread_session(started.session, started.turns)
             .await
             .expect("primary thread should be registered");
@@ -8731,8 +8782,8 @@ async fn override_turn_context_sends_thread_settings_update() {
             collaboration_mode.settings.reasoning_effort
         );
         assert_eq!(
-            notification.thread_settings.personality,
-            Some(Personality::Pragmatic)
+            notification.thread_settings.personality, initial_personality,
+            "the Pragmatic turn override should not change personality"
         );
 
         app.handle_app_server_event(
@@ -8761,7 +8812,7 @@ async fn override_turn_context_sends_thread_settings_update() {
             updated_mode.settings.reasoning_effort,
             collaboration_mode.settings.reasoning_effort
         );
-        assert_eq!(updated_session.personality, Some(Personality::Pragmatic));
+        assert_eq!(updated_session.personality, initial_personality);
         assert_eq!(updated_session.service_tier, Some(service_tier));
         assert_eq!(updated_session.approval_policy, AskForApproval::OnRequest);
         assert_eq!(
@@ -9186,6 +9237,7 @@ async fn inactive_thread_settings_notification_updates_cached_collaboration_mode
     let notification = ThreadSettingsUpdatedNotification {
         thread_id: inactive_thread_id.to_string(),
         thread_settings: ThreadSettings {
+            disabled_plugin_ids: Vec::new(),
             cwd: test_absolute_path("/tmp/thread-settings"),
             approval_policy: AskForApproval::OnRequest,
             approvals_reviewer: codex_app_server_protocol::ApprovalsReviewer::AutoReview,

@@ -3,9 +3,11 @@
 //! Owns the main app run loop from app-server bootstrap through terminal shutdown. Startup input
 //! remains isolated from protected interactive requests until the initialized composer owns it.
 
+use super::agents_overview_view::AgentsOverviewFocus;
 use super::reconnect::ReconnectState;
 use super::*;
 use crate::session_start::SessionStartAction;
+use crate::session_start::SessionStartOutcome;
 use crate::session_start::cancel_session_start;
 use crate::session_start::complete_session_start;
 use crate::unarchive_prompt::run_unarchive_prompt;
@@ -53,7 +55,11 @@ pub(super) async fn prepare_fresh_startup_config(
             app_server.remote_cwd_override().unwrap_or(Path::new("."))
         }
     };
-    let defaults = super::new_session::read_new_session_defaults(app_server, defaults_cwd).await?;
+    let defaults = crate::config_update::read_effective_config_if_supported(
+        app_server.request_handle(),
+        defaults_cwd,
+    )
+    .await?;
     if let Some(defaults) = defaults.as_ref() {
         super::new_session::overlay_new_session_defaults(
             config,
@@ -122,7 +128,6 @@ impl App {
     pub(super) fn ready_for_terminal_color_probe(&self, has_pending_app_events: bool) -> bool {
         !has_pending_app_events
             && !self.chat_widget.has_active_view()
-            && !self.windows_sandbox.startup_world_writable_scan_pending
             && !self.startup_pending_protected_request
             && !self.has_queued_startup_protected_request()
             && !self.chat_widget.has_pending_protected_request()
@@ -370,7 +375,7 @@ impl App {
             &session_selection,
             SessionSelection::StartFresh | SessionSelection::Exit
         );
-        let start_in_agents_overview =
+        let mut start_in_agents_overview =
             matches!(&session_selection, SessionSelection::AgentsOverview);
         let mut read_only_thread = false;
         let (mut chat_widget, initial_started_thread) = match session_selection {
@@ -497,14 +502,15 @@ impl App {
                 };
                 let resumed = if read_only_thread {
                     match resumed {
-                        Ok(resumed) => resumed,
+                        Ok(resumed) => Some(resumed),
                         Err(err) => return shutdown_on_startup_error(app_server, err).await,
                     }
                 } else {
                     let action = SessionStartAction::Resume(model_settings);
-                    let Some(resumed) = complete_session_start(
+                    let resumed = complete_session_start(
                         &mut app_server,
                         &config,
+                        &app_server_target,
                         &target_session,
                         action,
                         resumed,
@@ -513,11 +519,14 @@ impl App {
                             run_unarchive_prompt(tui, target_session.thread_id, action).await
                         },
                     )
-                    .await?
-                    else {
-                        return Ok(cancel_session_start(app_server).await);
-                    };
-                    resumed
+                    .await?;
+                    match resumed {
+                        SessionStartOutcome::Started(started) => Some(*started),
+                        SessionStartOutcome::CommandCenter => None,
+                        SessionStartOutcome::Exit => {
+                            return Ok(cancel_session_start(app_server).await);
+                        }
+                    }
                 };
                 let init = crate::chatwidget::ChatWidgetInit {
                     local_settings: local_settings.clone(),
@@ -530,7 +539,8 @@ impl App {
                         initial_images.clone(),
                         // CLI prompt args are plain strings, so they don't provide element ranges.
                         Vec::new(),
-                    ),
+                    )
+                    .filter(|_| resumed.is_some()),
                     enhanced_keys_supported,
                     has_chatgpt_account,
                     requires_openai_auth,
@@ -547,7 +557,7 @@ impl App {
                         .clone(),
                     session_telemetry: session_telemetry.clone(),
                 };
-                (ChatWidget::new_with_app_event(init), Some(resumed))
+                (ChatWidget::new_with_app_event(init), resumed)
             }
             SessionSelection::Fork(target_session) => {
                 let explicit_permission_override =
@@ -593,9 +603,10 @@ impl App {
                     Err(err) => return shutdown_on_startup_error(app_server, err).await,
                 };
                 let action = SessionStartAction::Fork(permission_mode);
-                let Some(forked) = complete_session_start(
+                let forked = complete_session_start(
                     &mut app_server,
                     &config,
+                    &app_server_target,
                     &target_session,
                     action,
                     forked,
@@ -604,17 +615,23 @@ impl App {
                         run_unarchive_prompt(tui, target_session.thread_id, action).await
                     },
                 )
-                .await?
-                else {
-                    return Ok(cancel_session_start(app_server).await);
+                .await?;
+                let forked = match forked {
+                    SessionStartOutcome::Started(started) => Some(*started),
+                    SessionStartOutcome::CommandCenter => None,
+                    SessionStartOutcome::Exit => {
+                        return Ok(cancel_session_start(app_server).await);
+                    }
                 };
-                if let Some(worktree) = managed_worktree.as_ref()
-                    && let Err(err) = worktree.bind(forked.session.thread_id)
-                {
-                    return shutdown_on_startup_error(app_server, err).await;
-                }
-                if config.model_reasoning_effort.is_none() {
-                    config.model_reasoning_effort = forked.session.reasoning_effort.clone();
+                if let Some(forked) = &forked {
+                    if let Some(worktree) = managed_worktree.as_ref()
+                        && let Err(err) = worktree.bind(forked.session.thread_id)
+                    {
+                        return shutdown_on_startup_error(app_server, err).await;
+                    }
+                    if config.model_reasoning_effort.is_none() {
+                        config.model_reasoning_effort = forked.session.reasoning_effort.clone();
+                    }
                 }
                 let init = crate::chatwidget::ChatWidgetInit {
                     local_settings: local_settings.clone(),
@@ -627,7 +644,8 @@ impl App {
                         initial_images.clone(),
                         // CLI prompt args are plain strings, so they don't provide element ranges.
                         Vec::new(),
-                    ),
+                    )
+                    .filter(|_| forked.is_some()),
                     enhanced_keys_supported,
                     has_chatgpt_account,
                     requires_openai_auth,
@@ -644,9 +662,15 @@ impl App {
                         .clone(),
                     session_telemetry: session_telemetry.clone(),
                 };
-                (ChatWidget::new_with_app_event(init), Some(forked))
+                (ChatWidget::new_with_app_event(init), forked)
             }
         };
+        let startup_session_cancelled = initial_started_thread.is_none()
+            && !pending_startup_thread_start
+            && !start_in_agents_overview;
+        if startup_session_cancelled {
+            start_in_agents_overview = true;
+        }
         chat_widget.note_rendered_width(tui.terminal.last_known_screen_size.width);
         chat_widget.remote_connection = remote_connection;
         chat_widget.set_local_worktree_operations(!crate::uses_remote_workspace_or_environment(
@@ -658,9 +682,39 @@ impl App {
             AppServerTarget::LocalDaemon { .. }
         ));
         let thread_and_widget_ms = thread_and_widget_started_at.elapsed().as_millis();
-        chat_widget
-            .maybe_prompt_windows_sandbox_enable(should_prompt_windows_sandbox_nux_at_startup);
-
+        let windows_sandbox_host =
+            windows_sandbox_host(&app_server_target, environment_manager.as_ref());
+        chat_widget.windows_sandbox_host = windows_sandbox_host;
+        let windows_sandbox_host_is_local = windows_sandbox_host == WindowsSandboxHost::Local;
+        #[cfg(target_os = "windows")]
+        let sandbox_ready =
+            if windows_sandbox_host_is_local && chat_widget.required_elevated_windows_sandbox() {
+                windows_sandbox_ready(&mut app_server).await
+            } else {
+                false
+            };
+        #[cfg(not(target_os = "windows"))]
+        let sandbox_ready = false;
+        #[cfg(target_os = "windows")]
+        if sandbox_ready {
+            chat_widget.windows_sandbox_elevated_setup_complete = true;
+        }
+        chat_widget.maybe_prompt_windows_sandbox_enable(
+            should_prompt_windows_sandbox_nux_at_startup
+                && windows_sandbox_host_is_local
+                && !sandbox_ready,
+        );
+        #[cfg(target_os = "windows")]
+        if windows_sandbox_host == WindowsSandboxHost::Mixed
+            && should_prompt_windows_sandbox_nux_at_startup
+        {
+            app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+                history_cell::StartupWarningsCell::new(vec![
+                    "Windows sandbox setup is unavailable when local and remote executors are configured together."
+                        .to_string(),
+                ]),
+            )));
+        }
         let file_search = FileSearchManager::new(config.cwd.to_path_buf(), app_event_tx.clone());
         let runtime_keymap =
             RuntimeKeymap::from_config(&local_settings.tui.keymap).map_err(|err| {
@@ -731,7 +785,7 @@ See the Codex keymap documentation for supported actions and examples."
             pending_realtime_transcript_replay: HashMap::new(),
             realtime_replay_order: VecDeque::new(),
             temporary_structured_requests: HashMap::new(),
-            pending_thread_titles: HashSet::new(),
+            pending_thread_titles: HashMap::new(),
             thread_event_listener_tasks: HashMap::new(),
             agent_navigation: AgentNavigationState::default(),
             agents_overview: Default::default(),
@@ -781,7 +835,7 @@ See the Codex keymap documentation for supported actions and examples."
             );
         }
         if start_in_agents_overview {
-            app.open_agents_overview(&app_server);
+            app.open_agents_overview(&app_server, AgentsOverviewFocus::Composer);
         } else if !matches!(app.app_server_target, AppServerTarget::Embedded) {
             app.refresh_agents_overview_threads(&app_server);
         }
@@ -839,39 +893,6 @@ See the Codex keymap documentation for supported actions and examples."
         }
         let initial_session_ms = initial_session_started_at.elapsed().as_millis();
 
-        // On startup, if a managed filesystem sandbox is active, warn about
-        // world-writable dirs on Windows.
-        #[cfg(target_os = "windows")]
-        {
-            let startup_permission_profile = app.config.permissions.effective_permission_profile();
-            let should_check = crate::windows_sandbox::level_from_config(&app.config)
-                != WindowsSandboxLevel::Disabled
-                && managed_filesystem_sandbox_is_restricted(&startup_permission_profile)
-                && !app
-                    .local_settings
-                    .notices
-                    .hide_world_writable_warning
-                    .unwrap_or(false);
-            if should_check {
-                app.windows_sandbox.startup_world_writable_scan_pending = true;
-                let cwd = app.config.cwd.clone();
-                let workspace_roots = app.config.effective_workspace_roots();
-                let env_map: std::collections::HashMap<String, String> = std::env::vars().collect();
-                let tx = app.app_event_tx.clone();
-                let logs_base_dir = app.config.codex_home.clone();
-                Self::spawn_world_writable_scan(
-                    cwd,
-                    workspace_roots,
-                    env_map,
-                    logs_base_dir,
-                    startup_permission_profile,
-                    app.session_telemetry.clone(),
-                    tx,
-                    /*startup_scan*/ true,
-                );
-            }
-        }
-
         if let Err(err) = startup_draft.flush_pending_events(tui).await {
             return shutdown_on_startup_error(app_server, err).await;
         }
@@ -891,7 +912,9 @@ See the Codex keymap documentation for supported actions and examples."
         {
             return shutdown_on_startup_error(app_server, err).await;
         }
-        let mut pending_startup_draft = Some(startup_draft.into_draft());
+        // Input for the cancelled resume/fork must not appear in a later selected session.
+        let mut pending_startup_draft =
+            (!startup_session_cancelled).then(|| startup_draft.into_draft());
         if app_event_rx.is_empty() && !app.has_queued_startup_protected_request() {
             app.chat_widget
                 .restore_startup_draft_when_ready(&mut pending_startup_draft);

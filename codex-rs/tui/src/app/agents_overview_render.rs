@@ -25,6 +25,9 @@ impl AgentsOverviewView {
                     &self.agents_keymap.new_task,
                     &self.agents_keymap.rename,
                     &self.agents_keymap.stop,
+                    &self.agents_keymap.archive,
+                    &self.agents_keymap.delete,
+                    &self.agents_keymap.hide,
                     &self.agents_keymap.toggle_grouping,
                 ]
                 .into_iter()
@@ -46,15 +49,24 @@ impl AgentsOverviewView {
                 " "
             },
         );
-        let mut footer_spans = Vec::new();
+        let mut hints: Vec<Line<'static>> = Vec::new();
         if !navigation_hint.is_empty() {
-            footer_spans.extend([navigation_hint.bold(), " navigate  ".dim()]);
+            hints.push(vec![navigation_hint.bold(), " navigate".dim()].into());
         }
         let mut add_hint = |hint: Option<ShortcutHint>, label: &'static str, enabled: bool| {
             if let Some(hint) = hint {
                 let key = hint.display_label().replace(" + ", "+");
-                footer_spans.push(if enabled { key.bold() } else { key.dim() });
-                footer_spans.push(format!(" {label}  ").dim());
+                hints.push(
+                    vec![
+                        if enabled {
+                            key.bold()
+                        } else {
+                            key.bold().dim()
+                        },
+                        format!(" {label}").dim(),
+                    ]
+                    .into(),
+                );
             }
         };
         add_hint(
@@ -83,7 +95,11 @@ impl AgentsOverviewView {
         add_hint(
             self.agents_keymap
                 .primary_hint("toggle_grouping", &self.agents_keymap.toggle_grouping),
-            "group",
+            match self.state().grouping {
+                AgentsOverviewGrouping::Project => "group: project",
+                AgentsOverviewGrouping::Status => "group: status",
+                AgentsOverviewGrouping::Model => "group: model",
+            },
             true,
         );
         add_hint(
@@ -99,16 +115,40 @@ impl AgentsOverviewView {
             self.selected_row()
                 .is_some_and(|row| matches!(row.thread.status, ThreadStatus::Active { .. })),
         );
-        add_hint(list_hint(ListAction::Cancel), "back", true);
-        let mut footer_line: Line = footer_spans.into();
-        if footer_line.width() > usize::from(width) {
-            for span in &mut footer_line.spans {
-                if span.content.ends_with("  ") {
-                    span.content.to_mut().pop();
-                }
-            }
+        for (action, bindings) in [
+            ("hide", &self.agents_keymap.hide),
+            ("archive", &self.agents_keymap.archive),
+            ("delete", &self.agents_keymap.delete),
+        ] {
+            add_hint(
+                self.agents_keymap.primary_hint(action, bindings),
+                action,
+                self.selected_row().is_some(),
+            );
         }
-        crate::wrapping::word_wrap_lines([footer_line], usize::from(width))
+        add_hint(list_hint(ListAction::Cancel), "back", true);
+        let separator = if hints.iter().map(Line::width).sum::<usize>()
+            + hints.len().saturating_sub(1) * 2
+            <= usize::from(width)
+        {
+            "  "
+        } else {
+            " "
+        };
+        crate::footer_hint::wrap_hint_rows(hints, width, separator.len(), Line::width)
+            .into_iter()
+            .flat_map(|row| {
+                let mut line = Line::default();
+                for hint in row {
+                    if !line.spans.is_empty() {
+                        line.spans.push(separator.dim());
+                    }
+                    line.spans.extend(hint.spans);
+                }
+                // An individual custom chord may be wider than the entire terminal.
+                crate::wrapping::word_wrap_lines([line], usize::from(width.max(1)))
+            })
+            .collect()
     }
 }
 
@@ -188,6 +228,8 @@ impl Renderable for AgentsOverviewView {
         let attention = format!("{needs_you} need input");
         if let Some(notice) = self.state().connection_notice {
             Line::from(notice.cyan()).render(inset(summary), buf);
+        } else if self.state().refresh_failed {
+            Line::from("Error loading tasks".red()).render(inset(summary), buf);
         } else {
             Line::from(format!("{attention}   {working} working   {ready} ready").dim())
                 .render(inset(summary), buf);

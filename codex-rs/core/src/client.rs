@@ -11,6 +11,8 @@
 //! A [`ModelClientSession`] is created per turn and is used to stream one or more Responses API
 //! requests during that turn. It caches a Responses WebSocket connection (opened lazily) and stores
 //! per-turn state such as the `x-codex-turn-state` token used for sticky routing.
+//! Cached connections, incremental response state, and turn routing are discarded when auth
+//! ownership changes.
 //!
 //! WebSocket prewarm is a v2-only `response.create` with `generate=false`; it waits for completion
 //! so the next request can reuse the same connection and `previous_response_id`.
@@ -213,6 +215,7 @@ struct ModelClientState {
 /// share the same auth/provider setup flow.
 struct CurrentClientSetup {
     auth: Option<CodexAuth>,
+    auth_owner_generation: Option<u64>,
     api_provider: ApiProvider,
     api_auth: SharedAuthProvider,
     agent_identity_telemetry: Option<AgentIdentityTelemetry>,
@@ -276,6 +279,7 @@ pub struct ModelClientSession {
     /// This is a contract between the client and server: we receive it at turn start,
     /// keep sending it unchanged between turn requests (e.g., for retries, incremental
     /// appends, or continuation requests), and must not send it between different turns.
+    /// An auth ownership change clears it so the new owner gets fresh routing state.
     turn_state: Arc<OnceLock<String>>,
 }
 
@@ -289,6 +293,8 @@ struct LastResponse {
 struct WebsocketSession {
     connection: Option<ApiWebSocketConnection>,
     endpoint: Option<ResponsesEndpoint>,
+    /// Owner of the cached state, including before a connection is opened.
+    auth_owner_generation: Option<u64>,
     last_request: Option<ResponsesApiRequest>,
     last_response_rx: Option<oneshot::Receiver<LastResponse>>,
     last_response_from_untraced_warmup: bool,
@@ -502,20 +508,48 @@ impl ModelClient {
         responses_metadata.session_id.clone()
     }
 
+    // ChatGPT derives cache affinity from the Responses session-id header. Keep the
+    // actual session identity in turn metadata, hooks, and history/notes requests.
+    fn responses_session_id(&self, metadata: &CodexResponsesMetadata) -> String {
+        if self.state.session_source.is_non_root_agent() {
+            metadata.session_id.clone()
+        } else {
+            self.prompt_cache_key(metadata)
+        }
+    }
+
     /// Creates a fresh turn-scoped streaming session.
     ///
     /// This constructor does not perform network I/O itself; the session opens a websocket lazily
     /// when the first stream request is issued.
     pub fn new_session(&self) -> ModelClientSession {
+        let auth_owner_generation = self.auth_owner_generation();
+        let mut websocket_session = self.take_cached_websocket_session();
+        if websocket_session.auth_owner_generation != auth_owner_generation {
+            // Drop the old owner's cache before this turn can establish fresh routing state.
+            websocket_session = WebsocketSession {
+                auth_owner_generation,
+                ..Default::default()
+            };
+        }
         ModelClientSession {
             client: self.clone(),
-            websocket_session: self.take_cached_websocket_session(),
+            websocket_session,
             turn_state: Arc::new(OnceLock::new()),
         }
     }
 
     pub(crate) fn auth_manager(&self) -> Option<Arc<AuthManager>> {
         self.state.provider.auth_manager()
+    }
+
+    fn auth_owner_generation(&self) -> Option<u64> {
+        self.auth_manager().map(|manager| {
+            manager
+                .auth_change_state_receiver()
+                .borrow()
+                .owner_generation
+        })
     }
 
     fn take_cached_websocket_session(&self) -> WebsocketSession {
@@ -914,6 +948,9 @@ impl ModelClient {
     /// This centralizes setup used by both prewarm and normal request paths so they stay in
     /// lockstep when auth/provider resolution changes.
     async fn current_client_setup(&self) -> Result<CurrentClientSetup> {
+        // Capture before resolving credentials so an account switch during setup cannot label
+        // an old connection with the new owner's revision.
+        let auth_owner_generation = self.auth_owner_generation();
         let auth = self.state.provider.auth().await;
         let api_provider = self.state.provider.api_provider().await?;
         let resolved_auth = self
@@ -927,6 +964,7 @@ impl ModelClient {
             .await?;
         Ok(CurrentClientSetup {
             auth,
+            auth_owner_generation,
             api_provider,
             api_auth: resolved_auth.auth,
             agent_identity_telemetry: resolved_auth.agent_identity_telemetry,
@@ -1134,7 +1172,7 @@ impl ModelClient {
             headers.insert("x-client-request-id", header_value);
         }
         headers.extend(build_session_headers(
-            Some(responses_metadata.session_id.to_string()),
+            Some(self.responses_session_id(responses_metadata)),
             Some(responses_metadata.thread_id.to_string()),
         ));
         headers.extend(self.build_responses_compatibility_headers(responses_metadata));
@@ -1189,7 +1227,7 @@ impl ModelClientSession {
         use_responses_lite: bool,
     ) -> ApiResponsesOptions {
         ApiResponsesOptions {
-            session_id: Some(responses_metadata.session_id.to_string()),
+            session_id: Some(self.client.responses_session_id(responses_metadata)),
             thread_id: Some(responses_metadata.thread_id.to_string()),
             session_source: Some(self.client.state.session_source.clone()),
             extra_headers: {
@@ -1325,22 +1363,17 @@ impl ModelClientSession {
         let endpoint = self
             .client
             .responses_endpoint(client_setup.auth.as_ref(), &model_info.slug);
-        let connection = self
-            .client
-            .connect_websocket(
-                session_telemetry,
-                client_setup.api_provider,
-                client_setup.api_auth,
-                responses_metadata,
-                auth_context,
-                RequestRouteTelemetry::for_endpoint(endpoint.path()),
-                endpoint,
-            )
-            .await?;
-        self.websocket_session.connection = Some(connection);
-        self.websocket_session.endpoint = Some(endpoint);
-        self.websocket_session
-            .set_connection_reused(/*connection_reused*/ false);
+        self.websocket_connection(WebsocketConnectParams {
+            session_telemetry,
+            api_provider: client_setup.api_provider,
+            api_auth: client_setup.api_auth,
+            auth_owner_generation: client_setup.auth_owner_generation,
+            responses_metadata,
+            auth_context,
+            request_route_telemetry: RequestRouteTelemetry::for_endpoint(endpoint.path()),
+            endpoint,
+        })
+        .await?;
         Ok(())
     }
     /// Returns a websocket connection for this turn.
@@ -1364,6 +1397,7 @@ impl ModelClientSession {
             session_telemetry,
             api_provider,
             api_auth,
+            auth_owner_generation,
             responses_metadata,
             auth_context,
             request_route_telemetry,
@@ -1375,8 +1409,14 @@ impl ModelClientSession {
             }
             None => true,
         };
+        // Resolving an external auth provider can change ownership during client setup.
+        let owner_changed = self.websocket_session.auth_owner_generation != auth_owner_generation
+            || self.client.auth_owner_generation() != auth_owner_generation;
+        if owner_changed {
+            self.turn_state = Arc::new(OnceLock::new());
+        }
 
-        if needs_new {
+        if needs_new || owner_changed {
             self.reset_websocket_session();
             let new_conn = match self
                 .client
@@ -1401,6 +1441,7 @@ impl ModelClientSession {
             };
             self.websocket_session.connection = Some(new_conn);
             self.websocket_session.endpoint = Some(endpoint);
+            self.websocket_session.auth_owner_generation = auth_owner_generation;
             self.websocket_session
                 .set_connection_reused(/*connection_reused*/ false);
         } else {
@@ -1682,17 +1723,12 @@ impl ModelClientSession {
             } else {
                 session_telemetry_for_request(session_telemetry, &request)
             };
-            let mut client_metadata = self
-                .client
-                .build_ws_client_metadata(responses_metadata, model_info.use_responses_lite);
-            if let Some(turn_state) = self.turn_state.get() {
-                client_metadata.insert(X_CODEX_TURN_STATE_HEADER.to_string(), turn_state.clone());
-            }
             match self
                 .websocket_connection(WebsocketConnectParams {
                     session_telemetry,
                     api_provider: client_setup.api_provider,
                     api_auth: client_setup.api_auth,
+                    auth_owner_generation: client_setup.auth_owner_generation,
                     responses_metadata: &websocket_metadata,
                     auth_context: request_auth_context,
                     request_route_telemetry: RequestRouteTelemetry::for_endpoint(endpoint.path()),
@@ -1731,6 +1767,12 @@ impl ModelClientSession {
                 && crate::guardian::is_basic_session_source(&self.client.state.session_source)
             {
                 crate::guardian::observe_guardian_request(session_telemetry, &request);
+            }
+            let mut client_metadata = self
+                .client
+                .build_ws_client_metadata(responses_metadata, model_info.use_responses_lite);
+            if let Some(turn_state) = self.turn_state.get() {
+                client_metadata.insert(X_CODEX_TURN_STATE_HEADER.to_string(), turn_state.clone());
             }
             let (incremental_request, previous_response_id_from_untraced_warmup) =
                 self.prepare_websocket_request(&request);
@@ -2308,6 +2350,7 @@ struct WebsocketConnectParams<'a> {
     session_telemetry: &'a SessionTelemetry,
     api_provider: codex_api::Provider,
     api_auth: SharedAuthProvider,
+    auth_owner_generation: Option<u64>,
     responses_metadata: &'a CodexResponsesMetadata,
     auth_context: AuthRequestTelemetryContext,
     request_route_telemetry: RequestRouteTelemetry,

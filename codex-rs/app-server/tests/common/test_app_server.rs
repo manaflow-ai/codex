@@ -104,7 +104,6 @@ use codex_app_server_protocol::ThreadRealtimeListVoicesParams;
 use codex_app_server_protocol::ThreadRealtimeStartParams;
 use codex_app_server_protocol::ThreadRealtimeStopParams;
 use codex_app_server_protocol::ThreadResumeParams;
-use codex_app_server_protocol::ThreadRollbackParams;
 use codex_app_server_protocol::ThreadSearchOccurrencesParams;
 use codex_app_server_protocol::ThreadSearchParams;
 use codex_app_server_protocol::ThreadSectionMoveParams;
@@ -190,6 +189,21 @@ impl TestAppServer {
 
     pub async fn wait_for_exit(&mut self) -> std::io::Result<ExitStatus> {
         self.process.wait().await
+    }
+
+    #[cfg(unix)]
+    pub fn send_sigterm(&self) -> anyhow::Result<()> {
+        let pid = self.process.id().context("app-server has no pid")?;
+        let status = std::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status()?;
+        ensure!(status.success(), "failed to signal app-server: {status}");
+        Ok(())
+    }
+
+    /// Waits for output without consuming it, for transport backpressure tests.
+    pub async fn peek_stdout(&mut self) -> std::io::Result<&[u8]> {
+        self.stdout.fill_buf().await
     }
 
     /// Closes stdio and waits for app-server's graceful thread teardown to finish.
@@ -642,15 +656,6 @@ impl TestAppServer {
     ) -> anyhow::Result<i64> {
         let params = Some(serde_json::to_value(params)?);
         self.send_request("thread/shellCommand", params).await
-    }
-
-    /// Send a `thread/rollback` JSON-RPC request.
-    pub async fn send_thread_rollback_request(
-        &mut self,
-        params: ThreadRollbackParams,
-    ) -> anyhow::Result<i64> {
-        let params = Some(serde_json::to_value(params)?);
-        self.send_request("thread/rollback", params).await
     }
 
     /// Send a `thread/list` JSON-RPC request.

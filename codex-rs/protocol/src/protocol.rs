@@ -743,12 +743,6 @@ pub enum Op {
     /// model.
     SetThreadMemoryMode { mode: ThreadMemoryMode },
 
-    /// Request Codex to drop the last N user turns from in-memory context.
-    ///
-    /// This does not attempt to revert local filesystem changes. Clients are
-    /// responsible for undoing any edits on disk.
-    ThreadRollback { num_turns: u32 },
-
     /// Request a code review from the agent.
     Review { review_request: ReviewRequest },
 
@@ -962,7 +956,6 @@ impl Op {
             Self::ReloadUserConfig => "reload_user_config",
             Self::Compact => "compact",
             Self::SetThreadMemoryMode { .. } => "set_thread_memory_mode",
-            Self::ThreadRollback { .. } => "thread_rollback",
             Self::Review { .. } => "review",
             Self::ApproveGuardianDeniedAction { .. } => "approve_guardian_denied_action",
             Self::Shutdown => "shutdown",
@@ -1405,7 +1398,8 @@ pub enum EventMsg {
     /// Conversation history was compacted (either automatically or manually).
     ContextCompacted(ContextCompactedEvent),
 
-    /// Conversation history was rolled back by dropping the last N user turns.
+    /// Legacy persisted marker for dropping the last N user turns.
+    /// Retained for replay of existing rollouts; live rollback operations are unsupported.
     ThreadRolledBack(ThreadRolledBackEvent),
 
     /// Agent has started a turn.
@@ -1888,6 +1882,7 @@ pub enum CodexErrorInfo {
     ActiveTurnNotSteerable {
         turn_kind: NonSteerableTurnKind,
     },
+    // Retained to deserialize errors recorded in legacy rollouts.
     ThreadRollbackFailed,
     Other,
 }
@@ -2174,6 +2169,10 @@ pub struct TurnCompleteEvent {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct TurnStartedEvent {
     pub turn_id: String,
+    /// ID of the originating turn in the root thread; equals `turn_id` for root turns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub root_turn_id: Option<String>,
     // Persist for rollout consumers that correlate turns with telemetry traces.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -2613,6 +2612,9 @@ pub struct McpInvocation {
 pub struct McpToolCallBeginEvent {
     /// Identifier so this can be paired with the McpToolCallEnd event.
     pub call_id: String,
+    /// Originating turn; absent in older rollout records.
+    #[serde(default)]
+    pub turn_id: String,
     pub invocation: McpInvocation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -2642,6 +2644,9 @@ pub struct McpToolCallBeginEvent {
 pub struct McpToolCallEndEvent {
     /// Identifier for the corresponding McpToolCallBegin that finished.
     pub call_id: String,
+    /// Originating turn; absent in older rollout records.
+    #[serde(default)]
+    pub turn_id: String,
     pub invocation: McpInvocation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -4469,6 +4474,16 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn old_turn_started_records_have_no_root_attribution() {
+        let event: TurnStartedEvent = serde_json::from_value(serde_json::json!({
+            "turn_id": "old-turn",
+            "model_context_window": null
+        }))
+        .unwrap();
+        assert_eq!(event.root_turn_id, None);
+    }
+
+    #[test]
     fn review_decision_denied_round_trip() -> Result<()> {
         let decision = ReviewDecision::Denied {
             rejection: "denied reason".to_string(),
@@ -5347,6 +5362,7 @@ mod tests {
         assert_eq!(legacy_events.len(), 1);
         match &legacy_events[0] {
             EventMsg::McpToolCallBegin(event) => {
+                assert_eq!(event.turn_id, "turn-1");
                 assert_eq!(event.call_id, "mcp-1");
                 assert_eq!(event.invocation.server, "server");
                 assert_eq!(event.invocation.tool, "tool");
@@ -5472,6 +5488,7 @@ mod tests {
         assert_eq!(legacy_events.len(), 1);
         match &legacy_events[0] {
             EventMsg::McpToolCallEnd(event) => {
+                assert_eq!(event.turn_id, "turn-1");
                 assert_eq!(event.call_id, "mcp-1");
                 assert_eq!(event.invocation.server, "server");
                 assert_eq!(event.invocation.tool, "tool");

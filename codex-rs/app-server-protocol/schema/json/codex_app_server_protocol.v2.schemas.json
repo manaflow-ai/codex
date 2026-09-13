@@ -2029,6 +2029,78 @@
             },
             "method": {
               "enum": [
+                "thread/attachment/add"
+              ],
+              "title": "Thread/attachment/addRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/ThreadAttachmentAddParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Thread/attachment/addRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/RequestId"
+            },
+            "method": {
+              "enum": [
+                "thread/attachment/list"
+              ],
+              "title": "Thread/attachment/listRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/ThreadAttachmentListParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Thread/attachment/listRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/RequestId"
+            },
+            "method": {
+              "enum": [
+                "thread/attachment/remove"
+              ],
+              "title": "Thread/attachment/removeRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/ThreadAttachmentRemoveParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Thread/attachment/removeRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/RequestId"
+            },
+            "method": {
+              "enum": [
                 "thread/section/move"
               ],
               "title": "Thread/section/moveRequestMethod",
@@ -2140,30 +2212,6 @@
             "params"
           ],
           "title": "Thread/approveGuardianDeniedActionRequest",
-          "type": "object"
-        },
-        {
-          "properties": {
-            "id": {
-              "$ref": "#/definitions/RequestId"
-            },
-            "method": {
-              "enum": [
-                "thread/rollback"
-              ],
-              "title": "Thread/rollbackRequestMethod",
-              "type": "string"
-            },
-            "params": {
-              "$ref": "#/definitions/ThreadRollbackParams"
-            }
-          },
-          "required": [
-            "id",
-            "method",
-            "params"
-          ],
-          "title": "Thread/rollbackRequest",
           "type": "object"
         },
         {
@@ -5802,6 +5850,21 @@
         "modelCatalogJson": {
           "type": [
             "string",
+            "null"
+          ]
+        },
+        "modelProvider": {
+          "description": "Exact provider selection required by managed policy.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "modelProviders": {
+          "additionalProperties": true,
+          "description": "Complete required provider definitions, using config.toml field names.",
+          "type": [
+            "object",
             "null"
           ]
         },
@@ -10652,6 +10715,9 @@
           ],
           "description": "Current thread-runtime connection state; null when unavailable or the configuration changed."
         },
+        "serverCapabilities": {
+          "description": "Capabilities advertised by the initialized MCP server; null when unavailable."
+        },
         "serverInfo": {
           "anyOf": [
             {
@@ -11072,6 +11138,18 @@
             }
           ]
         },
+        "availableAccessPrograms": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ModelAccessPrograms"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Null when the catalog does not provide access-program metadata."
+        },
         "defaultReasoningEffort": {
           "$ref": "#/definitions/ReasoningEffort"
         },
@@ -11172,6 +11250,22 @@
         "isDefault",
         "model",
         "supportedReasoningEfforts"
+      ],
+      "type": "object"
+    },
+    "ModelAccessPrograms": {
+      "description": "Caller-specific explicit access programs advertised by model discovery.",
+      "properties": {
+        "cyber": {
+          "description": "Accepted explicit selections.",
+          "items": {
+            "$ref": "#/definitions/CyberAccessProgram"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "cyber"
       ],
       "type": "object"
     },
@@ -15823,6 +15917,26 @@
           "properties": {
             "method": {
               "enum": [
+                "thread/attachment/updated"
+              ],
+              "title": "Thread/attachment/updatedNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/ThreadAttachmentUpdatedNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Thread/attachment/updatedNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
                 "thread/goal/updated"
               ],
               "title": "Thread/goal/updatedNotificationMethod",
@@ -18178,7 +18292,7 @@
           "description": "Optional analytics source classification for this thread."
         },
         "turns": {
-          "description": "Only populated on `thread/resume`, `thread/rollback`, `thread/fork`, and `thread/read` (when `includeTurns` is true) responses. For all other responses and notifications returning a Thread, the turns field will be an empty list.",
+          "description": "Only populated on `thread/resume`, `thread/fork`, and `thread/read` (when `includeTurns` is true) responses. For all other responses and notifications returning a Thread, the turns field will be an empty list.",
           "items": {
             "$ref": "#/definitions/Turn"
           },
@@ -18265,6 +18379,200 @@
         "threadId"
       ],
       "title": "ThreadArchivedNotification",
+      "type": "object"
+    },
+    "ThreadAttachment": {
+      "description": "An independently persisted attachment associated with a thread.",
+      "properties": {
+        "attachmentType": {
+          "type": "string"
+        },
+        "createdAt": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "identityKey": {
+          "type": "string"
+        },
+        "payload": true
+      },
+      "required": [
+        "attachmentType",
+        "createdAt",
+        "id",
+        "identityKey",
+        "payload"
+      ],
+      "type": "object"
+    },
+    "ThreadAttachmentAddOutcome": {
+      "description": "Result of attempting to associate an attachment with a thread.",
+      "enum": [
+        "created",
+        "existing"
+      ],
+      "type": "string"
+    },
+    "ThreadAttachmentAddParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Parameters for creating or locating an attachment on its owning thread.",
+      "properties": {
+        "attachmentType": {
+          "type": "string"
+        },
+        "identityKey": {
+          "type": "string"
+        },
+        "payload": true,
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "attachmentType",
+        "identityKey",
+        "payload",
+        "threadId"
+      ],
+      "title": "ThreadAttachmentAddParams",
+      "type": "object"
+    },
+    "ThreadAttachmentAddResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "The created or existing attachment.",
+      "properties": {
+        "attachment": {
+          "$ref": "#/definitions/ThreadAttachment"
+        },
+        "outcome": {
+          "$ref": "#/definitions/ThreadAttachmentAddOutcome"
+        }
+      },
+      "required": [
+        "attachment",
+        "outcome"
+      ],
+      "title": "ThreadAttachmentAddResponse",
+      "type": "object"
+    },
+    "ThreadAttachmentListParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Parameters for listing attachments from one thread.",
+      "properties": {
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "threadId"
+      ],
+      "title": "ThreadAttachmentListParams",
+      "type": "object"
+    },
+    "ThreadAttachmentListResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "One page of attachments associated with the requested thread.",
+      "properties": {
+        "data": {
+          "items": {
+            "$ref": "#/definitions/ThreadAttachment"
+          },
+          "type": "array"
+        },
+        "nextCursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "data"
+      ],
+      "title": "ThreadAttachmentListResponse",
+      "type": "object"
+    },
+    "ThreadAttachmentOperation": {
+      "description": "The persisted attachment change represented by a notification.",
+      "enum": [
+        "created",
+        "deleted"
+      ],
+      "type": "string"
+    },
+    "ThreadAttachmentRemoveParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Parameters for deleting an attachment by its stable thread-local identity.",
+      "properties": {
+        "attachmentType": {
+          "type": "string"
+        },
+        "identityKey": {
+          "type": "string"
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "attachmentType",
+        "identityKey",
+        "threadId"
+      ],
+      "title": "ThreadAttachmentRemoveParams",
+      "type": "object"
+    },
+    "ThreadAttachmentRemoveResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Successful deletion does not return additional attachment data.",
+      "title": "ThreadAttachmentRemoveResponse",
+      "type": "object"
+    },
+    "ThreadAttachmentUpdatedNotification": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Notification published after a thread attachment is created or deleted.",
+      "properties": {
+        "attachmentId": {
+          "type": "string"
+        },
+        "attachmentType": {
+          "type": "string"
+        },
+        "identityKey": {
+          "type": "string"
+        },
+        "operation": {
+          "$ref": "#/definitions/ThreadAttachmentOperation"
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "attachmentId",
+        "attachmentType",
+        "identityKey",
+        "operation",
+        "threadId"
+      ],
+      "title": "ThreadAttachmentUpdatedNotification",
       "type": "object"
     },
     "ThreadClosedNotification": {
@@ -18486,6 +18794,14 @@
         },
         "cwd": {
           "$ref": "#/definitions/AbsolutePathBuf"
+        },
+        "disabledPluginIds": {
+          "default": [],
+          "description": "Saved list of disabled plugin IDs. Does not yet filter plugin capabilities.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         },
         "instructionSources": {
           "default": [],
@@ -20735,6 +21051,14 @@
         "cwd": {
           "$ref": "#/definitions/AbsolutePathBuf"
         },
+        "disabledPluginIds": {
+          "default": [],
+          "description": "Saved list of disabled plugin IDs. Does not yet filter plugin capabilities.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "instructionSources": {
           "default": [],
           "description": "Environment-native paths to instruction source files currently loaded for this thread.",
@@ -20867,45 +21191,6 @@
         "threadId"
       ],
       "title": "ThreadRevertedNotification",
-      "type": "object"
-    },
-    "ThreadRollbackParams": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "description": "DEPRECATED: `thread/rollback` will be removed soon.",
-      "properties": {
-        "numTurns": {
-          "description": "The number of turns to drop from the end of the thread. Must be >= 1.\n\nThis only modifies the thread's history and does not revert local file changes that have been made by the agent. Clients are responsible for reverting these changes.",
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "threadId": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "numTurns",
-        "threadId"
-      ],
-      "title": "ThreadRollbackParams",
-      "type": "object"
-    },
-    "ThreadRollbackResponse": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "properties": {
-        "thread": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/Thread"
-            }
-          ],
-          "description": "The updated thread after applying the rollback, with `turns` populated.\n\nThe ThreadItems stored in each Turn are lossy since we explicitly do not persist all agent interactions, such as command executions. This is the same behavior as `thread/resume`."
-        }
-      },
-      "required": [
-        "thread"
-      ],
-      "title": "ThreadRollbackResponse",
       "type": "object"
     },
     "ThreadSearchResult": {
@@ -21214,6 +21499,14 @@
         "cwd": {
           "$ref": "#/definitions/AbsolutePathBuf"
         },
+        "disabledPluginIds": {
+          "default": [],
+          "description": "Saved list of disabled plugin IDs. Does not yet filter plugin capabilities.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "effort": {
           "anyOf": [
             {
@@ -21486,6 +21779,14 @@
         },
         "cwd": {
           "$ref": "#/definitions/AbsolutePathBuf"
+        },
+        "disabledPluginIds": {
+          "default": [],
+          "description": "Saved list of disabled plugin IDs. Does not yet filter plugin capabilities.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         },
         "instructionSources": {
           "default": [],
@@ -22514,6 +22815,16 @@
           "description": "Override the working directory for this turn and subsequent turns.",
           "type": [
             "string",
+            "null"
+          ]
+        },
+        "disabledPluginIds": {
+          "description": "Replace this thread's disabled plugin IDs. Omitted/null preserves the list; [] clears it.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
             "null"
           ]
         },

@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 fn required_context(text: String) -> ComposedContext {
     let action = PlannedAction {
+        tool_descriptions: None,
         json: text,
         kind: PlannedActionKind::Command,
         reason: None,
@@ -127,7 +128,11 @@ async fn finalization_overflow_marks_the_reviewer_exhausted() {
         .thread_extension_data
         .insert(PendingReviewContext(context));
 
-    assert!(finalize(&session, &step, &mut input).await.is_err());
+    assert!(
+        finalize(&session, &step, &mut input, HistoryTruncation::Preserve)
+            .await
+            .is_err()
+    );
     assert!(
         session
             .services

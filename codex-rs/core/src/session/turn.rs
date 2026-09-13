@@ -188,15 +188,16 @@ pub(crate) async fn run_turn(
     )
     .await
     {
+        // Compaction runs before the new input is recorded, so preserve it on every failure.
+        run_hooks_and_record_inputs(
+            &sess,
+            &turn_context,
+            &turn_context.capture_current_model_info(),
+            &input,
+            PersistContext::Standard,
+        )
+        .await;
         if matches!(err.details(), CodexErrorDetails::TurnAborted) {
-            run_hooks_and_record_inputs(
-                &sess,
-                &turn_context,
-                &turn_context.capture_current_model_info(),
-                &input,
-                PersistContext::Standard,
-            )
-            .await;
             return Err(err);
         }
         if matches!(err.details(), CodexErrorDetails::ToolCollision(_)) {
@@ -205,6 +206,17 @@ pub(crate) async fn run_turn(
         let error = err.to_codex_protocol_error();
         sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
             .await;
+        // Publish the failure only after prompt hooks finish, so clients cannot react to
+        // an error by steering follow-up input into a turn still preserving its prompt.
+        let message_prefix = match turn_context.provider.capabilities().remote_compaction {
+            RemoteCompactionSupport::V2 => Some("Error running remote compact task".to_string()),
+            RemoteCompactionSupport::Unsupported => None,
+        };
+        sess.send_event(
+            turn_context.as_ref(),
+            EventMsg::Error(err.to_error_event(message_prefix)),
+        )
+        .await;
         error!("Failed to run pre-sampling compact");
         return Ok(None);
     }
@@ -309,8 +321,13 @@ pub(crate) async fn run_turn(
         return Ok(None);
     }
     if crate::guardian::is_basic_session_source(&turn_context.session_source)
-        && let Err(error) =
-            crate::guardian::finalize_guardian_input(&sess, &first_step_context, &mut input).await
+        && let Err(error) = crate::guardian::finalize_guardian_input(
+            &sess,
+            &first_step_context,
+            &mut input,
+            codex_guardian_context::HistoryTruncation::Preserve,
+        )
+        .await
     {
         // Token-budget compaction resets history, which can discard the evidence
         // referenced by a pending delta review. Leave budget failures unreusable.
@@ -321,6 +338,9 @@ pub(crate) async fn run_turn(
         }
         // Incoming evidence can overflow even below the normal history
         // threshold. Keep it pending while compacting, then select once more.
+        sess.services
+            .thread_extension_data
+            .insert(crate::guardian::ExhaustedReviewBudget::Compacting);
         run_auto_compact(
             &sess,
             Arc::clone(&first_step_context),
@@ -334,7 +354,13 @@ pub(crate) async fn run_turn(
         world_state = sess
             .record_context_updates_and_set_reference_context_item(first_step_context.as_ref())
             .await?;
-        crate::guardian::finalize_guardian_input(&sess, &first_step_context, &mut input).await?;
+        crate::guardian::finalize_guardian_input(
+            &sess,
+            &first_step_context,
+            &mut input,
+            codex_guardian_context::HistoryTruncation::Allow,
+        )
+        .await?;
     }
     let mut can_drain_pending_input = input.is_empty();
     if run_hooks_and_record_inputs(
@@ -477,7 +503,7 @@ pub(crate) async fn run_turn(
                 .record_step_world_state_if_changed(&world_state, step_context.as_ref())
                 .await?;
 
-            // Keep the override after accepted input so ordinary turn rollback removes it too.
+            // Keep the override after accepted input so history truncation removes them together.
             sess.record_reasoning_effort_override(step_context.as_ref())
                 .await;
 
@@ -692,6 +718,9 @@ pub(crate) async fn run_turn(
                 // token-budget resets must fail closed and retire the reviewer.
                 // Retry once per model step, so ineffective compaction cannot loop.
                 guardian_budget_compacted = true;
+                sess.services
+                    .thread_extension_data
+                    .insert(crate::guardian::ExhaustedReviewBudget::Compacting);
                 run_auto_compact(
                     &sess,
                     Arc::clone(&step_context),
@@ -849,7 +878,8 @@ async fn required_mcp_servers_for_input(
         .services
         .plugins_manager
         .plugins_for_config(&turn_context.config.plugins_config_input())
-        .await;
+        .await
+        .without_plugins(&turn_context.disabled_plugin_ids);
     let current_config = sess.services.mcp_runtime.current_config();
     let mentioned_plugins =
         collect_explicit_plugin_mentions(user_input, loaded_plugins.capability_summaries());
@@ -1632,7 +1662,8 @@ pub(crate) async fn prepare_tool_recommendations(
         .plugins_manager
         .plugins_for_config(&turn_context.config.plugins_config_input())
         .instrument(trace_span!("built_tools.load_plugins"))
-        .await;
+        .await
+        .without_plugins(&turn_context.disabled_plugin_ids);
     let tool_suggest_is_enabled = tool_suggest_enabled(turn_context);
     let auth = if tool_suggest_is_enabled {
         sess.services.auth_manager.auth().await
@@ -2780,7 +2811,11 @@ async fn try_run_sampling_request(
                 )
                 .await;
                 let budget_result = sess
-                    .record_token_usage_info(&turn_context, token_usage.as_ref())
+                    .record_token_usage_info(
+                        &turn_context,
+                        &step_context.settings,
+                        token_usage.as_ref(),
+                    )
                     .await;
                 should_emit_token_count = true;
                 should_emit_turn_diff = true;

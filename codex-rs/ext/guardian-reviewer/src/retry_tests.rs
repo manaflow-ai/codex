@@ -72,6 +72,10 @@ fn guardian_review_retry_only_retries_transient_session_and_parse_errors() {
     outcomes.extend([
         (GuardianReviewOutcome::Completed(assessment), false),
         (
+            GuardianReviewOutcome::Error(GuardianReviewError::InputBudgetExceeded),
+            false,
+        ),
+        (
             GuardianReviewOutcome::Error(GuardianReviewError::prompt_build(anyhow::anyhow!(
                 "prompt"
             ))),
@@ -114,6 +118,7 @@ async fn guardian_review_retry_wait_honors_cancellation() {
 
     let error = wait_before_guardian_retry(
         /*attempt_count*/ 1,
+        /*retry_not_before*/ None,
         Instant::now() + Duration::from_secs(/*secs*/ 1),
         Some(&cancel_token),
     )
@@ -126,6 +131,7 @@ async fn guardian_review_retry_wait_honors_cancellation() {
 async fn guardian_review_retry_wait_honors_deadline() {
     let error = wait_before_guardian_retry(
         /*attempt_count*/ 1,
+        /*retry_not_before*/ None,
         Instant::now(),
         /*external_cancel*/ None,
     )

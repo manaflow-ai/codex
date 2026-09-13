@@ -16,7 +16,9 @@ use codex_guardian_context::SectionInput;
 use codex_guardian_context::default_registry;
 use codex_protocol::models::ResponseItem;
 
+use crate::context::ContextualUserFragment;
 use crate::context::GuardianReviewEvidence;
+use crate::context::GuardianToolDescriptions;
 use crate::context::NodeReplReviewEvidence;
 use crate::context::NodeReplReviewEvidenceMode;
 use crate::context::node_repl_review_evidence_mode;
@@ -40,7 +42,6 @@ pub(crate) struct GuardianPromptItems {
     pub(crate) context: ComposedContext,
     pub(crate) transcript_cursor: GuardianTranscriptCursor,
     pub(crate) node_repl_evidence_sequence: u64,
-    pub(crate) reviewed_action_truncated: bool,
 }
 
 /// Points to the end of the transcript that the guardian has already reviewed.
@@ -118,7 +119,21 @@ pub(crate) async fn build_guardian_prompt_items_with_parent_turn(
         .fragments;
     let planned_action_json = format_guardian_action_pretty(&request)?;
     let planned_action = PlannedAction {
-        json: planned_action_json.text,
+        json: planned_action_json,
+        tool_descriptions: if let GuardianApprovalRequest::McpToolCall {
+            tool_description,
+            connector_description,
+            ..
+        } = &request
+        {
+            GuardianToolDescriptions::new(
+                tool_description.as_deref(),
+                connector_description.as_deref(),
+            )
+            .map(|descriptions| descriptions.render())
+        } else {
+            None
+        },
         kind: match &request {
             GuardianApprovalRequest::NetworkAccess { trigger, .. } => PlannedActionKind::Network {
                 has_trigger: trigger.is_some(),
@@ -218,7 +233,6 @@ pub(crate) async fn build_guardian_prompt_items_with_parent_turn(
         context,
         transcript_cursor,
         node_repl_evidence_sequence,
-        reviewed_action_truncated: planned_action_json.truncated,
     })
 }
 
@@ -345,7 +359,6 @@ pub(crate) fn guardian_truncate_text(content: &str, token_cap: usize) -> (String
 }
 
 use codex_guardian_reviewer::guardian_output_contract_prompt;
-pub(super) use codex_guardian_reviewer::parse_guardian_assessment;
 
 pub(crate) const BUNDLED_GUARDIAN_POLICY: &str = include_str!("../../assets/guardian/policy.md");
 pub(crate) const BUNDLED_GUARDIAN_POLICY_TEMPLATE: &str =

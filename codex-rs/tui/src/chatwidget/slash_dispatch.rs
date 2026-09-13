@@ -227,7 +227,12 @@ impl ChatWidget {
                             ..Default::default()
                         },
                         SelectionItem {
-                            name: "Yes, delete and exit".to_string(),
+                            name: if self.remote_connection.is_some() {
+                                "Yes, delete and return to command center"
+                            } else {
+                                "Yes, delete and exit"
+                            }
+                            .to_string(),
                             description: Some("Permanently delete this session now".to_string()),
                             actions: vec![Box::new(|tx| {
                                 tx.send(AppEvent::DeleteCurrentThread);
@@ -308,10 +313,6 @@ impl ChatWidget {
             }
             SlashCommand::Model => {
                 self.open_model_popup();
-                self.defer_input_until_settings_applied();
-            }
-            SlashCommand::Personality => {
-                self.open_personality_popup();
                 self.defer_input_until_settings_applied();
             }
             SlashCommand::Plan => {
@@ -755,9 +756,10 @@ impl ChatWidget {
                 }
             }
             SlashCommand::Voice => match trimmed.to_ascii_lowercase().as_str() {
+                "settings" => self.app_event_tx.send(AppEvent::OpenRealtimeSettings),
                 "mute" => self.toggle_realtime_microphone(),
                 "stop" => self.stop_realtime_conversation(),
-                _ => self.add_error_message("Usage: /voice [mute|stop]".to_string()),
+                _ => self.add_error_message("Usage: /voice [settings|mute|stop]".to_string()),
             },
             SlashCommand::Ide => {
                 self.handle_ide_command_args(trimmed);
@@ -1141,7 +1143,6 @@ impl ChatWidget {
             token_activity_command_enabled: self.has_codex_backend_auth,
             goal_command_enabled: self.config.features.enabled(Feature::Goals),
             service_tier_commands_enabled: self.fast_mode_enabled(),
-            personality_command_enabled: self.config.features.enabled(Feature::Personality),
             voice_command_enabled: self.realtime_conversation_available_for_thread,
             worktrees_enabled: self.config.features.enabled(Feature::Worktrees)
                 && self.local_worktree_operations,
@@ -1208,7 +1209,6 @@ impl ChatWidget {
             | SlashCommand::Compact
             | SlashCommand::Review
             | SlashCommand::Model
-            | SlashCommand::Personality
             | SlashCommand::Plan
             | SlashCommand::Goal
             | SlashCommand::Side

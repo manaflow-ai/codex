@@ -12,7 +12,6 @@ use codex_protocol::protocol::GuardianRiskLevel;
 use codex_protocol::protocol::GuardianUserAuthorization;
 use codex_protocol::protocol::ReviewDecision;
 
-use crate::GuardianAssessment;
 use crate::GuardianReviewError;
 use crate::GuardianReviewOutcome;
 
@@ -23,11 +22,18 @@ const REJECTION_INSTRUCTIONS: &str = concat!(
     "or if the user explicitly approves the action after being informed of the risk. ",
     "Otherwise, stop and request user input.",
 );
+const REVIEW_FAILURE_INSTRUCTIONS: &str = concat!(
+    "The action was not executed because automatic approval review could not be completed. ",
+    "This is a review failure, not a determination that the action is unsafe. ",
+    "Do not bypass the approval check; resolve the error or ask the user for guidance.",
+);
 const TIMEOUT_INSTRUCTIONS: &str = concat!(
     "The automatic permission approval review did not finish before its deadline. ",
     "Do not assume the action is unsafe based on the timeout alone. ",
     "You may retry once, or ask the user for guidance or explicit approval.",
 );
+const INPUT_BUDGET_MESSAGE: &str =
+    "the complete action and minimum review context exceed the reviewer input budget";
 
 pub fn guardian_timeout_message(model_info: &ModelInfo) -> String {
     model_info
@@ -40,7 +46,8 @@ pub fn guardian_timeout_message(model_info: &ModelInfo) -> String {
 }
 
 pub struct ReviewCompletion {
-    pub decision: ReviewDecision,
+    /// `None` requests user approval after optional review exhausts its input budget.
+    pub decision: Option<ReviewDecision>,
     pub event: GuardianAssessmentEvent,
     pub warning: Option<String>,
     pub analytics: GuardianReviewAnalyticsResult,
@@ -51,6 +58,7 @@ pub struct ReviewCompletion {
 pub fn complete_review(
     outcome: GuardianReviewOutcome,
     model: &ModelInfo,
+    require_guardian: bool,
     mut event: GuardianAssessmentEvent,
     mut analytics: GuardianReviewAnalyticsResult,
 ) -> ReviewCompletion {
@@ -79,6 +87,20 @@ pub fn complete_review(
         }
         GuardianReviewOutcome::Error(error) => {
             analytics.failure_reason = Some(error.failure_reason());
+            if matches!(error, GuardianReviewError::InputBudgetExceeded) && !require_guardian {
+                let rationale = format!("Automatic approval review failed: {INPUT_BUDGET_MESSAGE}");
+                analytics.decision = GuardianReviewDecision::Aborted;
+                analytics.terminal_status = GuardianReviewTerminalStatus::Aborted;
+                event.status = GuardianAssessmentStatus::Aborted;
+                event.rationale = Some(rationale.clone());
+                return ReviewCompletion {
+                    decision: None,
+                    event,
+                    warning: Some(rationale),
+                    analytics,
+                    assessment_outcome: None,
+                };
+            }
             match error {
                 GuardianReviewError::Timeout => {
                     let rationale = "Automatic approval review timed out while evaluating the requested approval.".to_string();
@@ -87,7 +109,7 @@ pub fn complete_review(
                     event.status = GuardianAssessmentStatus::TimedOut;
                     event.rationale = Some(rationale.clone());
                     return ReviewCompletion {
-                        decision: ReviewDecision::TimedOut,
+                        decision: Some(ReviewDecision::TimedOut),
                         event,
                         warning: Some(rationale),
                         analytics,
@@ -99,24 +121,41 @@ pub fn complete_review(
                     analytics.terminal_status = GuardianReviewTerminalStatus::Aborted;
                     event.status = GuardianAssessmentStatus::Aborted;
                     return ReviewCompletion {
-                        decision: ReviewDecision::Abort,
+                        decision: Some(ReviewDecision::Abort),
                         event,
                         warning: None,
                         analytics,
                         assessment_outcome: None,
                     };
                 }
-                GuardianReviewError::PromptBuild { message }
-                | GuardianReviewError::Session { message, .. }
-                | GuardianReviewError::Parse { message } => {
+                GuardianReviewError::InputBudgetExceeded
+                | GuardianReviewError::PromptBuild { .. }
+                | GuardianReviewError::Session { .. }
+                | GuardianReviewError::Parse { .. } => {
+                    let message = match &error {
+                        GuardianReviewError::InputBudgetExceeded => INPUT_BUDGET_MESSAGE,
+                        GuardianReviewError::PromptBuild { message }
+                        | GuardianReviewError::Session { message, .. }
+                        | GuardianReviewError::Parse { message } => message,
+                        GuardianReviewError::Timeout | GuardianReviewError::Cancelled => {
+                            "guardian review failed"
+                        }
+                    };
                     analytics.decision = GuardianReviewDecision::Denied;
                     analytics.terminal_status = GuardianReviewTerminalStatus::FailedClosed;
-                    GuardianAssessment {
-                        risk_level: GuardianRiskLevel::High,
-                        user_authorization: GuardianUserAuthorization::Unknown,
-                        outcome: GuardianAssessmentOutcome::Deny,
-                        rationale: format!("Automatic approval review failed: {message}"),
-                    }
+                    let rationale = format!("Automatic approval review failed: {message}");
+                    // Keep the existing blocked status for client compatibility.
+                    event.status = GuardianAssessmentStatus::Denied;
+                    event.rationale = Some(rationale.clone());
+                    return ReviewCompletion {
+                        decision: Some(ReviewDecision::denied(format!(
+                            "{rationale}\n{REVIEW_FAILURE_INSTRUCTIONS}"
+                        ))),
+                        event,
+                        warning: Some(rationale),
+                        analytics,
+                        assessment_outcome: None,
+                    };
                 }
             }
         }
@@ -166,7 +205,7 @@ pub fn complete_review(
         ))
     };
     ReviewCompletion {
-        decision,
+        decision: Some(decision),
         event,
         warning: Some(warning),
         analytics,
